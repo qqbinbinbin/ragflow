@@ -4,6 +4,8 @@ USER root
 SHELL ["/bin/bash", "-c"]
 
 ARG NEED_MIRROR=0
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 
 WORKDIR /ragflow
 
@@ -35,8 +37,8 @@ RUN --mount=type=cache,id=ragflow_apt,target=/var/cache/apt,sharing=locked \
     apt update && \
     apt --no-install-recommends install -y ca-certificates; \
     if [ "$NEED_MIRROR" == "1" ]; then \
-        sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources; \
-        sed -i 's|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources; \
+        sed -i "s|http://archive.ubuntu.com/ubuntu|https://${APT_MIRROR}/ubuntu|g" /etc/apt/sources.list.d/ubuntu.sources; \
+        sed -i "s|http://security.ubuntu.com/ubuntu|https://${APT_MIRROR}/ubuntu|g" /etc/apt/sources.list.d/ubuntu.sources; \
     fi; \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache && \
@@ -70,7 +72,7 @@ RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/,target=/deps 
         mkdir -p /etc/uv && \
         echo 'python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"' > /etc/uv/uv.toml && \
         echo '[[index]]' >> /etc/uv/uv.toml && \
-        echo 'url = "https://mirrors.aliyun.com/pypi/simple"' >> /etc/uv/uv.toml && \
+        echo "url = \"${UV_INDEX_URL}\"" >> /etc/uv/uv.toml && \
         echo 'default = true' >> /etc/uv/uv.toml; \
     fi; \
     arch="$(uname -m)"; \
@@ -113,11 +115,11 @@ RUN --mount=type=cache,id=ragflow_apt,target=/var/cache/apt,sharing=locked \
 
 
 # Add dependencies of selenium
-RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/chrome-linux64-121-0-6167-85,target=/chrome-linux64.zip \
+RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/chrome-linux64.zip,target=/chrome-linux64.zip \
     unzip /chrome-linux64.zip && \
     mv chrome-linux64 /opt/chrome && \
     ln -s /opt/chrome/chrome /usr/local/bin/
-RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/chromedriver-linux64-121-0-6167-85,target=/chromedriver-linux64.zip \
+RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/chromedriver-linux64.zip,target=/chromedriver-linux64.zip \
     unzip -j /chromedriver-linux64.zip chromedriver-linux64/chromedriver && \
     mv chromedriver /usr/local/bin/ && \
     rm -f /usr/bin/google-chrome
@@ -135,21 +137,38 @@ FROM base AS builder
 USER root
 
 WORKDIR /ragflow
+ARG INSTALL_DOCLING=1
+ARG DOCLING_VERSION==2.71.0
 
 # install dependencies from uv.lock file
 COPY pyproject.toml uv.lock ./
+COPY .offline-cache/graspologic.git /opt/offline-cache/graspologic.git
 
 # https://github.com/astral-sh/uv/issues/10462
 # uv records index url into uv.lock but doesn't failover among multiple indexes
 RUN --mount=type=cache,id=ragflow_uv,target=/root/.cache/uv,sharing=locked \
+    git config --global --unset-all url."file:///opt/offline-cache/graspologic.git".insteadOf >/dev/null 2>&1 || true && \
+    git config --global --add url."file:///opt/offline-cache/graspologic.git".insteadOf "https://gitee.com/infiniflow/graspologic.git" && \
+    git config --global --add url."file:///opt/offline-cache/graspologic.git".insteadOf "https://github.com/infiniflow/graspologic.git" && \
     if [ "$NEED_MIRROR" == "1" ]; then \
-        sed -i 's|pypi.org|mirrors.aliyun.com/pypi|g' uv.lock; \
+        uv_host="$(echo "${UV_INDEX_URL}" | sed -E 's|^https?://([^/]+)/?.*$|\1|')"; \
+        sed -i "s|pypi.org|${uv_host}|g" uv.lock; \
     else \
         sed -i 's|mirrors.aliyun.com/pypi|pypi.org|g' uv.lock; \
+        sed -i 's|pypi.tuna.tsinghua.edu.cn|pypi.org|g' uv.lock; \
     fi; \
     uv sync --python 3.12 --frozen && \
     # Ensure pip is available in the venv for runtime package installation (fixes #12651)
     .venv/bin/python3 -m ensurepip --upgrade
+
+RUN --mount=type=cache,id=ragflow_uv,target=/root/.cache/uv,sharing=locked \
+    if [ "$INSTALL_DOCLING" = "1" ]; then \
+        if [ "$NEED_MIRROR" == "1" ]; then \
+            uv pip install --python .venv/bin/python --torch-backend cpu -i "${UV_INDEX_URL}" --extra-index-url https://pypi.org/simple "docling${DOCLING_VERSION}"; \
+        else \
+            uv pip install --python .venv/bin/python --torch-backend cpu "docling${DOCLING_VERSION}"; \
+        fi; \
+    fi
 
 COPY web web
 COPY docs docs
