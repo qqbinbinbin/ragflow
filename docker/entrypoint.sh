@@ -242,6 +242,25 @@ function ensure_db_init() {
     echo "Database tables initialized."
 }
 
+function ensure_minio_bucket() {
+    "$PY" - <<'PY'
+from common import settings
+from rag.utils.minio_conn import RAGFlowMinio
+
+bucket = settings.MINIO.get("bucket", "") or ""
+if not bucket:
+    print("[minio] bucket not configured, skip ensure bucket")
+    raise SystemExit(0)
+
+conn = RAGFlowMinio()
+if not conn.conn.bucket_exists(bucket):
+    conn.conn.make_bucket(bucket)
+    print(f"[minio] created bucket: {bucket}")
+else:
+    print(f"[minio] bucket already exists: {bucket}")
+PY
+}
+
 function wait_for_server() {
     local url="$1"
     local server_name="$2"
@@ -265,6 +284,7 @@ function wait_for_server() {
 # -----------------------------------------------------------------------------
 ensure_docling
 ensure_db_init
+ensure_minio_bucket
 
 if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]; then
     echo "Starting nginx..."

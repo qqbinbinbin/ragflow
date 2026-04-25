@@ -387,6 +387,26 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
 
     if doc["type"] == FileType.PDF.value:
         file_bin = settings.STORAGE_IMPL.get(bucket, name)
+        if not file_bin:
+            logging.error(
+                "Failed to load PDF from object storage before queueing tasks: "
+                "doc_id=%s bucket=%s name=%s",
+                doc["id"],
+                bucket,
+                name,
+            )
+            DocumentService.update_by_id(
+                doc["id"],
+                {
+                    "run": TaskStatus.FAIL.value,
+                    "progress": -1,
+                    "progress_msg": (
+                        "Failed to load source document from object storage. "
+                        "Check MinIO bucket/object availability and retry."
+                    ),
+                },
+            )
+            return
         do_layout = doc["parser_config"].get("layout_recognize", "DeepDOC")
         pages = PdfParser.total_page_number(doc["name"], file_bin)
         if pages is None:
@@ -409,6 +429,26 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
 
     elif doc["parser_id"] == "table":
         file_bin = settings.STORAGE_IMPL.get(bucket, name)
+        if not file_bin:
+            logging.error(
+                "Failed to load spreadsheet from object storage before queueing tasks: "
+                "doc_id=%s bucket=%s name=%s",
+                doc["id"],
+                bucket,
+                name,
+            )
+            DocumentService.update_by_id(
+                doc["id"],
+                {
+                    "run": TaskStatus.FAIL.value,
+                    "progress": -1,
+                    "progress_msg": (
+                        "Failed to load source document from object storage. "
+                        "Check MinIO bucket/object availability and retry."
+                    ),
+                },
+            )
+            return
         rn = RAGFlowExcelParser.row_number(doc["name"], file_bin)
         for i in range(0, rn, 3000):
             task = new_task()
@@ -448,6 +488,28 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
             settings.docStoreConn.delete({"id": pre_chunk_ids}, search.index_name(chunking_config["tenant_id"]),
                                          chunking_config["kb_id"])
     DocumentService.update_by_id(doc["id"], {"chunk_num": ck_num})
+
+    if not parse_task_array:
+        logging.error(
+            "No parse tasks generated for document: doc_id=%s type=%s parser_id=%s bucket=%s name=%s",
+            doc["id"],
+            doc.get("type"),
+            doc.get("parser_id"),
+            bucket,
+            name,
+        )
+        DocumentService.update_by_id(
+            doc["id"],
+            {
+                "run": TaskStatus.FAIL.value,
+                "progress": -1,
+                "progress_msg": (
+                    "No parsing tasks were generated for this document. "
+                    "Check parser configuration and source file availability."
+                ),
+            },
+        )
+        return
 
     bulk_insert_into_db(Task, parse_task_array, True)
     DocumentService.begin2parse(doc["id"])

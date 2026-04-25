@@ -86,7 +86,10 @@ async def download(tenant_id, dataset_id, document_id):
     doc_id, doc_location = File2DocumentService.get_storage_address(doc_id=document_id)  # minio address
     file_stream = settings.STORAGE_IMPL.get(doc_id, doc_location)
     if not file_stream:
-        return construct_json_result(message="This file is empty.", code=RetCode.DATA_ERROR)
+        return construct_json_result(
+            message="Document object is missing from storage. Re-upload or re-download it first.",
+            code=RetCode.DATA_ERROR,
+        )
     file = BytesIO(file_stream)
     # Use send_file with a proper filename and MIME type
     return await send_file(
@@ -116,7 +119,10 @@ async def download_doc(document_id):
     doc_id, doc_location = File2DocumentService.get_storage_address(doc_id=document_id)  # minio address
     file_stream = settings.STORAGE_IMPL.get(doc_id, doc_location)
     if not file_stream:
-        return construct_json_result(message="This file is empty.", code=RetCode.DATA_ERROR)
+        return construct_json_result(
+            message="Document object is missing from storage. Re-upload or re-download it first.",
+            code=RetCode.DATA_ERROR,
+        )
     file = BytesIO(file_stream)
     # Use send_file with a proper filename and MIME type
     return await send_file(

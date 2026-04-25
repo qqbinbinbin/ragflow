@@ -25,6 +25,9 @@ from api.db.db_models import DB, DataBaseModel
 
 @DB.connection_context()
 def bulk_insert_into_db(model, data_source, replace_on_conflict=False):
+    if not data_source:
+        return
+
     DB.create_tables([model])
 
     for i, data in enumerate(data_source):

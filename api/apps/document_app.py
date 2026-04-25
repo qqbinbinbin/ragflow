@@ -343,6 +343,10 @@ async def get(doc_id):
 
         b, n = File2DocumentService.get_storage_address(doc_id=doc_id)
         data = await thread_pool_exec(settings.STORAGE_IMPL.get, b, n)
+        if not data:
+            return get_data_error_result(
+                message="Document object is missing from storage. Re-upload or re-download it first."
+            )
         response = await make_response(data)
 
         ext = re.search(r"\.([^.]+)$", doc.name.lower())
@@ -363,6 +367,10 @@ async def download_attachment(attachment_id):
     try:
         ext = request.args.get("ext", "markdown")
         data = await thread_pool_exec(settings.STORAGE_IMPL.get, current_user.id, attachment_id)
+        if not data:
+            return get_data_error_result(
+                message="Attachment object is missing from storage."
+            )
         response = await make_response(data)
         content_type = CONTENT_TYPE_MAP.get(ext, f"application/{ext}")
         apply_safe_file_response_headers(response, content_type, ext)
