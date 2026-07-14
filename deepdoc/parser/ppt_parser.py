@@ -17,6 +17,7 @@
 import logging
 from io import BytesIO
 from pptx import Presentation
+from PIL import Image
 
 
 class RAGFlowPptParser:
@@ -40,7 +41,23 @@ class RAGFlowPptParser:
         else:
             return paragraph.text
 
-    def __extract(self, shape):
+    def _extract_picture(self, shape, picture_describer=None):
+        try:
+            image_blob = shape.image.blob
+            if not image_blob:
+                return ""
+
+            if picture_describer is None:
+                return ""
+
+            with Image.open(BytesIO(image_blob)) as img:
+                description = picture_describer(img.copy())
+            return str(description or "").strip()
+        except Exception as e:
+            logging.warning(f"PPTX visual model image extraction failed: {e}")
+            return ""
+
+    def __extract(self, shape, picture_describer=None):
         try:
             # First try to get text content
             if hasattr(shape, 'has_text_frame') and shape.has_text_frame:
@@ -73,10 +90,15 @@ class RAGFlowPptParser:
             if shape_type == 6:
                 texts = []
                 for p in self.__sort_shapes(shape.shapes):
-                    t = self.__extract(p)
+                    t = self.__extract(p, picture_describer=picture_describer)
                     if t:
                         texts.append(t)
                 return "\n".join(texts)
+
+            # MSO_SHAPE_TYPE.PICTURE == 13. Avoid importing the enum to keep this parser
+            # compatible with older python-pptx builds.
+            if shape_type == 13:
+                return self._extract_picture(shape, picture_describer=picture_describer)
 
             return ""
 
@@ -84,7 +106,7 @@ class RAGFlowPptParser:
             logging.error(f"Error processing shape: {str(e)}")
             return ""
 
-    def __call__(self, fnm, from_page, to_page, callback=None):
+    def __call__(self, fnm, from_page, to_page, callback=None, picture_describer=None):
         ppt = Presentation(fnm) if isinstance(
             fnm, str) else Presentation(
             BytesIO(fnm))
@@ -97,7 +119,7 @@ class RAGFlowPptParser:
                 break
             texts = []
             for shape in self.__sort_shapes(slide.shapes):
-                txt = self.__extract(shape)
+                txt = self.__extract(shape, picture_describer=picture_describer)
                 if txt:
                     texts.append(txt)
             txts.append("\n".join(texts))

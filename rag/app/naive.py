@@ -261,6 +261,137 @@ PARSERS = {
 }
 
 
+SUPPORTED_EMBEDDED_DOCUMENT_EXTENSIONS = {
+    ".doc",
+    ".docx",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".xls",
+    ".xlsx",
+}
+
+UNSUPPORTED_EMBEDDED_DOCUMENT_EXTENSIONS = {
+    ".bin",
+    ".ole",
+    ".zip",
+}
+
+
+def _is_supported_embedded_document(filename):
+    lower = (filename or "").lower()
+    _, ext = os.path.splitext(lower)
+    if ext in UNSUPPORTED_EMBEDDED_DOCUMENT_EXTENSIONS:
+        return False
+    return ext in SUPPORTED_EMBEDDED_DOCUMENT_EXTENSIONS
+
+
+def _append_text_to_section(section, text):
+    text = str(text or "").strip()
+    if not text:
+        return section
+
+    if isinstance(section, tuple):
+        if not section:
+            return (text,)
+        current = str(section[0] or "").strip()
+        merged = f"{current}\n{text}" if current else text
+        return (merged, *section[1:])
+
+    if isinstance(section, list):
+        if not section:
+            return [text]
+        current = str(section[0] or "").strip()
+        merged = f"{current}\n{text}" if current else text
+        return [merged, *section[1:]]
+
+    current = str(section or "").strip()
+    return f"{current}\n{text}" if current else text
+
+
+def _section_page_numbers(section):
+    from deepdoc.parser import PdfParser
+
+    if isinstance(section, (tuple, list)):
+        txt = section[0] if section else ""
+        poss = section[1] if len(section) > 1 else ""
+    else:
+        txt = section
+        poss = ""
+
+    if isinstance(poss, str) and "@@" not in poss and isinstance(txt, str) and "@@" in txt:
+        poss = txt
+    elif not poss and isinstance(txt, str) and "@@" in txt:
+        poss = txt
+
+    positions = PdfParser.extract_positions(poss) if isinstance(poss, str) else []
+    pages = []
+    for page, *_ in positions:
+        if isinstance(page, list):
+            pages.extend(int(p) for p in page if p)
+        elif page:
+            pages.append(int(page))
+    return pages
+
+
+def _enhance_pdf_sections_with_page_vision(sections, pdf_parser, image_context_size, callback=None, **kwargs):
+    if not sections or image_context_size <= 0:
+        return sections
+
+    page_images = getattr(pdf_parser, "page_images", None)
+    if not page_images:
+        return sections
+
+    try:
+        vision_model_config = get_tenant_default_model_by_type(kwargs["tenant_id"], LLMType.IMAGE2TEXT)
+        vision_model = LLMBundle(kwargs["tenant_id"], vision_model_config)
+        if callback:
+            callback(0.72, "PDF visual model detected. Attempting to enhance page image extraction...")
+    except Exception as e:
+        logging.warning(f"PDF visual model unavailable: {e}")
+        return sections
+
+    page_to_indices = {}
+    unpositioned = []
+    for idx, section in enumerate(sections):
+        pages = _section_page_numbers(section)
+        if not pages:
+            unpositioned.append(idx)
+            continue
+        for page in pages:
+            page_to_indices.setdefault(page, []).append(idx)
+
+    enhanced = list(sections)
+    for page_index, page_image in enumerate(page_images):
+        page_num = page_index + 1 + int(getattr(pdf_parser, "page_from", 0) or 0)
+        target_indices = page_to_indices.get(page_num)
+        if not target_indices and page_index == 0 and unpositioned:
+            target_indices = [unpositioned[0]]
+        if not target_indices:
+            continue
+
+        try:
+            parsed = VisionFigureParser(
+                vision_model=vision_model,
+                figures_data=[((page_image, [f"pdf page {page_num} image"]), [(page_num, 0, 0, 0, 0)])],
+                context_size=image_context_size,
+                **kwargs,
+            )(callback=callback)
+        except Exception as e:
+            logging.warning(f"PDF visual model page enhancement failed for page {page_num}: {e}")
+            continue
+
+        if not parsed:
+            continue
+        description = str(parsed[0][0][1] or "").strip()
+        if not description:
+            continue
+        enhanced[target_indices[-1]] = _append_text_to_section(enhanced[target_indices[-1]], description)
+
+    return enhanced
+
+
 class Docx(DocxParser):
     def __init__(self):
         pass
@@ -769,6 +900,12 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
         # Recursively chunk each embedded file and collect results
         for embed_filename, embed_bytes in embeds:
+            if not _is_supported_embedded_document(embed_filename):
+                message = f"unsupported embedded file skipped: {embed_filename}"
+                logging.info(message)
+                if callback:
+                    callback(0.05, message)
+                continue
             try:
                 sub_res = chunk(embed_filename, binary=embed_bytes, lang=lang, callback=callback, is_root=False, **kwargs) or []
                 embed_res.extend(sub_res)
@@ -845,6 +982,15 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
         if not sections and not tables:
             return []
+
+        if image_context_size > 0:
+            sections = _enhance_pdf_sections_with_page_vision(
+                sections,
+                pdf_parser,
+                image_context_size,
+                callback=callback,
+                **kwargs,
+            )
 
         if table_context_size or image_context_size:
             tables = append_context2table_image4pdf(sections, tables, image_context_size)

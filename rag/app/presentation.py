@@ -24,7 +24,11 @@ from pypdf import PdfReader as pdf2_read
 
 from deepdoc.parser import PdfParser, PlainParser
 from deepdoc.parser.ppt_parser import RAGFlowPptParser
+from deepdoc.parser.figure_parser import VisionFigureParser
 from rag.app.naive import by_plaintext, PARSERS
+from api.db.services.llm_service import LLMBundle
+from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type
+from common.constants import LLMType
 from common.parser_config_utils import normalize_layout_recognizer
 from rag.nlp import rag_tokenizer
 from rag.nlp import tokenize
@@ -124,6 +128,35 @@ class PlainPdf(PlainParser):
         return [(txt, None) for txt in page_txt], []
 
 
+def _build_pptx_picture_describer(tenant_id, parser_config=None, callback=None, **kwargs):
+    parser_config = parser_config or {}
+    image_context_size = max(0, int(parser_config.get("image_context_size", 0) or 0))
+    if image_context_size <= 0 or not tenant_id:
+        return None
+
+    try:
+        vision_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.IMAGE2TEXT)
+        vision_model = LLMBundle(tenant_id, vision_model_config)
+        if callback:
+            callback(0.2, "PPTX visual model detected. Attempting to enhance embedded image extraction...")
+    except Exception as e:
+        logging.warning(f"PPTX visual model unavailable: {e}")
+        return None
+
+    def picture_describer(image):
+        parsed = VisionFigureParser(
+            vision_model=vision_model,
+            figures_data=[((image, ["pptx embedded image"]), [(0, 0, 0, 0, 0)])],
+            context_size=image_context_size,
+            **kwargs,
+        )(callback=callback)
+        if not parsed:
+            return ""
+        return str(parsed[0][0][1] or "").strip()
+
+    return picture_describer
+
+
 def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", callback=None, parser_config=None, **kwargs):
     """
     The supported file formats are pdf, ppt, pptx.
@@ -139,7 +172,13 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
     if re.search(r"\.pptx?$", filename, re.IGNORECASE):
         try:
             ppt_parser = RAGFlowPptParser()
-            for pn, txt in enumerate(ppt_parser(filename if not binary else binary, from_page, 1000000, callback)):
+            picture_describer = _build_pptx_picture_describer(
+                tenant_id=kwargs.get("tenant_id"),
+                parser_config=parser_config,
+                callback=callback,
+                **{k: v for k, v in kwargs.items() if k != "tenant_id"},
+            )
+            for pn, txt in enumerate(ppt_parser(filename if not binary else binary, from_page, 1000000, callback, picture_describer=picture_describer)):
                 d = copy.deepcopy(doc)
                 pn += from_page
                 d["doc_type_kwd"] = "image"

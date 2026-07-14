@@ -97,8 +97,8 @@ class OpenAIEmbed(Base):
         self.model_name = model_name
 
     def encode(self, texts: list):
-        # OpenAI requires batch size <=16
-        batch_size = 16
+        # OpenAI-compatible providers may enforce smaller request-body limits.
+        batch_size = max(1, min(16, int(os.environ.get("EMBEDDING_BATCH_SIZE", "16") or "16")))
         texts = [truncate(t, 8191) for t in texts]
         ress = []
         total_tokens = 0

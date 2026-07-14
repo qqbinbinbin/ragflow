@@ -36,6 +36,37 @@ from deepdoc.parser import ExcelParser
 from common import settings
 
 
+def _deduplicate_dataframe_columns(df):
+    seen = Counter()
+    renamed = []
+    display_names = []
+    for column in df.columns:
+        raw = str(column)
+        seen[raw] += 1
+        if seen[raw] == 1:
+            renamed.append(raw)
+            display_names.append(raw)
+            continue
+        next_name = f"{raw}__{seen[raw]}"
+        logging.warning("duplicate column renamed: %s -> %s", raw, next_name)
+        renamed.append(next_name)
+        display_names.append(f"{raw} ({seen[raw]})")
+    if list(df.columns) != renamed:
+        df = df.copy()
+        df.columns = renamed
+    return df, display_names
+
+
+def _coerce_vision_description_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value if item is not None)
+    if value is None:
+        return ""
+    return str(value)
+
+
 class Excel(ExcelParser):
     def __call__(self, fnm, binary=None, from_page=0, to_page=10000000000, callback=None, **kwargs):
         if not binary:
@@ -58,7 +89,7 @@ class Excel(ExcelParser):
                                                                               **kwargs)
                 if image_descriptions and len(image_descriptions) == len(images):
                     for i, bf in enumerate(image_descriptions):
-                        images[i]["image_description"] = "\n".join(bf[0][1])
+                        images[i]["image_description"] = _coerce_vision_description_text(bf[0][1])
                     for img in images:
                         if img["span_type"] == "single_cell" and img.get("image_description"):
                             pending_cell_images.append(img)
@@ -303,7 +334,10 @@ class Excel(ExcelParser):
 
 def trans_datatime(s):
     try:
-        return datetime_parse(s.strip()).strftime("%Y-%m-%d %H:%M:%S")
+        parsed = datetime_parse(s.strip())
+        if parsed.year < 1000:
+            return None
+        return f"{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d} {parsed.hour:02d}:{parsed.minute:02d}:{parsed.second:02d}"
     except Exception:
         return None
 
@@ -438,14 +472,10 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
         for n in ["id", "_id", "index", "idx"]:
             if n in df.columns:
                 del df[n]
+        df, display_clmns = _deduplicate_dataframe_columns(df)
         clmns = df.columns.values
-        if len(clmns) != len(set(clmns)):
-            col_counts = Counter(clmns)
-            duplicates = [col for col, count in col_counts.items() if count > 1]
-            if duplicates:
-                raise ValueError(f"Duplicate column names detected: {duplicates}\nFrom: {clmns}")
 
-        txts = list(copy.deepcopy(clmns))
+        txts = list(copy.deepcopy(display_clmns))
         py_clmns = [PY.get_pinyins(re.sub(r"(/.*|（[^（）]+?）|\([^()]+?\))", "", str(n)), "_")[0] for n in clmns]
         clmn_tys = []
         for j in range(len(clmns)):
@@ -454,13 +484,13 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
             df[clmns[j]] = cln
             if ty == "text":
                 txts.extend([str(c) for c in cln if c])
-        clmns_map = [(py_clmns[i].lower() + fields_map[clmn_tys[i]], str(clmns[i]).replace("_", " ")) for i in
+        clmns_map = [(py_clmns[i].lower() + fields_map[clmn_tys[i]], str(display_clmns[i]).replace("_", " ")) for i in
                      range(len(clmns))]
         # For Infinity/OceanBase: Use original column names as keys since they're stored in chunk_data JSON
         # For ES/OS: Use full field names with type suffixes (e.g., url_kwd, body_tks)
         if settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE:
             # For Infinity/OceanBase: key = original column name, value = display name
-            field_map = {py_clmns[i].lower(): str(clmns[i]).replace("_", " ") for i in range(len(clmns))}
+            field_map = {py_clmns[i].lower(): str(display_clmns[i]).replace("_", " ") for i in range(len(clmns))}
         else:
             # For ES/OS: key = typed field name, value = display name
             field_map = {k: v for k, v in clmns_map}
@@ -486,7 +516,7 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
                 else:
                     fld = clmns_map[j][0]
                     d[fld] = row[clmns[j]] if clmn_tys[j] != "text" else rag_tokenizer.tokenize(row[clmns[j]])
-                row_fields.append((clmns[j], row[clmns[j]]))
+                row_fields.append((display_clmns[j], row[clmns[j]]))
             if not row_fields:
                 continue
             # Add the data JSON field to the document (for Infinity/OceanBase)
