@@ -300,6 +300,8 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
 
     if stream:
         completion_tokens = 0
+        emitted_message = False
+        fallback_content = ""
         try:
             async for ans in completion(
                 tenant_id=tenant_id,
@@ -315,12 +317,23 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                     except Exception as e:
                         logging.exception(f"Agent OpenAI-Compatible completion_openai parse answer failed: {e}")
                         continue
-                if ans.get("event") not in ["message", "message_end"]:
+                if ans.get("event") not in ["message", "message_end", "workflow_finished"]:
                     continue
 
                 content_piece = ""
                 if ans["event"] == "message":
                     content_piece = ans["data"]["content"]
+                    emitted_message = emitted_message or bool(content_piece)
+                elif ans["event"] == "workflow_finished" and not emitted_message:
+                    outputs = ans.get("data", {}).get("outputs", {})
+                    if isinstance(outputs, dict):
+                        fallback_content = outputs.get("content") or outputs.get("result") or ""
+                    elif isinstance(outputs, str):
+                        fallback_content = outputs
+                    if not fallback_content:
+                        continue
+                    content_piece = fallback_content
+                    emitted_message = True
 
                 completion_tokens += len(tiktoken_encoder.encode(content_piece))
 

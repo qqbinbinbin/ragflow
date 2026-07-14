@@ -298,6 +298,20 @@ class Canvas(Graph):
         self._id = canvas_id
 
     def load(self):
+        self.dsl.setdefault("history", [])
+        self.dsl.setdefault("path", [])
+        self.dsl.setdefault("retrieval", {"chunks": [], "doc_aggs": []})
+        self.dsl.setdefault("messages", [])
+        self.dsl.setdefault("reference", [])
+        self.dsl.setdefault("answer", [])
+        self.dsl.setdefault("globals", {
+            "sys.query": "",
+            "sys.user_id": "",
+            "sys.conversation_turns": 0,
+            "sys.files": [],
+            "sys.history": [],
+            "sys.date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        })
         super().load()
         self.history = self.dsl["history"]
         if "globals" in self.dsl:

@@ -80,6 +80,30 @@ class LLMParam(ComponentParamBase):
         return conf
 
 
+class GenerateParam(LLMParam):
+    """
+    Backward-compatible parameters for legacy Agent DSLs that still use
+    Generate instead of the current LLM component name.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.prompt = ""
+        self.parameters = []
+
+    def update(self, conf, allow_redundant=False):
+        conf = dict(conf)
+        prompt = conf.get("prompt")
+        if isinstance(prompt, str):
+            prompt = prompt.replace("{begin@query}", "{sys.query}")
+            conf["prompt"] = prompt
+        if prompt and not conf.get("sys_prompt"):
+            conf["sys_prompt"] = prompt
+        if prompt and "prompts" not in conf:
+            conf["prompts"] = [{"role": "user", "content": "{sys.query}"}]
+        return super().update(conf, allow_redundant=allow_redundant)
+
+
 class LLM(ComponentBase):
     component_name = "LLM"
 
@@ -453,3 +477,26 @@ class LLM(ComponentBase):
     def thoughts(self) -> str:
         _, msg,_ = self._prepare_prompt_variables()
         return "⌛Give me a moment—starting from: \n\n" + re.sub(r"(User's query:|[\\]+)", '', msg[-1]['content'], flags=re.DOTALL) + "\n\nI’ll figure out our best next move."
+
+
+class Generate(LLM):
+    component_name = "Generate"
+
+    def _prepare_prompt_variables(self):
+        original_sys_prompt = self._param.sys_prompt
+        if "{input}" in self._param.sys_prompt:
+            for upstream_id in self.get_upstream():
+                upstream = self._canvas.get_component(upstream_id)
+                if not upstream:
+                    continue
+                upstream_obj = upstream.get("obj")
+                if not upstream_obj:
+                    continue
+                value = upstream_obj.output("formalized_content")
+                if value:
+                    self._param.sys_prompt = self._param.sys_prompt.replace("{input}", str(value))
+                    break
+        try:
+            return super()._prepare_prompt_variables()
+        finally:
+            self._param.sys_prompt = original_sys_prompt

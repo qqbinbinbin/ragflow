@@ -26,7 +26,12 @@ import pytest
 
 
 class _DummyManager:
+    def __init__(self):
+        self.routes = []
+
     def route(self, *_args, **_kwargs):
+        self.routes.append((_args, _kwargs))
+
         def decorator(func):
             return func
 
@@ -867,6 +872,50 @@ def test_openai_nonstream_branch_unit(monkeypatch):
     res = _run(inspect.unwrap(module.chat_completion_openai_like)("tenant-1", "chat-1"))
     assert res["choices"][0]["message"]["content"] == "world"
     
+
+@pytest.mark.p2
+def test_agent_openai_contract_route_reuses_canvas_openai_completion(monkeypatch):
+    module = _load_session_module(monkeypatch)
+
+    routes = [args[0] for args, _kwargs in module.manager.routes]
+    assert "/agents_openai/<agent_id>/chat/completions" in routes
+
+    monkeypatch.setattr(module, "Response", _StubResponse)
+    captured_calls = []
+
+    async def _completion_openai_stream(*args, **kwargs):
+        captured_calls.append((args, kwargs))
+        yield "data:stream\n\n"
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(module, "completion_openai", _completion_openai_stream)
+    monkeypatch.setattr(
+        module,
+        "get_request_json",
+        lambda: _AwaitableValue(
+            {
+                "model": "knowledge-agent",
+                "messages": [
+                    {"role": "assistant", "content": "preface"},
+                    {"role": "user", "content": "latest question"},
+                ],
+                "stream": True,
+                "metadata": {"id": "meta-session"},
+            }
+        ),
+    )
+
+    resp = _run(inspect.unwrap(module.agent_completion_openai_like)("tenant-1", "agent-1"))
+    chunks = _run(_collect_stream(resp.body))
+
+    assert resp.headers.get("Content-Type") == "text/event-stream; charset=utf-8"
+    assert chunks[-1].strip() == "data: [DONE]"
+    assert captured_calls[-1][0][0] == "tenant-1"
+    assert captured_calls[-1][0][1] == "agent-1"
+    assert captured_calls[-1][0][2] == "latest question"
+    assert captured_calls[-1][1]["session_id"] == "meta-session"
+    assert captured_calls[-1][1]["stream"] is True
+
 
 @pytest.mark.p2
 def test_agents_openai_compatibility_unit(monkeypatch):

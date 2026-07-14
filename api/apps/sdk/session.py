@@ -30,6 +30,7 @@ from api.db.db_models import APIToken
 from api.db.services.api_service import API4ConversationService
 from api.db.services.canvas_service import UserCanvasService
 from api.db.services.canvas_service import completion as agent_completion
+from api.db.services.canvas_service import completion_openai
 from api.db.services.conversation_service import ConversationService
 from api.db.services.user_canvas_version import UserCanvasVersionService
 from api.db.services.conversation_service import async_iframe_completion as iframe_completion
@@ -674,6 +675,54 @@ async def agent_bot_completions(agent_id):
         return get_error_data_result(message=str(e) or "Unknown error")
 
     return None
+
+
+@manager.route("/agents_openai/<agent_id>/chat/completions", methods=["POST"])  # noqa: F821
+@validate_request("model", "messages")  # noqa: F821
+@token_required
+async def agent_completion_openai_like(tenant_id, agent_id):
+    req = await get_request_json()
+    messages = req.get("messages", [])
+    if not messages:
+        return get_error_data_result(message="You must provide at least one message.")
+
+    question = next(
+        (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+        "",
+    )
+    if not question:
+        return get_error_data_result(message="The last content of this conversation is not from user.")
+
+    stream = req.pop("stream", True)
+    session_id = req.pop("session_id", req.get("id", "")) or req.get("metadata", {}).get("id", "")
+    if stream:
+        resp = Response(
+            completion_openai(
+                tenant_id,
+                agent_id,
+                question,
+                session_id=session_id,
+                stream=True,
+                **req,
+            )
+        )
+        resp.headers.add_header("Cache-control", "no-cache")
+        resp.headers.add_header("Connection", "keep-alive")
+        resp.headers.add_header("X-Accel-Buffering", "no")
+        resp.headers.add_header("Content-Type", "text/event-stream; charset=utf-8")
+        return resp
+
+    async for response in completion_openai(
+        tenant_id,
+        agent_id,
+        question,
+        session_id=session_id,
+        stream=False,
+        **req,
+    ):
+        return jsonify(response)
+    return None
+
 
 @manager.route("/agentbots/<agent_id>/inputs", methods=["GET"])  # noqa: F821
 async def begin_inputs(agent_id):
