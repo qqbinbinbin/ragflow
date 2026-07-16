@@ -28,6 +28,54 @@ ILLEGAL_CHARACTERS_RE = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]")
 
 class RAGFlowExcelParser:
     @staticmethod
+    def _clean_cell_value(value):
+        if isinstance(value, str):
+            value = ILLEGAL_CHARACTERS_RE.sub(" ", value)
+            return value if value.strip() else None
+        try:
+            missing = pd.isna(value)
+            if not hasattr(missing, "__len__") and bool(missing):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return value
+
+    @staticmethod
+    def _load_calamine_to_workbook(file_like_object):
+        from python_calamine import CalamineWorkbook
+
+        file_like_object.seek(0)
+        source = CalamineWorkbook.from_filelike(file_like_object)
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+
+        for sheet_name in source.sheet_names:
+            source_sheet = source.get_sheet_by_name(sheet_name)
+            worksheet = workbook.create_sheet(title=sheet_name)
+            sheet_start = getattr(source_sheet, "start", None)
+            if sheet_start is None:
+                continue
+
+            for row_index, row in enumerate(source_sheet.iter_rows(), start=1):
+                for column_index, value in enumerate(row, start=1):
+                    cleaned = RAGFlowExcelParser._clean_cell_value(value)
+                    if cleaned is not None:
+                        worksheet.cell(row=row_index, column=column_index, value=cleaned)
+
+            for start, end in getattr(source_sheet, "merged_cell_ranges", []):
+                min_row, min_col = start
+                max_row, max_col = end
+                if min_row != max_row or min_col != max_col:
+                    worksheet.merge_cells(
+                        start_row=min_row + 1,
+                        start_column=min_col + 1,
+                        end_row=max_row + 1,
+                        end_column=max_col + 1,
+                    )
+
+        return workbook
+
+    @staticmethod
     def _load_excel_to_workbook(file_like_object):
         if isinstance(file_like_object, bytes):
             file_like_object = BytesIO(file_like_object)
@@ -51,36 +99,34 @@ class RAGFlowExcelParser:
         try:
             return load_workbook(file_like_object, data_only=True)
         except Exception as e:
-            logging.info(f"openpyxl load error: {e}, try pandas instead")
+            logging.info(f"openpyxl load error: {e}, try calamine instead")
             try:
-                file_like_object.seek(0)
                 try:
-                    dfs = pd.read_excel(file_like_object, sheet_name=None)
-                    return RAGFlowExcelParser._dataframe_to_workbook(dfs)
+                    return RAGFlowExcelParser._load_calamine_to_workbook(file_like_object)
                 except Exception as ex:
-                    logging.info(f"pandas with default engine load error: {ex}, try calamine instead")
+                    logging.info(f"calamine workbook load error: {ex}, try pandas instead")
                     file_like_object.seek(0)
-                    dfs = pd.read_excel(file_like_object, sheet_name=None, engine="calamine")
-                    return RAGFlowExcelParser._dataframe_to_workbook(dfs)
+                    dfs = pd.read_excel(file_like_object, sheet_name=None, header=None, engine="calamine")
+                    return RAGFlowExcelParser._dataframes_to_workbook(dfs, include_headers=False)
             except Exception as e_pandas:
                 raise Exception(f"pandas.read_excel error: {e_pandas}, original openpyxl error: {e}")
 
     @staticmethod
     def _clean_dataframe(df: pd.DataFrame):
-        def clean_string(s):
-            if isinstance(s, str):
-                return ILLEGAL_CHARACTERS_RE.sub(" ", s)
-            return s
-
-        return df.apply(lambda col: col.map(clean_string))
+        return df.apply(lambda col: col.map(RAGFlowExcelParser._clean_cell_value))
 
     @staticmethod
-    def _fill_worksheet_from_dataframe(ws, df: pd.DataFrame):
-        for col_num, column_name in enumerate(df.columns, 1):
-            ws.cell(row=1, column=col_num, value=column_name)
-        for row_num, row in enumerate(df.values, 2):
+    def _fill_worksheet_from_dataframe(ws, df: pd.DataFrame, include_headers=True):
+        data_start_row = 1
+        if include_headers:
+            for col_num, column_name in enumerate(df.columns, 1):
+                ws.cell(row=1, column=col_num, value=column_name)
+            data_start_row = 2
+        for row_num, row in enumerate(df.values, data_start_row):
             for col_num, value in enumerate(row, 1):
-                ws.cell(row=row_num, column=col_num, value=value)
+                cleaned = RAGFlowExcelParser._clean_cell_value(value)
+                if cleaned is not None:
+                    ws.cell(row=row_num, column=col_num, value=cleaned)
 
     @staticmethod
     def _dataframe_to_workbook(df):
@@ -95,7 +141,7 @@ class RAGFlowExcelParser:
         return wb
 
     @staticmethod
-    def _dataframes_to_workbook(dfs: dict):
+    def _dataframes_to_workbook(dfs: dict, include_headers=True):
         wb = Workbook()
         default_sheet = wb.active
         wb.remove(default_sheet)
@@ -103,7 +149,7 @@ class RAGFlowExcelParser:
         for sheet_name, df in dfs.items():
             df = RAGFlowExcelParser._clean_dataframe(df)
             ws = wb.create_sheet(title=sheet_name)
-            RAGFlowExcelParser._fill_worksheet_from_dataframe(ws, df)
+            RAGFlowExcelParser._fill_worksheet_from_dataframe(ws, df, include_headers=include_headers)
         return wb
 
     @staticmethod

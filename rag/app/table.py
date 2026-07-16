@@ -103,9 +103,10 @@ class Excel(ExcelParser):
                 continue
             if not rows:
                 continue
-            headers, header_rows = self._parse_headers(ws, rows)
+            headers, header_start, header_rows = self._parse_sheet_structure(ws, rows)
             if not headers:
                 continue
+            sheet_context = self._build_sheet_context(ws, rows[:header_start])
             data = []
             for i, r in enumerate(rows[header_rows:]):
                 rn += 1
@@ -124,6 +125,8 @@ class Excel(ExcelParser):
             if len(data) == 0:
                 continue
             df = pd.DataFrame(data, columns=headers)
+            df.attrs["sheet_name"] = sheet_name
+            df.attrs["sheet_context"] = sheet_context
             for img in pending_cell_images:
                 excel_row = img["row_from"] - 1
                 excel_col = img["col_from"] - 1
@@ -159,13 +162,161 @@ class Excel(ExcelParser):
         return res, tables
 
     def _parse_headers(self, ws, rows):
-        if len(rows) == 0:
-            return [], 0
-        has_complex_structure = self._has_complex_header_structure(ws, rows)
-        if has_complex_structure:
-            return self._parse_multi_level_headers(ws, rows)
-        else:
-            return self._parse_simple_headers(rows)
+        headers, _header_start, data_start = self._parse_sheet_structure(ws, rows)
+        return headers, data_start
+
+    def _parse_sheet_structure(self, ws, rows):
+        if not rows:
+            return [], 0, 0
+
+        max_scan_rows = min(20, len(rows))
+        max_columns = max((len(row) for row in rows[:max_scan_rows]), default=0)
+        candidates = []
+        for start in range(max_scan_rows):
+            if self._is_empty_row([cell.value for cell in rows[start]]):
+                continue
+            for depth in range(1, min(3, max_scan_rows - start) + 1):
+                end = start + depth
+                headers = self._build_headers_for_region(ws, rows, start, end)
+                informative = sum(not header.startswith("Column_") for header in headers)
+                if informative < min(2, max_columns):
+                    continue
+
+                following_rows = []
+                for row in rows[end:]:
+                    if self._is_empty_row([cell.value for cell in row]):
+                        continue
+                    following_rows.append(row)
+                    if len(following_rows) == 3:
+                        break
+                if not following_rows:
+                    continue
+
+                data_columns = {
+                    index
+                    for row in following_rows
+                    for index, cell in enumerate(row)
+                    if not self._is_empty_value(cell.value)
+                }
+                informative_columns = {
+                    index for index, header in enumerate(headers)
+                    if not header.startswith("Column_")
+                }
+                coverage = len(informative_columns & data_columns) / max(1, len(data_columns))
+                similarity = self._following_row_similarity(following_rows)
+                merged_bonus = 0.5 if self._region_has_merges(ws, start, end) else 0.0
+                hierarchy_bonus = 1.0 if self._has_parent_child_header(ws, rows, start, end) else 0.0
+                trailing_data_penalty = 1.5 if self._header_ends_outside_merge_region(ws, start, end) else 0.0
+                score = coverage * 5 + similarity * 4 + merged_bonus + hierarchy_bonus - (depth - 1) * 0.4 - trailing_data_penalty
+                candidates.append((score, -depth, -start, end, headers))
+
+        if not candidates:
+            headers, data_start = self._parse_simple_headers(rows)
+            return headers, 0, data_start
+
+        _score, _negative_depth, negative_header_start, data_start, headers = max(candidates)
+        header_start = -negative_header_start
+        return headers, header_start, data_start
+
+    def _region_has_merges(self, ws, start, end):
+        first_row = start + 1
+        last_row = end
+        return any(
+            merged.min_row <= last_row and merged.max_row >= first_row
+            for merged in ws.merged_cells.ranges
+        )
+
+    def _has_parent_child_header(self, ws, rows, start, end):
+        if end - start < 2:
+            return False
+        parent_row = start + 1
+        child_row = rows[start + 1]
+        for merged in ws.merged_cells.ranges:
+            if merged.min_row != parent_row or merged.max_row != parent_row:
+                continue
+            if merged.max_col <= merged.min_col:
+                continue
+            child_values = 0
+            for col_idx in range(merged.min_col - 1, min(merged.max_col, len(child_row))):
+                if not self._is_empty_value(child_row[col_idx].value):
+                    child_values += 1
+            if child_values >= 2:
+                return True
+        return False
+
+    def _header_ends_outside_merge_region(self, ws, start, end):
+        if end - start < 2 or not self._region_has_merges(ws, start, end):
+            return False
+        last_row = end
+        return not any(
+            merged.min_row <= last_row <= merged.max_row
+            for merged in ws.merged_cells.ranges
+        )
+
+    def _following_row_similarity(self, rows):
+        if len(rows) < 2:
+            return 0.5
+        masks = []
+        for row in rows:
+            masks.append({
+                index for index, cell in enumerate(row)
+                if not self._is_empty_value(cell.value)
+            })
+        scores = []
+        for left, right in zip(masks, masks[1:]):
+            union = left | right
+            scores.append(len(left & right) / len(union) if union else 1.0)
+        return sum(scores) / len(scores)
+
+    def _build_headers_for_region(self, ws, rows, start, end):
+        headers = []
+        max_col = max((len(row) for row in rows[start:end]), default=0)
+        merged_ranges = list(ws.merged_cells.ranges)
+        for col_idx in range(max_col):
+            parts = []
+            for row_idx in range(start, end):
+                if col_idx >= len(rows[row_idx]):
+                    continue
+                value = rows[row_idx][col_idx].value
+                merged_value = self._get_merged_cell_value(ws, row_idx + 1, col_idx + 1, merged_ranges)
+                if merged_value is not None:
+                    value = merged_value
+                if self._is_empty_value(value):
+                    continue
+                value = str(value).strip()
+                is_child_header = row_idx > start and bool(parts)
+                if value not in parts and (self._is_valid_header_part(value) or is_child_header):
+                    parts.append(value)
+            headers.append("-".join(parts) if parts else f"Column_{col_idx + 1}")
+        return headers
+
+    def _build_sheet_context(self, ws, rows):
+        context_lines = []
+        merged_ranges = list(ws.merged_cells.ranges)
+        for row_idx, row in enumerate(rows, 1):
+            values = []
+            for col_idx, cell in enumerate(row, 1):
+                value = cell.value
+                merged_value = self._get_merged_cell_value(ws, row_idx, col_idx, merged_ranges)
+                if merged_value is not None:
+                    value = merged_value
+                if self._is_empty_value(value):
+                    continue
+                value = str(value).strip()
+                if not values or values[-1] != value:
+                    values.append(value)
+            if len(values) == 1:
+                context_lines.append(values[0])
+                continue
+            for index in range(0, len(values) - 1, 2):
+                context_lines.append(f"{values[index]}: {values[index + 1]}")
+            if len(values) % 2:
+                context_lines.append(values[-1])
+        deduplicated = []
+        for line in context_lines:
+            if line not in deduplicated:
+                deduplicated.append(line)
+        return "; ".join(deduplicated)[:1000]
 
     def _has_complex_header_structure(self, ws, rows):
         if len(rows) < 1:
@@ -327,9 +478,20 @@ class Excel(ExcelParser):
 
     def _is_empty_row(self, row_data):
         for val in row_data:
-            if val is not None and str(val).strip() != "":
+            if not self._is_empty_value(val):
                 return False
         return True
+
+    def _is_empty_value(self, value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        try:
+            missing = pd.isna(value)
+            return not hasattr(missing, "__len__") and bool(missing)
+        except (TypeError, ValueError):
+            return False
 
 
 def trans_datatime(s):
@@ -350,6 +512,16 @@ def trans_bool(s):
     return None
 
 
+def _is_missing_scalar(value):
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+        return not hasattr(missing, "__len__") and bool(missing)
+    except (TypeError, ValueError):
+        return False
+
+
 def column_data_type(arr):
     arr = list(arr)
     counts = {"int": 0, "float": 0, "text": 0, "datetime": 0, "bool": 0}
@@ -357,7 +529,7 @@ def column_data_type(arr):
              [(int, "int"), (float, "float"), (trans_datatime, "datetime"), (trans_bool, "bool"), (str, "text")]}
     float_flag = False
     for a in arr:
-        if a is None:
+        if _is_missing_scalar(a):
             continue
         if re.match(r"[+-]?[0-9]+$", str(a).replace("%%", "")) and not str(a).replace("%%", "").startswith("0"):
             counts["int"] += 1
@@ -378,7 +550,8 @@ def column_data_type(arr):
         counts = sorted(counts.items(), key=lambda x: x[1] * -1)
         ty = counts[0][0]
     for i in range(len(arr)):
-        if arr[i] is None:
+        if _is_missing_scalar(arr[i]):
+            arr[i] = None
             continue
         try:
             arr[i] = trans[ty](str(arr[i]))
@@ -465,6 +638,9 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
 
     res = []
     PY = Pinyin()
+    structured_engine = settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE
+    if not structured_engine:
+        KnowledgebaseService.delete_field_map(kwargs["kb_id"])
     # Field type suffixes for database columns
     # Maps data types to their database field suffixes
     fields_map = {"text": "_tks", "int": "_long", "keyword": "_kwd", "float": "_flt", "datetime": "_dt", "bool": "_kwd"}
@@ -486,18 +662,16 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
                 txts.extend([str(c) for c in cln if c])
         clmns_map = [(py_clmns[i].lower() + fields_map[clmn_tys[i]], str(display_clmns[i]).replace("_", " ")) for i in
                      range(len(clmns))]
-        # For Infinity/OceanBase: Use original column names as keys since they're stored in chunk_data JSON
-        # For ES/OS: Use full field names with type suffixes (e.g., url_kwd, body_tks)
-        if settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE:
-            # For Infinity/OceanBase: key = original column name, value = display name
+        # Structured engines retain source columns in chunk_data for SQL retrieval.
+        # ES/OpenSearch keeps rows in stable retrieval fields to avoid unbounded mappings.
+        if structured_engine:
             field_map = {py_clmns[i].lower(): str(display_clmns[i]).replace("_", " ") for i in range(len(clmns))}
-        else:
-            # For ES/OS: key = typed field name, value = display name
-            field_map = {k: v for k, v in clmns_map}
-        logging.debug(f"Field map: {field_map}")
-        KnowledgebaseService.update_parser_config(kwargs["kb_id"], {"field_map": field_map})
+            logging.debug(f"Field map: {field_map}")
+            KnowledgebaseService.update_parser_config(kwargs["kb_id"], {"field_map": field_map})
 
         eng = lang.lower() == "english"  # is_english(txts)
+        sheet_name = str(df.attrs.get("sheet_name", "")).strip()
+        sheet_context = str(df.attrs.get("sheet_context", "")).strip()
         for ii, row in df.iterrows():
             d = {"docnm_kwd": filename, "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename))}
             row_fields = []
@@ -509,22 +683,24 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
                     continue
                 if not isinstance(row[clmns[j]], pd.Series) and pd.isna(row[clmns[j]]):
                     continue
-                # For Infinity/OceanBase: Store in chunk_data JSON column
-                # For Elasticsearch/OpenSearch: Store as individual fields with type suffixes
-                if settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE:
+                # Structured engines retain source columns; ES/OpenSearch uses formatted_text below.
+                if structured_engine:
                     data_json[str(clmns[j])] = row[clmns[j]]
-                else:
-                    fld = clmns_map[j][0]
-                    d[fld] = row[clmns[j]] if clmn_tys[j] != "text" else rag_tokenizer.tokenize(row[clmns[j]])
                 row_fields.append((display_clmns[j], row[clmns[j]]))
             if not row_fields:
                 continue
             # Add the data JSON field to the document (for Infinity/OceanBase)
-            if settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE:
+            if structured_engine:
                 d["chunk_data"] = data_json
             # Format as a structured text for better LLM comprehension
             # Format each field as "- Field Name: Value" on separate lines
-            formatted_text = "\n".join([f"- {field}: {value}" for field, value in row_fields])
+            semantic_fields = []
+            if sheet_name:
+                semantic_fields.append(("Sheet", sheet_name))
+            if sheet_context:
+                semantic_fields.append(("Sheet context", sheet_context))
+            semantic_fields.extend(row_fields)
+            formatted_text = "\n".join([f"- {field}: {value}" for field, value in semantic_fields])
             tokenize(d, formatted_text, eng)
             res.append(d)
         if tbls:

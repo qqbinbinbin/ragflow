@@ -3,6 +3,7 @@ import logging
 import re
 from pathlib import Path
 
+import pandas as pd
 from dateutil.parser import parse as datetime_parse
 
 
@@ -15,6 +16,7 @@ def _load_column_data_type():
     namespace = {
         "datetime_parse": datetime_parse,
         "logging": logging,
+        "pd": pd,
         "re": re,
     }
     exec(compile(module, "rag/app/table.py", "exec"), namespace)
@@ -53,3 +55,16 @@ def test_table_column_type_keeps_supported_four_digit_dates_as_datetime():
         "2025-02-09 00:00:00",
         "2025-03-09 00:00:00",
     ]
+
+
+def test_table_column_type_keeps_missing_scalars_out_of_content_and_type_vote():
+    column_data_type = _load_column_data_type()
+
+    values, column_type = column_data_type([
+        float("nan"),
+        pd.NA,
+        "North",
+    ])
+
+    assert column_type == "text"
+    assert values == [None, None, "North"]

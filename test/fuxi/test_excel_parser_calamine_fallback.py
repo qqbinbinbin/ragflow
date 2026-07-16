@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import Workbook
 
 
 def _load_excel_parser_class():
@@ -22,33 +23,78 @@ def _load_excel_parser_class():
     return module
 
 
-def test_calamine_fallback_reads_every_legacy_excel_sheet(monkeypatch):
+def test_calamine_fallback_preserves_raw_rows_merges_and_empty_cells(monkeypatch):
     module = _load_excel_parser_class()
     RAGFlowExcelParser = module.RAGFlowExcelParser
-    calls = []
-    sheets = {
-        "Cover": pd.DataFrame(),
-        "Part approval": pd.DataFrame({"part": ["A-1"]}),
-        "Inspection": pd.DataFrame({"result": ["pass"]}),
-    }
+
+    class FakeSheet:
+        start = (1, 0)
+        merged_cell_ranges = [((1, 0), (1, 2)), ((3, 0), (4, 0))]
+
+        @staticmethod
+        def iter_rows():
+            return iter([
+                ["", "", ""],
+                ["Supplier report", "", ""],
+                ["", "", ""],
+                ["Part", "Supplier", "Status"],
+                ["", "Name", "Quality"],
+                ["P-1", "North", "Approved"],
+            ])
+
+    class FakeEmptySheet:
+        start = None
+        merged_cell_ranges = []
+
+        @staticmethod
+        def iter_rows():
+            return iter([])
+
+    class FakeCalamineWorkbook:
+        sheet_names = ["Cover", "Supplier matrix"]
+
+        @staticmethod
+        def from_filelike(_file):
+            return FakeCalamineWorkbook()
+
+        @staticmethod
+        def get_sheet_by_name(name):
+            return FakeEmptySheet() if name == "Cover" else FakeSheet()
 
     def fake_load_workbook(*_args, **_kwargs):
         raise ValueError("legacy OLE workbook")
 
-    def fake_read_excel(_file, **kwargs):
-        calls.append(kwargs)
-        if kwargs.get("engine") != "calamine":
-            raise AssertionError("xlrd cannot read workbook formatting")
-        return sheets
-
     monkeypatch.setattr(module, "load_workbook", fake_load_workbook)
-    monkeypatch.setattr(module.pd, "read_excel", fake_read_excel)
+    monkeypatch.setitem(
+        sys.modules,
+        "python_calamine",
+        types.SimpleNamespace(CalamineWorkbook=FakeCalamineWorkbook),
+    )
 
     workbook = RAGFlowExcelParser._load_excel_to_workbook(
         BytesIO(b"\xd0\xcf\x11\xe0fixture")
     )
 
-    assert calls[-1] == {"sheet_name": None, "engine": "calamine"}
-    assert workbook.sheetnames == ["Cover", "Part approval", "Inspection"]
-    assert workbook["Part approval"]["A2"].value == "A-1"
-    assert workbook["Inspection"]["A2"].value == "pass"
+    assert workbook.sheetnames == ["Cover", "Supplier matrix"]
+    assert workbook["Cover"].max_row == 1
+    sheet = workbook["Supplier matrix"]
+    assert sheet["A1"].value is None
+    assert sheet["A2"].value == "Supplier report"
+    assert sheet["A3"].value is None
+    assert sheet["A4"].value == "Part"
+    assert sheet["A6"].value == "P-1"
+    assert sheet["B6"].value == "North"
+    assert str(sheet["B3"].value).lower() != "nan"
+    assert {str(cell_range) for cell_range in sheet.merged_cells.ranges} == {
+        "A2:C2",
+        "A4:A5",
+    }
+
+
+def test_dataframe_workbook_conversion_keeps_missing_values_empty():
+    module = _load_excel_parser_class()
+    workbook = module.RAGFlowExcelParser._dataframe_to_workbook(
+        pd.DataFrame({"Part": ["P-1"], "Optional": [float("nan")]})
+    )
+
+    assert workbook.active["B2"].value is None
