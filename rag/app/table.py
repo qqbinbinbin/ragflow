@@ -519,6 +519,20 @@ class Excel(ExcelParser):
             return False
 
 
+def build_structure_projection(filename, binary, *, producer_generation_ref=None, **kwargs):
+    """Build a dedicated no-vector structure generation from full source bytes."""
+
+    from rag.app.tabular_structure import build_tabular_structure_projection
+
+    return build_tabular_structure_projection(
+        filename,
+        binary,
+        producer_generation_ref=producer_generation_ref,
+        parser=Excel(),
+        **kwargs,
+    )
+
+
 def trans_datatime(s):
     try:
         parsed = datetime_parse(s.strip())
