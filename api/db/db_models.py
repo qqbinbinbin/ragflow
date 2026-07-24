@@ -921,6 +921,30 @@ class Document(DataBaseModel):
         db_table = "document"
 
 
+class TabularStructureGeneration(DataBaseModel):
+    producer_generation_ref = CharField(max_length=36, primary_key=True)
+    tenant_id = CharField(max_length=32, null=False, index=True)
+    kb_id = CharField(max_length=256, null=False, index=True)
+    document_id = CharField(max_length=32, null=False, index=True)
+    projection_version = CharField(max_length=64, null=False)
+    producer_schema_version = CharField(max_length=64, null=False)
+    manifest_object_name = CharField(max_length=512, null=False)
+    manifest_sha256 = CharField(max_length=64, null=False)
+    source_sha256 = CharField(max_length=64, null=False)
+    row_count = BigIntegerField(null=False)
+    part_count = IntegerField(null=False)
+    status = CharField(max_length=16, null=False, index=True)
+    safe_error_code = CharField(max_length=64, null=True)
+    activated_at = DateTimeField(null=True)
+    retained_at = DateTimeField(null=True)
+
+    class Meta:
+        db_table = "tabular_structure_generation"
+        indexes = (
+            (("tenant_id", "kb_id", "document_id", "status"), False),
+        )
+
+
 class File(DataBaseModel):
     id = CharField(max_length=32, primary_key=True)
     parent_id = CharField(max_length=32, null=False, help_text="parent folder id", index=True)

@@ -132,6 +132,14 @@ def _run(coro):
 
 def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     repo_root = Path(__file__).resolve().parents[4]
+    quart_mod = ModuleType("quart")
+    quart_mod.request = SimpleNamespace(args={}, headers={})
+    monkeypatch.setitem(sys.modules, "quart", quart_mod)
+
+    xxhash_mod = ModuleType("xxhash")
+    xxhash_mod.xxh64 = lambda value: SimpleNamespace(hexdigest=lambda: f"chunk-{len(value)}")
+    monkeypatch.setitem(sys.modules, "xxhash", xxhash_mod)
+
     common_pkg = ModuleType("common")
     common_pkg.__path__ = [str(repo_root / "common")]
     monkeypatch.setitem(sys.modules, "common", common_pkg)
@@ -245,7 +253,13 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     api_utils_mod.get_error_data_result = lambda message="Sorry! Data missing!", code=102: {"code": code, "message": message}
     api_utils_mod.get_request_json = lambda: _AwaitableValue({})
     api_utils_mod.get_result = lambda code=0, message="", data=None, total=None: {
-        key: value for key, value in {"code": code, "message": message, "data": data, "total": total}.items() if value is not None
+        key: value
+        for key, value in (
+            {"code": code, "data": data, "total": total}.items()
+            if code == 0
+            else {"code": code, "message": message or "Error"}.items()
+        )
+        if value is not None
     }
     api_utils_mod.server_error_response = lambda e: {"code": 500, "message": str(e)}
     monkeypatch.setitem(sys.modules, "api.utils.api_utils", api_utils_mod)
@@ -472,6 +486,7 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
 
     tenant_model_service_mod.get_model_config_by_id = _get_model_config_by_id
     tenant_model_service_mod.get_model_config_from_provider_instance = _get_model_config_from_provider_instance
+    tenant_model_service_mod.split_model_name = lambda model_name: (model_name, "")
     tenant_model_service_mod.resolve_model_config = _get_model_config_from_provider_instance
     tenant_model_service_mod.get_tenant_default_model_by_type = _get_tenant_default_model_by_type
     monkeypatch.setitem(sys.modules, "api.db.joint_services.tenant_model_service", tenant_model_service_mod)
@@ -503,12 +518,7 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
 
 
 def _load_restful_chunk_module(monkeypatch):
-    repo_root = Path(__file__).resolve().parents[4]
-    helper_path = repo_root / "test" / "testcases" / "test_web_api" / "test_chunk_app" / "test_chunk_routes_unit.py"
-    spec = importlib.util.spec_from_file_location("test_restful_chunk_route_helpers", helper_path)
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
-    return helper._load_chunk_api_module(monkeypatch)
+    return _load_doc_module(monkeypatch)
 
 
 def _route_core(func):
@@ -897,6 +907,97 @@ class TestDocRoutesUnit:
         assert res["code"] == 0
         assert res["data"]["total"] == 1
         assert res["data"]["chunks"][0]["id"] == "chunk-1"
+
+    def test_tabular_structure_manifest_authorizes_before_service_read(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: False)
+        monkeypatch.setattr(
+            module,
+            "_get_tabular_structure_service",
+            lambda: (_ for _ in ()).throw(AssertionError("generation service must not run before authorization")),
+        )
+        monkeypatch.setattr(module, "request", SimpleNamespace(args=_DummyArgs({"generation_ref": "generation-1"})))
+
+        res = _run(_route_core(module.get_tabular_structure_manifest)("tenant-1", "ds-1", "doc-1"))
+
+        assert "don't own the dataset" in res["message"]
+
+    def test_tabular_structure_routes_require_exact_generation_and_return_bounded_data(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        calls = []
+
+        class _Service:
+            @staticmethod
+            def read_active_manifest(storage, **kwargs):
+                calls.append(("manifest", storage, kwargs))
+                return {
+                    "producer_generation_ref": kwargs["producer_generation_ref"],
+                    "projection_version": "tabular-structure-projection/v1",
+                    "producer_schema_version": "table-producer/v1",
+                    "row_count": 3,
+                    "tables": [{"table_ref": "table-1", "source_total_count": 3}],
+                }
+
+            @staticmethod
+            def read_active_rows(storage, **kwargs):
+                calls.append(("rows", storage, kwargs))
+                return {
+                    "producer_generation_ref": kwargs["producer_generation_ref"],
+                    "table_ref": kwargs["table_ref"],
+                    "rows": [{"row_ref_kwd": "row-1"}],
+                    "total": 3,
+                    "source_total_count": 3,
+                    "has_more": False,
+                    "next_cursor": None,
+                }
+
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+        monkeypatch.setattr(module, "_get_tabular_structure_service", lambda: _Service)
+        monkeypatch.setattr(module, "request", SimpleNamespace(args=_DummyArgs({})))
+
+        missing = _run(_route_core(module.get_tabular_structure_manifest)("tenant-1", "ds-1", "doc-1"))
+        assert "generation_ref" in missing["message"]
+        assert calls == []
+
+        monkeypatch.setattr(module, "request", SimpleNamespace(args=_DummyArgs({"generation_ref": "generation-1"})))
+        manifest = _run(_route_core(module.get_tabular_structure_manifest)("tenant-1", "ds-1", "doc-1"))
+        assert manifest["code"] == 0
+        assert "manifest_object_name" not in manifest["data"]
+
+        monkeypatch.setattr(
+            module,
+            "request",
+            SimpleNamespace(args=_DummyArgs({"generation_ref": "generation-1", "cursor": "2", "page_size": "25"})),
+        )
+        rows = _run(_route_core(module.list_tabular_structure_rows)("tenant-1", "ds-1", "doc-1", "table-1"))
+        assert rows["code"] == 0
+        assert rows["data"]["has_more"] is False
+        assert calls[0][2] == {
+            "tenant_id": "owner-tenant",
+            "dataset_id": "ds-1",
+            "document_id": "doc-1",
+            "producer_generation_ref": "generation-1",
+        }
+        assert calls[1][2] == {
+            "tenant_id": "owner-tenant",
+            "dataset_id": "ds-1",
+            "document_id": "doc-1",
+            "producer_generation_ref": "generation-1",
+            "table_ref": "table-1",
+            "cursor": 2,
+            "page_size": 25,
+        }
+
+    def test_tabular_structure_error_returns_stable_reason_without_exception_text(self, monkeypatch, caplog):
+        module = _load_restful_chunk_module(monkeypatch)
+
+        response = module._tabular_structure_error_response(RuntimeError("private-object-path"))
+
+        assert response["message"] == "provider_failure"
+        assert response["data"] == {"reason": "provider_failure"}
+        assert "private-object-path" not in caplog.text
 
     def test_list_chunks_uses_dataset_owner_index_for_team_dataset(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)

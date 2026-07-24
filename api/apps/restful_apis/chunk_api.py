@@ -67,6 +67,40 @@ from rag.prompts.generator import cross_languages, keyword_extraction
 
 DOC_STOP_PARSING_INVALID_STATE_MESSAGE = "Can't stop parsing document that has not started or already completed"
 DOC_STOP_PARSING_INVALID_STATE_ERROR_CODE = "DOC_STOP_PARSING_INVALID_STATE"
+TABULAR_STRUCTURE_PAGE_SIZE_MAX = 3000
+
+
+def _get_tabular_structure_service():
+    from api.db.services.tabular_structure_service import TabularStructureService
+
+    return TabularStructureService
+
+
+def _tabular_structure_error_response(error):
+    from rag.app.tabular_structure import StructureGenerationConflict, StructureSnapshotChanged, StructureSnapshotMissing
+
+    if isinstance(error, StructureSnapshotMissing):
+        reason = "structure_snapshot_missing"
+    elif isinstance(error, (StructureSnapshotChanged, StructureGenerationConflict)):
+        reason = "structure_snapshot_changed"
+    elif isinstance(error, (ValueError, TypeError)):
+        reason = "invalid_structure_request"
+    else:
+        logging.error("Tabular structure read failed: provider_failure")
+        reason = "provider_failure"
+    return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+
+
+def _authorized_structure_owner(tenant_id, dataset_id, document_id):
+    if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
+        return None, get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    docs = DocumentService.query(id=document_id, kb_id=dataset_id)
+    if not docs:
+        return None, get_error_data_result(message=f"You don't own the document {document_id}.")
+    found, dataset = KnowledgebaseService.get_by_id(dataset_id)
+    if not found or not getattr(dataset, "tenant_id", None):
+        return None, get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    return dataset.tenant_id, None
 
 
 def _decode_chunk_image_base64(image_base64):
@@ -148,6 +182,59 @@ def _get_query_id_list(args, name: str) -> list[str]:
                 ids.append(item)
                 seen.add(item)
     return ids
+
+
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def get_tabular_structure_manifest(tenant_id, dataset_id, document_id):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    generation_ref = str(request.args.get("generation_ref") or "").strip()
+    if not generation_ref:
+        return get_error_data_result(message="`generation_ref` is required")
+    try:
+        data = _get_tabular_structure_service().read_active_manifest(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=generation_ref,
+        )
+        return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/<table_ref>/rows", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def list_tabular_structure_rows(tenant_id, dataset_id, document_id, table_ref):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    generation_ref = str(request.args.get("generation_ref") or "").strip()
+    if not generation_ref:
+        return get_error_data_result(message="`generation_ref` is required")
+    try:
+        cursor = int(request.args.get("cursor", 0))
+        page_size = int(request.args.get("page_size", 30))
+        if cursor < 0 or page_size < 1 or page_size > TABULAR_STRUCTURE_PAGE_SIZE_MAX:
+            raise ValueError("invalid structure pagination")
+        data = _get_tabular_structure_service().read_active_rows(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=generation_ref,
+            table_ref=table_ref,
+            cursor=cursor,
+            page_size=page_size,
+        )
+        return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
 
 
 def _strip_chunk_runtime_fields(chunk):

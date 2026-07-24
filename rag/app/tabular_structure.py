@@ -44,6 +44,7 @@ PROJECTION_FIELDS = frozenset(
 
 DEFAULT_CONTEXT_ENTRY_LIMIT = 8
 DEFAULT_CONTEXT_VALUE_BYTES = 128
+DEFAULT_TABLE_LABEL_BYTES = 128
 DEFAULT_ROWS_PER_PART = 3000
 
 PROJECTION_ROW_FIELDS = frozenset(
@@ -67,6 +68,18 @@ PROJECTION_ROW_FIELDS = frozenset(
 
 _ULID_RE = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 _UNTRUSTED_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+class StructureGenerationConflict(RuntimeError):
+    """The persistent generation state violates its single-active invariant."""
+
+
+class StructureSnapshotMissing(LookupError):
+    """The requested immutable structure generation is not readable."""
+
+
+class StructureSnapshotChanged(RuntimeError):
+    """The requested immutable structure generation no longer matches its digest."""
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -445,6 +458,10 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         ):
             if not isinstance(row[field_name], str):
                 raise ValueError(f"{label} must be a string")
+        if len(row["table_label_kwd"].encode("utf-8")) > DEFAULT_TABLE_LABEL_BYTES:
+            raise ValueError("table label exceeds the UTF-8 byte limit")
+        if _sanitize_untrusted_text(row["table_label_kwd"]) != row["table_label_kwd"]:
+            raise ValueError("table label contains unsafe controls")
         if row["row_role_kwd"] not in {"data", "note", "unknown"}:
             raise ValueError("invalid structure row role")
         if not isinstance(row["row_ordinal_int"], int) or isinstance(row["row_ordinal_int"], bool) or row["row_ordinal_int"] < 1:
@@ -468,6 +485,7 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             raise ValueError("structure record identity does not match its generation and row reference")
         if row["row_ref_kwd"] != f"{row['table_ref_kwd']}:{row['row_ordinal_int']}":
             raise ValueError("row reference does not match table and physical row identity")
+        parsed_lists = {}
         for field_name, label in (
             ("table_context_list", "table context"),
             ("ordered_fields_list", "ordered fields"),
@@ -486,6 +504,15 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
                 for item in values
             ):
                 raise ValueError(f"{label} must use the fixed name/value schema")
+            parsed_lists[field_name] = values
+        context = parsed_lists["table_context_list"]
+        if len(context) > DEFAULT_CONTEXT_ENTRY_LIMIT:
+            raise ValueError("table context exceeds the entry limit")
+        for item in context:
+            if any(len(item[field].encode("utf-8")) > DEFAULT_CONTEXT_VALUE_BYTES for field in ("name", "value")):
+                raise ValueError("table context exceeds the UTF-8 byte limit")
+            if any(_sanitize_untrusted_text(item[field]) != item[field] for field in ("name", "value")):
+                raise ValueError("table context contains unsafe controls")
         if row["id"] in ids or row["row_ref_kwd"] in row_refs:
             raise ValueError("duplicate structure row identity")
         ids.add(row["id"])
@@ -493,6 +520,10 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         by_table.setdefault(row["table_ref_kwd"], []).append(row)
 
     for table_rows in by_table.values():
+        if len({row["table_label_kwd"] for row in table_rows}) != 1:
+            raise ValueError("table label is not generation-wide")
+        if len({row["table_context_list"] for row in table_rows}) != 1:
+            raise ValueError("table context is not generation-wide")
         ordinals = [row["row_ordinal_int"] for row in table_rows]
         if ordinals != sorted(ordinals) or len(ordinals) != len(set(ordinals)):
             raise ValueError("structure rows are not in deterministic physical order")
@@ -661,4 +692,172 @@ def store_tabular_structure_projection(
         "manifest_sha256": manifest_sha256,
         "part_count": len(parts),
         "row_count": len(projection["rows"]),
+    }
+
+
+def _get_immutable_object(storage, bucket: str, object_name: str, tenant_id: str | None) -> bytes:
+    payload = _storage_call(storage.get, bucket, object_name, tenant_id=tenant_id)
+    if not isinstance(payload, bytes) or not payload:
+        raise StructureSnapshotMissing("structure snapshot object is missing")
+    return payload
+
+
+def _decode_snapshot_json(payload: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StructureSnapshotChanged(f"{label} payload is invalid") from exc
+    if not isinstance(value, dict):
+        raise StructureSnapshotChanged(f"{label} payload is invalid")
+    return value
+
+
+def load_tabular_structure_projection(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    manifest_object_name: str,
+    manifest_sha256: str,
+    expected_part_count: int | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Read and verify one exact immutable projection generation."""
+
+    if not bucket or not document_id or not manifest_object_name:
+        raise StructureSnapshotMissing("structure snapshot identity is missing")
+    _validate_generation_ref(producer_generation_ref)
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256 or ""):
+        raise StructureSnapshotChanged("manifest digest is invalid")
+    document_ref = _versioned_digest("tabular-structure-document/v1", document_id)
+    expected_prefix = f"_fuxi/tabular-structure/v1/{document_ref}/{producer_generation_ref}/"
+    expected_manifest_name = f"{expected_prefix}manifest-{manifest_sha256}.json"
+    if manifest_object_name != expected_manifest_name:
+        raise StructureSnapshotChanged("manifest document scope changed")
+
+    manifest_payload = _get_immutable_object(storage, bucket, manifest_object_name, tenant_id)
+    if hashlib.sha256(manifest_payload).hexdigest() != manifest_sha256:
+        raise StructureSnapshotChanged("manifest digest changed")
+    manifest = _decode_snapshot_json(manifest_payload, "manifest")
+    expected_manifest_fields = {
+        "version",
+        "producer_schema_version",
+        "producer_generation_ref",
+        "source_sha256",
+        "row_count",
+        "tables",
+        "parts",
+    }
+    if set(manifest) != expected_manifest_fields:
+        raise StructureSnapshotChanged("manifest schema changed")
+    if manifest["version"] != PROJECTION_VERSION or manifest["producer_schema_version"] != PRODUCER_SCHEMA_VERSION:
+        raise StructureSnapshotChanged("manifest version changed")
+    if manifest["producer_generation_ref"] != producer_generation_ref:
+        raise StructureSnapshotChanged("manifest generation changed")
+    if not isinstance(manifest["parts"], list):
+        raise StructureSnapshotChanged("manifest parts changed")
+    if expected_part_count is not None and (
+        not isinstance(expected_part_count, int)
+        or isinstance(expected_part_count, bool)
+        or expected_part_count < 0
+        or len(manifest["parts"]) != expected_part_count
+    ):
+        raise StructureSnapshotChanged("generation part count changed")
+
+    rows: list[dict[str, Any]] = []
+    expected_offset = 0
+    for expected_part_number, part_manifest in enumerate(manifest["parts"], start=1):
+        expected_part_fields = {"part_number", "object_name", "row_offset", "row_count", "sha256"}
+        if not isinstance(part_manifest, dict) or set(part_manifest) != expected_part_fields:
+            raise StructureSnapshotChanged("part manifest changed")
+        if (
+            part_manifest["part_number"] != expected_part_number
+            or part_manifest["row_offset"] != expected_offset
+            or not isinstance(part_manifest["row_count"], int)
+            or isinstance(part_manifest["row_count"], bool)
+            or part_manifest["row_count"] < 0
+            or not isinstance(part_manifest["object_name"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(part_manifest["sha256"]))
+        ):
+            raise StructureSnapshotChanged("part manifest changed")
+        expected_part_name = f"{expected_prefix}part-{expected_part_number:06d}-{part_manifest['sha256']}.json"
+        if part_manifest["object_name"] != expected_part_name:
+            raise StructureSnapshotChanged("part document scope changed")
+
+        part_payload = _get_immutable_object(storage, bucket, part_manifest["object_name"], tenant_id)
+        if hashlib.sha256(part_payload).hexdigest() != part_manifest["sha256"]:
+            raise StructureSnapshotChanged("part digest changed")
+        part = _decode_snapshot_json(part_payload, "part")
+        if set(part) != {"version", "producer_generation_ref", "part_number", "row_offset", "row_count", "rows"}:
+            raise StructureSnapshotChanged("part schema changed")
+        if (
+            part["version"] != PROJECTION_PART_VERSION
+            or part["producer_generation_ref"] != producer_generation_ref
+            or part["part_number"] != expected_part_number
+            or part["row_offset"] != expected_offset
+            or part["row_count"] != part_manifest["row_count"]
+            or not isinstance(part["rows"], list)
+            or len(part["rows"]) != part["row_count"]
+        ):
+            raise StructureSnapshotChanged("part generation changed")
+        rows.extend(part["rows"])
+        expected_offset += part["row_count"]
+
+    if expected_offset != manifest["row_count"]:
+        raise StructureSnapshotChanged("manifest row count changed")
+    projection = {
+        "version": manifest["version"],
+        "producer_schema_version": manifest["producer_schema_version"],
+        "producer_generation_ref": producer_generation_ref,
+        "source_sha256": manifest["source_sha256"],
+        "tables": manifest["tables"],
+        "rows": rows,
+    }
+    try:
+        validate_tabular_structure_projection(projection)
+    except ValueError as exc:
+        raise StructureSnapshotChanged("structure projection validation changed") from exc
+    return projection
+
+
+def page_tabular_structure_rows(
+    projection: dict[str, Any],
+    *,
+    table_ref: str,
+    cursor: int = 0,
+    page_size: int = 30,
+) -> dict[str, Any]:
+    """Return one stable offset page from an already verified generation."""
+
+    validate_tabular_structure_projection(projection)
+    if not isinstance(table_ref, str) or not table_ref:
+        raise ValueError("table_ref is required")
+    if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+        raise ValueError("cursor must be a non-negative integer")
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
+        raise ValueError("page_size must be a positive integer")
+
+    table = next((item for item in projection["tables"] if item["table_ref"] == table_ref), None)
+    if table is None:
+        raise StructureSnapshotMissing("table snapshot is missing")
+    rows = [row for row in projection["rows"] if row["table_ref_kwd"] == table_ref]
+    rows.sort(
+        key=lambda row: (
+            row["data_row_index_int"] if row["data_row_index_int"] is not None else float("inf"),
+            row["row_ordinal_int"],
+            row["row_ref_kwd"],
+        )
+    )
+    page_rows = rows[cursor : cursor + page_size]
+    next_cursor = cursor + len(page_rows)
+    has_more = next_cursor < len(rows)
+    return {
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "table_ref": table_ref,
+        "rows": page_rows,
+        "total": len(rows),
+        "source_total_count": table["source_total_count"],
+        "has_more": has_more,
+        "next_cursor": next_cursor if has_more else None,
     }
