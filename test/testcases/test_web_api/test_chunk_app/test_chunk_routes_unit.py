@@ -17,7 +17,6 @@
 import asyncio
 import inspect
 import importlib.util
-import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -215,8 +214,8 @@ def _load_chunk_module(monkeypatch):
         EMBEDDING = SimpleNamespace(value="embedding")
         CHAT = SimpleNamespace(value="chat")
         RERANK = SimpleNamespace(value="rerank")
-        SPEECH2TEXT = SimpleNamespace(value="speech2text")
-        IMAGE2TEXT = SimpleNamespace(value="image2text")
+        ASR = SimpleNamespace(value="asr")
+        VISION = SimpleNamespace(value="vision")
         TTS = SimpleNamespace(value="tts")
         OCR = SimpleNamespace(value="ocr")
 
@@ -290,7 +289,7 @@ def _load_chunk_module(monkeypatch):
     api_utils_mod.get_result = lambda data=None, message="", code=0: {"code": code, "message": message, "data": data}
     api_utils_mod.get_error_data_result = lambda message="": {"code": _DummyRetCode.DATA_ERROR, "message": message, "data": False}
     api_utils_mod.server_error_response = lambda exc: {"code": _DummyRetCode.EXCEPTION_ERROR, "message": repr(exc), "data": False}
-    api_utils_mod.validate_request = lambda *_args, **_kwargs: (lambda fn: fn)
+    api_utils_mod.validate_request = lambda *_args, **_kwargs: lambda fn: fn
     api_utils_mod.add_tenant_id_to_kwargs = lambda func: func
     api_utils_mod.check_duplicate_ids = lambda ids, _kind: (list(dict.fromkeys(ids)), [] if len(ids) == len(set(ids)) else [f"Duplicate {_kind} ids"])
     api_utils_mod.get_request_json = lambda: _AwaitableValue({})
@@ -310,7 +309,8 @@ def _load_chunk_module(monkeypatch):
 
     tenant_model_service_mod = ModuleType("api.db.joint_services.tenant_model_service")
     tenant_model_service_mod.get_model_config_by_id = lambda *_args, **_kwargs: {"llm_name": "embed", "model_type": "embedding"}
-    tenant_model_service_mod.get_model_config_by_type_and_name = lambda *_args, **_kwargs: {"llm_name": "embed", "model_type": "embedding"}
+    tenant_model_service_mod.get_model_config_from_provider_instance = lambda *_args, **_kwargs: {"llm_name": "embed", "model_type": "embedding"}
+    tenant_model_service_mod.resolve_model_config = lambda *_args, **_kwargs: {"llm_name": "embed", "model_type": "embedding"}
     tenant_model_service_mod.get_tenant_default_model_by_type = lambda *_args, **_kwargs: {"llm_name": "chat", "model_type": "chat"}
     monkeypatch.setitem(sys.modules, "api.db.joint_services.tenant_model_service", tenant_model_service_mod)
 
@@ -346,7 +346,7 @@ def _load_chunk_module(monkeypatch):
 
         @staticmethod
         def get_tenant_embd_id(_doc_id):
-            return 1
+            return "tm-embd-1"
 
         @staticmethod
         def decrement_chunk_num(*args):
@@ -378,7 +378,7 @@ def _load_chunk_module(monkeypatch):
 
         @staticmethod
         def get_by_id(_kb_id):
-            return True, SimpleNamespace(pagerank=0.6, tenant_embd_id=2, tenant_llm_id=1)
+            return True, SimpleNamespace(pagerank=0.6, tenant_id="tenant-1", tenant_embd_id="tm-embd-2", tenant_llm_id="tm-llm-1")
 
     kb_service_mod.KnowledgebaseService = _KnowledgebaseService
     monkeypatch.setitem(sys.modules, "api.db.services.knowledgebase_service", kb_service_mod)
@@ -387,12 +387,7 @@ def _load_chunk_module(monkeypatch):
     class _DummyLLMService:
         @staticmethod
         def query(**_kwargs):
-            return [SimpleNamespace(
-                llm_name="gpt-3.5-turbo",
-                model_type="chat",
-                max_tokens=8192,
-                is_tools=True
-            )]
+            return [SimpleNamespace(llm_name="gpt-3.5-turbo", model_type="chat", max_tokens=8192, is_tools=True)]
 
     llm_service_mod = ModuleType("api.db.services.llm_service")
     llm_service_mod.LLMService = _DummyLLMService
@@ -428,22 +423,13 @@ def _load_chunk_module(monkeypatch):
                 api_base="https://api.example.com",
                 max_tokens=8192,
                 used_tokens=0,
-                status=1
+                status=1,
             )
 
         @staticmethod
         def get_api_key(tenant_id, model_name):
             return _MockTableObject(
-                id=1,
-                tenant_id=tenant_id,
-                llm_factory="",
-                model_type="chat",
-                llm_name=model_name,
-                api_key="fake-api-key",
-                api_base="https://api.example.com",
-                max_tokens=8192,
-                used_tokens=0,
-                status=1
+                id=1, tenant_id=tenant_id, llm_factory="", model_type="chat", llm_name=model_name, api_key="fake-api-key", api_base="https://api.example.com", max_tokens=8192, used_tokens=0, status=1
             )
 
         @staticmethod
@@ -466,13 +452,13 @@ def _load_chunk_module(monkeypatch):
         def get_by_id(tenant_id):
             return True, SimpleNamespace(
                 llm_id="gpt-3.5-turbo",
-                tenant_llm_id=1,
+                tenant_llm_id="tm-llm-1",
                 embd_id="text-embedding-ada-002",
-                tenant_embd_id=2,
+                tenant_embd_id="tm-embd-2",
                 asr_id="whisper-1",
                 img2txt_id="gpt-4-vision-preview",
                 rerank_id="bge-reranker",
-                tts_id="tts-1"
+                tts_id="tts-1",
             )
 
     tenant_llm_service_mod.TenantLLMService = _TenantLLMService
@@ -491,13 +477,15 @@ def _load_chunk_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "api.db.services.user_service", user_service_mod)
     services_pkg.user_service = user_service_mod
 
-    module_name = "test_chunk_routes_unit_module"
     module_path = repo_root / "api" / "apps" / "chunk_app.py"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    module.manager = _DummyManager()
-    monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
+    module = None
+    if module_path.exists():
+        module_name = "test_chunk_routes_unit_module"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        module.manager = _DummyManager()
+        monkeypatch.setitem(sys.modules, module_name, module)
+        spec.loader.exec_module(module)
     return module
 
 
@@ -654,166 +642,76 @@ def test_restful_chunk_guard_branches_unit(monkeypatch):
 
 
 @pytest.mark.p2
-def test_retrieval_test_branch_matrix_unit(monkeypatch):
-    module = _load_chunk_module(monkeypatch)
-    module.request = SimpleNamespace(headers={"X-Request-ID": "req-r"}, args={})
+def test_restful_add_chunk_invalid_image_base64_does_not_index_chunk(monkeypatch):
+    module = _load_chunk_api_module(monkeypatch)
+    module.request = SimpleNamespace(args={}, headers={})
+    module.settings.docStoreConn.inserted.clear()
 
-    applied_filters = []
-    llm_calls = []
-    cross_calls = []
-    keyword_calls = []
-
-    async def _apply_filter(meta_data_filter, metas, question, chat_mdl, local_doc_ids):
-        applied_filters.append(
-            {
-                "meta_data_filter": meta_data_filter,
-                "metas": metas,
-                "question": question,
-                "chat_mdl": chat_mdl,
-                "local_doc_ids": list(local_doc_ids),
-            }
-        )
-        return ["doc-filtered"]
-
-    async def _cross_languages(_tenant_id, _dialog, question, langs):
-        cross_calls.append((question, tuple(langs)))
-        return f"{question}-xl"
-
-    async def _keyword_extraction(_chat_mdl, question):
-        keyword_calls.append(question)
-        return "-kw"
-
-    class _Retriever:
-        def __init__(self, mode="ok"):
-            self.mode = mode
-            self.retrieval_questions = []
-
-        async def retrieval(self, question, *_args, **_kwargs):
-            if self.mode == "not_found":
-                raise Exception("boom not_found boom")
-            if self.mode == "explode":
-                raise RuntimeError("retrieval boom")
-            self.retrieval_questions.append(question)
-            return {"chunks": [{"id": "c1", "vector": [0.1], "content_with_weight": "chunk-content"}]}
-
-        def retrieval_by_children(self, chunks, _tenant_ids):
-            return list(chunks)
-
-    class _KgRetriever:
-        async def retrieval(self, *_args, **_kwargs):
-            return {"id": "kg-1", "content_with_weight": "kg-content"}
-
-    class _NoContentKgRetriever:
-        async def retrieval(self, *_args, **_kwargs):
-            return {"id": "kg-2", "content_with_weight": ""}
-
-    monkeypatch.setattr(module, "LLMBundle", lambda *args, **kwargs: llm_calls.append((args, kwargs)) or SimpleNamespace())
-    monkeypatch.setattr(module, "get_model_config_by_type_and_name", lambda *_args, **_kwargs: {"llm_name": "stub-model", "model_type": "chat"})
-    monkeypatch.setattr(module, "get_tenant_default_model_by_type", lambda *_args, **_kwargs: {"llm_name": "stub-model", "model_type": "chat"})
-    monkeypatch.setattr(module, "get_model_config_by_id", lambda *_args, **_kwargs: {"llm_name": "stub-model", "model_type": "embedding"})
-    monkeypatch.setattr(module.DocMetadataService, "get_flatted_meta_by_kbs", lambda _kb_ids: [{"meta": "v"}], raising=False)
-    monkeypatch.setattr(module, "apply_meta_data_filter", _apply_filter)
-    monkeypatch.setattr(module.SearchService, "get_detail", lambda _sid: {"search_config": {"meta_data_filter": {"method": "auto"}, "chat_id": "chat-1"}}, raising=False)
-    monkeypatch.setattr(module, "cross_languages", _cross_languages)
-    monkeypatch.setattr(module, "keyword_extraction", _keyword_extraction)
-    monkeypatch.setattr(module, "label_question", lambda *_args, **_kwargs: ["lbl"])
-    monkeypatch.setattr(module.UserTenantService, "query", lambda **_kwargs: [_DummyTenant("tenant-1")])
-
-    monkeypatch.setattr(module.KnowledgebaseService, "query", lambda **_kwargs: False, raising=False)
-    _set_request_json(monkeypatch, module, {"kb_id": "kb-1", "question": "q", "search_id": "search-1"})
-    res = _run(module.retrieval_test())
-    assert res["code"] == module.RetCode.OPERATING_ERROR, res
-    assert "Only owner of dataset authorized for this operation." in res["message"], res
-    assert applied_filters and applied_filters[-1]["meta_data_filter"]["method"] == "auto"
-    assert llm_calls, "search_id metadata auto branch should instantiate chat model"
-
-    _set_request_json(monkeypatch, module, {"kb_id": [], "question": "q"})
-    res = _run(module.retrieval_test())
-    assert res["code"] == module.RetCode.DATA_ERROR, res
-    assert "Please specify dataset firstly." in res["message"], res
-
-    monkeypatch.setattr(module.KnowledgebaseService, "query", lambda **_kwargs: True, raising=False)
-    monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _kb_id: (False, None), raising=False)
-    _set_request_json(
-        monkeypatch,
+    monkeypatch.setattr(
         module,
-        {"kb_id": ["kb-1"], "question": "q", "meta_data_filter": {"method": "semi_auto"}},
+        "get_request_json",
+        lambda: _AwaitableValue({"content": "chunk with bad image", "image_base64": "not-valid-base64!!!"}),
     )
-    res = _run(module.retrieval_test())
+    res = _run(_route_core(module.add_chunk)("tenant-1", "kb-1", "doc-1"))
     assert res["code"] == module.RetCode.DATA_ERROR, res
-    assert "Knowledgebase not found!" in res["message"], res
-
-    retriever = _Retriever(mode="ok")
-    monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _kb_id: (True, SimpleNamespace(tenant_id="tenant-kb", embd_id="embd-1", tenant_embd_id=2)), raising=False)
-    monkeypatch.setattr(module.settings, "retriever", retriever)
-    monkeypatch.setattr(module.settings, "kg_retriever", _KgRetriever(), raising=False)
-    _set_request_json(
-        monkeypatch,
-        module,
-        {
-            "kb_id": ["kb-1"],
-            "question": "q",
-            "cross_languages": ["fr"],
-            "rerank_id": "rerank-1",
-            "keyword": True,
-            "use_kg": True,
-        },
-    )
-    res = _run(module.retrieval_test())
-    assert res["code"] == 0, res
-    assert cross_calls[-1] == ("q", ("fr",))
-    assert keyword_calls[-1] == "q-xl"
-    assert retriever.retrieval_questions[-1] == "q-xl-kw"
-    assert res["data"]["chunks"][0]["id"] == "kg-1", res
-    assert all("vector" not in chunk for chunk in res["data"]["chunks"])
-
-    monkeypatch.setattr(module.settings, "kg_retriever", _NoContentKgRetriever(), raising=False)
-    _set_request_json(monkeypatch, module, {"kb_id": ["kb-1"], "question": "q", "use_kg": True})
-    res = _run(module.retrieval_test())
-    assert res["code"] == 0, res
-    assert res["data"]["chunks"][0]["id"] == "c1", res
-
-    monkeypatch.setattr(module.settings, "retriever", _Retriever(mode="not_found"))
-    _set_request_json(monkeypatch, module, {"kb_id": ["kb-1"], "question": "q"})
-    res = _run(module.retrieval_test())
-    assert res["code"] == module.RetCode.DATA_ERROR, res
-    assert "No chunk found! Check the chunk status please!" in res["message"], res
-
-    monkeypatch.setattr(module.settings, "retriever", _Retriever(mode="explode"))
-    _set_request_json(monkeypatch, module, {"kb_id": ["kb-1"], "question": "q"})
-    res = _run(module.retrieval_test())
-    assert res["code"] == module.RetCode.EXCEPTION_ERROR, res
-    assert "retrieval boom" in res["message"], res
+    assert res["message"] == "Invalid `image_base64`", res
+    assert module.settings.docStoreConn.inserted == [], res
+    assert module.DocumentService.increment_calls == [], res
 
 
 @pytest.mark.p2
-def test_knowledge_graph_repeat_deal_matrix_unit(monkeypatch):
-    module = _load_chunk_module(monkeypatch)
-    module.request = SimpleNamespace(args={"doc_id": "doc-1"}, headers={})
+def test_restful_add_chunk_empty_image_base64_does_not_index_chunk(monkeypatch):
+    module = _load_chunk_api_module(monkeypatch)
+    module.request = SimpleNamespace(args={}, headers={})
+    module.settings.docStoreConn.inserted.clear()
 
-    payload = {
-        "id": "root",
-        "children": [
-            {"id": "dup"},
-            {"id": "dup", "children": [{"id": "dup"}]},
-        ],
-    }
+    monkeypatch.setattr(
+        module,
+        "get_request_json",
+        lambda: _AwaitableValue({"content": "chunk with empty image", "image_base64": ""}),
+    )
+    res = _run(_route_core(module.add_chunk)("tenant-1", "kb-1", "doc-1"))
+    assert res["code"] == module.RetCode.DATA_ERROR, res
+    assert res["message"] == "`image_base64` must be a non-empty string", res
+    assert module.settings.docStoreConn.inserted == [], res
+    assert module.DocumentService.increment_calls == [], res
 
-    class _SRes:
-        ids = ["bad-json", "mind-map"]
-        field = {
-            "bad-json": {"knowledge_graph_kwd": "graph", "content_with_weight": "{bad json"},
-            "mind-map": {"knowledge_graph_kwd": "mind_map", "content_with_weight": json.dumps(payload)},
-        }
 
-    async def _search(*_args, **_kwargs):
-        return _SRes()
+@pytest.mark.p2
+def test_restful_update_chunk_invalid_image_base64_does_not_update_chunk(monkeypatch):
+    module = _load_chunk_api_module(monkeypatch)
+    module.request = SimpleNamespace(args={}, headers={})
+    module.settings.docStoreConn.updated.clear()
 
-    monkeypatch.setattr(module.settings.retriever, "search", _search)
-    res = _run(module.knowledge_graph())
+    monkeypatch.setattr(
+        module,
+        "get_request_json",
+        lambda: _AwaitableValue({"content": "updated chunk", "image_base64": "not-valid-base64!!!"}),
+    )
+    res = _run(_route_core(module.update_chunk)("tenant-1", "kb-1", "doc-1", "chunk-1"))
+    assert res["code"] == module.RetCode.DATA_ERROR, res
+    assert res["message"] == "Invalid `image_base64`", res
+    assert module.settings.docStoreConn.updated == [], res
+
+
+@pytest.mark.p2
+def test_restful_add_chunk_valid_image_base64_stores_before_insert(monkeypatch):
+    module = _load_chunk_api_module(monkeypatch)
+    module.request = SimpleNamespace(args={}, headers={})
+    module.settings.docStoreConn.inserted.clear()
+    store_calls = []
+    monkeypatch.setattr(module, "store_chunk_image", lambda bucket, name, binary: store_calls.append((bucket, name, binary)))
+
+    valid_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    monkeypatch.setattr(
+        module,
+        "get_request_json",
+        lambda: _AwaitableValue({"content": "chunk with image", "image_base64": valid_b64}),
+    )
+    res = _run(_route_core(module.add_chunk)("tenant-1", "kb-1", "doc-1"))
     assert res["code"] == 0, res
-    assert res["data"]["graph"] == {}, res
-    mind_map = res["data"]["mind_map"]
-    assert mind_map["children"][0]["id"] == "dup", res
-    assert mind_map["children"][1]["id"] == "dup(1)", res
-    assert mind_map["children"][1]["children"][0]["id"] == "dup(2)", res
+    assert store_calls, "store_chunk_image should run before doc-store insert"
+    assert module.settings.docStoreConn.inserted, "chunk should be indexed after image stored"
+    inserted = module.settings.docStoreConn.inserted[-1]
+    assert inserted.get("img_id"), inserted
+    assert inserted.get("doc_type_kwd") == "image", inserted

@@ -1,5 +1,6 @@
 {
   "name": "ZHIPU-AI",
+  "rank": 993,
   "url": {
     "default": "https://open.bigmodel.cn/api/paas/v4"
   },
@@ -7,59 +8,99 @@
     "chat": "chat/completions",
     "async_chat": "async/chat/completions",
     "async_result": "async-result",
-    "embedding": "embedding",
+    "embedding": "embeddings",
     "rerank": "rerank",
-    "files": "files"
+    "ocr": "layout_parsing",
+    "asr": "audio/transcriptions",
+    "tts": "audio/speech",
+    "files": "files",
+    "models": "models"
   },
+  "class": "glm",
   "models": [
-    {
-      "name": "glm-5.1",
-      "max_tokens": 204800,
-      "model_types": [
-        "chat"
-      ]
-    },
     {
       "name": "glm-5",
       "max_tokens": 204800,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-5-turbo",
       "max_tokens": 204800,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-5v-turbo",
       "max_tokens": 204800,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.7",
       "max_tokens": 204800,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.7-flashx",
       "max_tokens": 204800,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.6",
       "max_tokens": 204800,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.6v-Flash",
@@ -67,105 +108,178 @@
       "model_types": [
         "chat",
         "vision"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.5",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.5-x",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.5-air",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.5-airx",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.5-flash",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4.5v",
       "max_tokens": 64000,
       "model_types": [
         "vision"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      },
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4-plus",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4-0520",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4-airx",
       "max_tokens": 8000,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4-air",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4-flash",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4-flashx",
       "max_tokens": 131072,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4-long",
       "max_tokens": 1000000,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "glm-4v",
@@ -179,7 +293,10 @@
       "max_tokens": 8192,
       "model_types": [
         "chat"
-      ]
+      ],
+      "tools": {
+        "support": true
+      }
     },
     {
       "name": "embedding-2",
@@ -196,7 +313,7 @@
       ]
     },
     {
-      "name": "glm-asr",
+      "name": "glm-asr-2512",
       "max_tokens": 4096,
       "model_types": [
         "asr"
@@ -215,38 +332,10 @@
       ]
     },
     {
-      "name": "glm-rerank",
+      "name": "rerank",
       "model_types": [
         "rerank"
       ]
     }
-  ],
-  "features": {
-    "thinking": {
-      "default_value": true,
-      "supported_models": [
-        "glm-5.1",
-        "glm-5",
-        "glm-5v-turbo",
-        "glm-4.7",
-        "glm-4.6",
-        "glm-4.6v",
-        "glm-4.5",
-        "glm-4.5v"
-      ]
-    },
-    "clear_thinking": {
-      "default_value": true,
-      "supported_models": [
-        "glm-5.1",
-        "glm-5",
-        "glm-5v-turbo",
-        "glm-4.7",
-        "glm-4.6",
-        "glm-4.6v",
-        "glm-4.5",
-        "glm-4.5v"
-      ]
-    }
-  }
+  ]
 }

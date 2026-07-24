@@ -30,10 +30,36 @@ from dateutil.parser import parse as datetime_parse
 
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from deepdoc.parser.figure_parser import vision_figure_parser_figure_xlsx_wrapper
+from common.constants import MAXIMUM_TASK_PAGE_NUMBER
 from deepdoc.parser.utils import get_text
 from rag.nlp import rag_tokenizer, tokenize, tokenize_table
 from deepdoc.parser import ExcelParser
 from common import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _deduplicate_column_names(columns):
+    reserved = {str(col) for col in columns}
+    used = set()
+    counts = Counter()
+    unique_columns = []
+    for col in columns:
+        name = str(col)
+        counts[name] += 1
+        if name not in used:
+            unique_columns.append(name)
+            used.add(name)
+            continue
+        suffix = counts[name]
+        new_name = f"{name}_{suffix}"
+        while new_name in used or new_name in reserved:
+            suffix += 1
+            new_name = f"{name}_{suffix}"
+        counts[name] = suffix
+        unique_columns.append(new_name)
+        used.add(new_name)
+    return unique_columns
 
 
 def _deduplicate_dataframe_columns(df):
@@ -68,7 +94,7 @@ def _coerce_vision_description_text(value):
 
 
 class Excel(ExcelParser):
-    def __call__(self, fnm, binary=None, from_page=0, to_page=10000000000, callback=None, **kwargs):
+    def __call__(self, fnm, binary=None, from_page=0, to_page=MAXIMUM_TASK_PAGE_NUMBER, callback=None, **kwargs):
         if not binary:
             wb = Excel._load_excel_to_workbook(fnm)
         else:
@@ -79,14 +105,13 @@ class Excel(ExcelParser):
         res, fails, done = [], [], 0
         rn = 0
         flow_images = []
-        pending_cell_images = []
         tables = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             images = Excel._extract_images_from_worksheet(ws, sheetname=sheet_name)
+            pending_cell_images = []
             if images:
-                image_descriptions = vision_figure_parser_figure_xlsx_wrapper(images=images, callback=callback,
-                                                                              **kwargs)
+                image_descriptions = vision_figure_parser_figure_xlsx_wrapper(images=images, callback=callback, **kwargs)
                 if image_descriptions and len(image_descriptions) == len(images):
                     for i, bf in enumerate(image_descriptions):
                         images[i]["image_description"] = _coerce_vision_description_text(bf[0][1])
@@ -125,6 +150,7 @@ class Excel(ExcelParser):
             if len(data) == 0:
                 continue
             df = pd.DataFrame(data, columns=headers)
+            df.columns = _deduplicate_column_names(df.columns)
             df.attrs["sheet_name"] = sheet_name
             df.attrs["sheet_context"] = sheet_context
             for img in pending_cell_images:
@@ -150,15 +176,14 @@ class Excel(ExcelParser):
                 (
                     (
                         img["image"],  # Image.Image or LazyImage
-                        [img["image_description"]]  # description list (must be list)
+                        [img["image_description"]],  # description list (must be list)
                     ),
                     [
                         (0, 0, 0, 0, 0)  # dummy position
-                    ]
+                    ],
                 )
             )
-        callback(0.3, ("Extract records: {}~{}".format(from_page + 1, min(to_page, from_page + rn)) + (
-            f"{len(fails)} failure, line: %s..." % (",".join(fails[:3])) if fails else "")))
+        callback(0.3, ("Extract records: {}~{}".format(from_page + 1, min(to_page, from_page + rn)) + (f"{len(fails)} failure, line: %s..." % (",".join(fails[:3])) if fails else "")))
         return res, tables
 
     def _parse_headers(self, ws, rows):
@@ -525,15 +550,14 @@ def _is_missing_scalar(value):
 def column_data_type(arr):
     arr = list(arr)
     counts = {"int": 0, "float": 0, "text": 0, "datetime": 0, "bool": 0}
-    trans = {t: f for f, t in
-             [(int, "int"), (float, "float"), (trans_datatime, "datetime"), (trans_bool, "bool"), (str, "text")]}
+    trans = {t: f for f, t in [(int, "int"), (float, "float"), (trans_datatime, "datetime"), (trans_bool, "bool"), (str, "text")]}
     float_flag = False
     for a in arr:
         if _is_missing_scalar(a):
             continue
         if re.match(r"[+-]?[0-9]+$", str(a).replace("%%", "")) and not str(a).replace("%%", "").startswith("0"):
             counts["int"] += 1
-            if int(str(a)) > 2 ** 63 - 1:
+            if int(str(a)) > 2**63 - 1:
                 float_flag = True
                 break
         elif re.match(r"[+-]?[0-9.]{,19}$", str(a).replace("%%", "")) and not str(a).replace("%%", "").startswith("0"):
@@ -564,7 +588,7 @@ def column_data_type(arr):
     return arr, ty
 
 
-def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese", callback=None, **kwargs):
+def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_TASK_PAGE_NUMBER, lang="Chinese", callback=None, **kwargs):
     """
     Excel and csv(txt) format files are supported.
     For csv or txt file, the delimiter between columns is TAB.
@@ -578,6 +602,11 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
 
     Every row in table will be treated as a chunk.
     """
+    _pc0 = kwargs.get("parser_config") or {}
+    logger.debug(f"[TABLE_PARSER_DEBUG] parser_config keys: {list(_pc0.keys())}")
+    logger.debug(f"[TABLE_PARSER_DEBUG] table_column_mode: {_pc0.get('table_column_mode')}")
+    logger.debug(f"[TABLE_PARSER_DEBUG] table_column_roles: {_pc0.get('table_column_roles')}")
+
     tbls = []
     is_english = lang.lower() == "english"
     if re.search(r"\.xlsx?$", filename, re.IGNORECASE):
@@ -602,10 +631,9 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
                 continue
             rows.append(row)
 
-        callback(0.3, ("Extract records: {}~{}".format(from_page, min(len(lines), to_page)) + (
-            f"{len(fails)} failure, line: %s..." % (",".join(fails[:3])) if fails else "")))
+        callback(0.3, ("Extract records: {}~{}".format(from_page, min(len(lines), to_page)) + (f"{len(fails)} failure, line: %s..." % (",".join(fails[:3])) if fails else "")))
 
-        dfs = [pd.DataFrame(np.array(rows), columns=headers)]
+        dfs = [pd.DataFrame(np.array(rows), columns=_deduplicate_column_names(headers))]
     elif re.search(r"\.csv$", filename, re.IGNORECASE):
         callback(0.1, "Start to parse.")
         txt = get_text(filename, binary)
@@ -620,30 +648,37 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
         fails = []
         rows = []
 
-        for i, row in enumerate(all_rows[1 + from_page: 1 + to_page]):
+        for i, row in enumerate(all_rows[1 + from_page : 1 + to_page]):
             if len(row) != len(headers):
                 fails.append(str(i + from_page))
                 continue
             rows.append(row)
 
-        callback(
-            0.3,
-            (f"Extract records: {from_page}~{from_page + len(rows)}" +
-             (f"{len(fails)} failure, line: {','.join(fails[:3])}..." if fails else ""))
-        )
+        callback(0.3, (f"Extract records: {from_page}~{from_page + len(rows)}" + (f"{len(fails)} failure, line: {','.join(fails[:3])}..." if fails else "")))
 
-        dfs = [pd.DataFrame(rows, columns=headers)]
+        dfs = [pd.DataFrame(rows, columns=_deduplicate_column_names(headers))]
     else:
         raise NotImplementedError("file type not supported yet(excel, text, csv supported)")
 
     res = []
     PY = Pinyin()
     structured_engine = settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE
-    if not structured_engine:
-        KnowledgebaseService.delete_field_map(kwargs["kb_id"])
+    kb_id = kwargs.get("kb_id")
+    if not structured_engine and kb_id:
+        KnowledgebaseService.delete_field_map(kb_id)
     # Field type suffixes for database columns
     # Maps data types to their database field suffixes
     fields_map = {"text": "_tks", "int": "_long", "keyword": "_kwd", "float": "_flt", "datetime": "_dt", "bool": "_kwd"}
+    parser_config = kwargs.get("parser_config") or {}
+    if parser_config.get("table_column_mode") == "manual":
+        column_roles = parser_config.get("table_column_roles") or {}
+    else:
+        column_roles = {}
+    logger.debug(f"[TABLE_PARSER_DEBUG] effective table_column_mode={parser_config.get('table_column_mode')!r}, column_roles keys={list(column_roles.keys())}")
+
+    # Pass 1: infer columns per sheet (multi-sheet Excel => multiple DataFrames). Merge field_map and
+    # table_column_names, then update KB once so the UI role selector sees all columns, not only the last sheet.
+    sheet_specs = []
     for df in dfs:
         for n in ["id", "_id", "index", "idx"]:
             if n in df.columns:
@@ -662,20 +697,56 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
                 txts.extend([str(c) for c in cln if c])
         clmns_map = [(py_clmns[i].lower() + fields_map[clmn_tys[i]], str(display_clmns[i]).replace("_", " ")) for i in
                      range(len(clmns))]
-        # Structured engines retain source columns in chunk_data for SQL retrieval.
-        # ES/OpenSearch keeps rows in stable retrieval fields to avoid unbounded mappings.
+        stored_indices = [i for i in range(len(clmns)) if column_roles.get(clmns[i], "both") in ("metadata", "both")]
+        field_map = {}
         if structured_engine:
-            field_map = {py_clmns[i].lower(): str(display_clmns[i]).replace("_", " ") for i in range(len(clmns))}
-            logging.debug(f"Field map: {field_map}")
-            KnowledgebaseService.update_parser_config(kwargs["kb_id"], {"field_map": field_map})
-
-        eng = lang.lower() == "english"  # is_english(txts)
+            field_map = {py_clmns[i].lower(): str(display_clmns[i]).replace("_", " ") for i in stored_indices}
         sheet_name = str(df.attrs.get("sheet_name", "")).strip()
         sheet_context = str(df.attrs.get("sheet_context", "")).strip()
+        logging.debug(f"Field map (sheet): {field_map}")
+        sheet_specs.append(
+            {
+                "df": df,
+                "clmns": clmns,
+                "display_clmns": display_clmns,
+                "clmn_tys": clmn_tys,
+                "clmns_map": clmns_map,
+                "py_clmns": py_clmns,
+                "field_map": field_map,
+                "sheet_name": sheet_name,
+                "sheet_context": sheet_context,
+            }
+        )
+
+    if structured_engine and kb_id:
+        merged_field_map = {}
+        merged_table_column_names = []
+        seen_col = set()
+        for spec in sheet_specs:
+            merged_field_map.update(spec["field_map"])
+            for col in spec["clmns"]:
+                if col not in seen_col:
+                    seen_col.add(col)
+                    merged_table_column_names.append(col)
+        logging.debug(f"Field map (merged across sheets): {merged_field_map}")
+        KnowledgebaseService.update_parser_config(
+            kb_id,
+            {"field_map": merged_field_map, "table_column_names": merged_table_column_names},
+        )
+
+    eng = lang.lower() == "english"  # is_english(txts)
+    for spec in sheet_specs:
+        df = spec["df"]
+        clmns = spec["clmns"]
+        display_clmns = spec["display_clmns"]
+        sheet_name = spec["sheet_name"]
+        sheet_context = spec["sheet_context"]
+        _debug_row_idx = 0
         for ii, row in df.iterrows():
+            _debug_row_idx += 1
             d = {"docnm_kwd": filename, "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename))}
-            row_fields = []
-            data_json = {}  # For Infinity: Store all columns in a JSON object
+            text_fields = []  # indexing + both -> content_with_weight
+            stored = {}  # metadata + both -> chunk_data for structured engines
             for j in range(len(clmns)):
                 if row[clmns[j]] is None:
                     continue
@@ -683,29 +754,37 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
                     continue
                 if not isinstance(row[clmns[j]], pd.Series) and pd.isna(row[clmns[j]]):
                     continue
-                # Structured engines retain source columns; ES/OpenSearch uses formatted_text below.
-                if structured_engine:
-                    data_json[str(clmns[j])] = row[clmns[j]]
-                row_fields.append((display_clmns[j], row[clmns[j]]))
-            if not row_fields:
+                col_name = clmns[j]
+                role = column_roles.get(col_name, "both")
+                if _debug_row_idx == 1:
+                    logger.debug(f"[TABLE_PARSER_DEBUG] Column '{col_name}' -> role '{role}'")
+                if role in ("indexing", "vectorize", "both"):
+                    text_fields.append((display_clmns[j], row[col_name]))
+                if structured_engine and role in ("metadata", "both"):
+                    stored[str(col_name)] = row[col_name]
+            if not text_fields and not stored:
                 continue
-            # Add the data JSON field to the document (for Infinity/OceanBase)
-            if structured_engine:
-                d["chunk_data"] = data_json
-            # Format as a structured text for better LLM comprehension
-            # Format each field as "- Field Name: Value" on separate lines
+            if stored:
+                d["chunk_data"] = stored
             semantic_fields = []
-            if sheet_name:
+            if text_fields and sheet_name:
                 semantic_fields.append(("Sheet", sheet_name))
-            if sheet_context:
+            if text_fields and sheet_context:
                 semantic_fields.append(("Sheet context", sheet_context))
-            semantic_fields.extend(row_fields)
+            semantic_fields.extend(text_fields)
             formatted_text = "\n".join([f"- {field}: {value}" for field, value in semantic_fields])
-            tokenize(d, formatted_text, eng)
+            tokenize(d, formatted_text, eng, language=lang)
+            if _debug_row_idx == 1:
+                logger.debug(f"[TABLE_PARSER_DEBUG] Chunk content_with_weight length: {len(d.get('content_with_weight', '') or '')}")
+                _cd = d.get("chunk_data")
+                logger.debug(f"[TABLE_PARSER_DEBUG] Chunk chunk_data keys: {list(_cd.keys()) if isinstance(_cd, dict) else 'N/A'}")
+                if not (settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE):
+                    _extra = [k for k in d if k not in ("docnm_kwd", "title_tks", "content_with_weight", "content_ltks", "content_sm_ltks")]
+                    logger.debug(f"[TABLE_PARSER_DEBUG] Chunk ES extra field keys (sample): {_extra[:20]}")
             res.append(d)
-        if tbls:
-            doc = {"docnm_kwd": filename, "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename))}
-            res.extend(tokenize_table(tbls, doc, is_english))
+    if tbls:
+        doc = {"docnm_kwd": filename, "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename))}
+        res.extend(tokenize_table(tbls, doc, is_english, language=lang))
     callback(0.35, "")
 
     return res
@@ -714,9 +793,7 @@ def chunk(filename, binary=None, from_page=0, to_page=10000000000, lang="Chinese
 if __name__ == "__main__":
     import sys
 
-
     def dummy(prog=None, msg=""):
         pass
-
 
     chunk(sys.argv[1], callback=dummy)

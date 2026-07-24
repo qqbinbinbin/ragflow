@@ -10,7 +10,17 @@ from dateutil.parser import parse as datetime_parse
 def _load_column_data_type():
     source = Path("rag/app/table.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    required_functions = {
+        "_is_missing_scalar",
+        "trans_bool",
+        "trans_datatime",
+        "column_data_type",
+    }
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in required_functions
+    ]
     module = ast.Module(body=functions, type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {

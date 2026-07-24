@@ -7,12 +7,14 @@ import ast
 from pathlib import Path
 
 
-SESSION_PATH = Path(__file__).resolve().parents[2] / "api/apps/sdk/session.py"
+BACKWARD_COMPAT_PATH = Path(__file__).resolve().parents[2] / "api/apps/backward_compat.py"
+AGENT_API_PATH = Path(__file__).resolve().parents[2] / "api/apps/restful_apis/agent_api.py"
 LLM_PATH = Path(__file__).resolve().parents[2] / "agent/component/llm.py"
 RETRIEVAL_PATH = Path(__file__).resolve().parents[2] / "agent/tools/retrieval.py"
 CANVAS_PATH = Path(__file__).resolve().parents[2] / "agent/canvas.py"
 ROUTE = "/agents_openai/<agent_id>/chat/completions"
-HANDLER = "agent_completion_openai_like"
+LEGACY_HANDLER = "deprecated_agents_openai_chat_completions"
+HANDLER = "agent_chat_completion"
 
 
 def _decorator_name(node: ast.AST) -> str:
@@ -26,7 +28,28 @@ def _decorator_name(node: ast.AST) -> str:
 
 
 def main() -> int:
-    source = SESSION_PATH.read_text(encoding="utf-8")
+    legacy_source = BACKWARD_COMPAT_PATH.read_text(encoding="utf-8")
+    legacy_tree = ast.parse(legacy_source)
+    legacy_handlers = {
+        node.name: node
+        for node in ast.walk(legacy_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    legacy_handler = legacy_handlers.get(LEGACY_HANDLER)
+    assert legacy_handler is not None, f"missing handler {LEGACY_HANDLER}"
+    legacy_routes = [
+        decorator.args[0].value
+        for decorator in legacy_handler.decorator_list
+        if isinstance(decorator, ast.Call)
+        and getattr(decorator.func, "attr", "") == "route"
+        and decorator.args
+        and isinstance(decorator.args[0], ast.Constant)
+    ]
+    assert ROUTE in legacy_routes, f"missing route {ROUTE}"
+    assert "agent_api.agent_chat_completion" in legacy_source
+    assert 'req["openai-compatible"] = True' in legacy_source
+
+    source = AGENT_API_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     handlers = {
         node.name: node
@@ -42,15 +65,12 @@ def main() -> int:
         if isinstance(decorator, ast.Call)
         and getattr(decorator.func, "attr", "") == "route"
     ]
-    routes = [
-        decorator.args[0].value
-        for decorator in route_decorators
-        if decorator.args and isinstance(decorator.args[0], ast.Constant)
-    ]
-    assert ROUTE in routes, f"missing route {ROUTE}"
+    routes = [decorator.args[0].value for decorator in route_decorators if decorator.args and isinstance(decorator.args[0], ast.Constant)]
+    assert "/agents/chat/completions" in routes
 
     decorator_names = {_decorator_name(decorator) for decorator in handler.decorator_list}
-    assert "token_required" in decorator_names, "agents_openai route must use SDK token auth"
+    assert "login_required" in decorator_names, "agent route must use maintained auth"
+    assert "add_tenant_id_to_kwargs" in decorator_names, "agent route must inject authorized tenant scope"
 
     calls = {
         node.func.id
@@ -58,7 +78,7 @@ def main() -> int:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "completion_openai" in calls, "agents_openai route must reuse completion_openai"
-    assert "Response" in calls, "streaming agents_openai route must return an SSE Response"
+    assert "_build_sse_response" in calls, "streaming agent route must return an SSE response"
 
     imported_names = set()
     for node in tree.body:

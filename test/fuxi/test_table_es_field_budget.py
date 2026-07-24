@@ -25,7 +25,7 @@ def _load_table_module(monkeypatch, dataframe, infinity=False, oceanbase=False):
         def get_pinyins(self, value, _separator):
             return ["header_%s" % sum(ord(char) for char in value)]
 
-    def tokenize(document, text, _english):
+    def tokenize(document, text, _english, **_kwargs):
         document["content_with_weight"] = text
         document["content_ltks"] = text.split()
         return document
@@ -47,6 +47,8 @@ def _load_table_module(monkeypatch, dataframe, infinity=False, oceanbase=False):
         DOC_ENGINE_INFINITY=infinity,
         DOC_ENGINE_OCEANBASE=oceanbase,
     )
+    common_constants = types.ModuleType("common.constants")
+    common_constants.MAXIMUM_TASK_PAGE_NUMBER = 100000
     xpinyin = types.ModuleType("xpinyin")
     xpinyin.Pinyin = Pinyin
 
@@ -57,6 +59,7 @@ def _load_table_module(monkeypatch, dataframe, infinity=False, oceanbase=False):
         "deepdoc.parser": deepdoc_parser,
         "rag.nlp": rag_nlp,
         "common": common,
+        "common.constants": common_constants,
         "xpinyin": xpinyin,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -112,6 +115,21 @@ def test_es_workbook_clears_field_map_once_for_multiple_sheets(monkeypatch):
     }
 
 
+def test_table_chunk_allows_calls_without_kb_id(monkeypatch):
+    table, calls = _load_table_module(
+        monkeypatch,
+        pd.DataFrame({"Supplier Name": ["North"]}),
+    )
+
+    chunks = table.chunk(
+        "supplier.xlsx",
+        callback=lambda *_args: None,
+    )
+
+    assert chunks
+    assert calls == {"deleted": [], "updated": []}
+
+
 def test_structured_table_engines_keep_chunk_data_and_field_map(monkeypatch):
     table, calls = _load_table_module(
         monkeypatch,
@@ -130,3 +148,51 @@ def test_structured_table_engines_keep_chunk_data_and_field_map(monkeypatch):
     assert len(calls["updated"]) == 1
     assert calls["updated"][0][0] == "kb-infinity"
     assert calls["updated"][0][1]["field_map"]
+
+
+def test_es_manual_roles_filter_semantic_text_without_dynamic_fields(monkeypatch):
+    table, calls = _load_table_module(
+        monkeypatch,
+        pd.DataFrame({"Supplier Name": ["North"], "Internal Code": ["S-1"]}),
+    )
+
+    chunks = table.chunk(
+        "supplier.xlsx",
+        callback=lambda *_args: None,
+        kb_id="kb-es-manual",
+        parser_config={
+            "table_column_mode": "manual",
+            "table_column_roles": {
+                "Supplier Name": "indexing",
+                "Internal Code": "metadata",
+            },
+        },
+    )
+
+    assert len(chunks) == 1
+    assert "Supplier Name" in chunks[0]["content_with_weight"]
+    assert "Internal Code" not in chunks[0]["content_with_weight"]
+    assert set(chunks[0]) <= {"docnm_kwd", "title_tks", "content_with_weight", "content_ltks"}
+    assert calls == {"deleted": ["kb-es-manual"], "updated": []}
+
+
+def test_structured_workbook_merges_field_map_once(monkeypatch):
+    table, calls = _load_table_module(
+        monkeypatch,
+        [
+            pd.DataFrame({"Supplier Name": ["North"]}),
+            pd.DataFrame({"Part Number": ["P-1"]}),
+        ],
+        oceanbase=True,
+    )
+
+    table.chunk(
+        "supplier.xlsx",
+        callback=lambda *_args: None,
+        kb_id="kb-oceanbase-workbook",
+    )
+
+    assert calls["deleted"] == []
+    assert len(calls["updated"]) == 1
+    assert calls["updated"][0][1]["table_column_names"] == ["Supplier Name", "Part Number"]
+    assert len(calls["updated"][0][1]["field_map"]) == 2

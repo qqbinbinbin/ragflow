@@ -1,5 +1,6 @@
 {
   "name": "Moonshot",
+  "rank": 994,
   "url": {
     "default": "https://api.moonshot.cn/v1"
   },
@@ -8,22 +9,31 @@
     "models": "models",
     "balance": "users/me/balance"
   },
+  "class": "kimi",
   "models": [
     {
       "name": "kimi-k2.6",
-      "max_tokens": 256000,
+      "max_tokens": 262144,
       "model_types": [
         "chat",
         "vision"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      }
     },
     {
       "name": "kimi-k2.5",
-      "max_tokens": 256000,
+      "max_tokens": 262144,
       "model_types": [
         "chat",
         "vision"
-      ]
+      ],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      }
     },
     {
       "name": "moonshot-v1-8k",
@@ -71,20 +81,5 @@
         "vision"
       ]
     }
-  ],
-  "features": {
-    "thinking": {
-      "default_value": true,
-      "supported_models": [
-        "kimi-k2.6",
-        "kimi-k2.5"
-      ]
-    },
-    "clear_thinking": {
-      "default_value": true,
-      "supported_models": [
-        "kimi-k2.6"
-      ]
-    }
-  }
+  ]
 }

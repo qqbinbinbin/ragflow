@@ -28,7 +28,7 @@ from deepdoc.parser.figure_parser import VisionFigureParser
 from rag.app.naive import by_plaintext, PARSERS
 from api.db.services.llm_service import LLMBundle
 from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type
-from common.constants import LLMType
+from common.constants import LLMType, MAXIMUM_PAGE_NUMBER
 from common.parser_config_utils import normalize_layout_recognizer
 from rag.nlp import rag_tokenizer
 from rag.nlp import tokenize
@@ -39,7 +39,7 @@ class Pdf(PdfParser):
     def __init__(self):
         super().__init__()
 
-    def __call__(self, filename, binary=None, from_page=0, to_page=100000, zoomin=3, callback=None, **kwargs):
+    def __call__(self, filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, zoomin=3, callback=None, **kwargs):
         # 1. OCR
         callback(msg="OCR started")
         self.__images__(filename if not binary else binary, zoomin, from_page, to_page, callback)
@@ -119,7 +119,7 @@ class Pdf(PdfParser):
 
 
 class PlainPdf(PlainParser):
-    def __call__(self, filename, binary=None, from_page=0, to_page=100000, callback=None, **kwargs):
+    def __call__(self, filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, callback=None, **kwargs):
         self.pdf = pdf2_read(filename if not binary else BytesIO(binary))
         page_txt = []
         for page in self.pdf.pages[from_page:to_page]:
@@ -157,7 +157,7 @@ def _build_pptx_picture_describer(tenant_id, parser_config=None, callback=None, 
     return picture_describer
 
 
-def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", callback=None, parser_config=None, **kwargs):
+def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang="Chinese", callback=None, parser_config=None, **kwargs):
     """
     The supported file formats are pdf, ppt, pptx.
     Every page will be treated as a chunk. And the thumbnail of every page will be stored.
@@ -178,21 +178,21 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
                 callback=callback,
                 **{k: v for k, v in kwargs.items() if k != "tenant_id"},
             )
-            for pn, txt in enumerate(ppt_parser(filename if not binary else binary, from_page, 1000000, callback, picture_describer=picture_describer)):
+            for pn, txt in enumerate(ppt_parser(filename if not binary else binary, from_page, to_page, callback, picture_describer=picture_describer)):
                 d = copy.deepcopy(doc)
                 pn += from_page
                 d["doc_type_kwd"] = "image"
                 d["page_num_int"] = [pn + 1]
                 d["top_int"] = [0]
                 d["position_int"] = [(pn + 1, 0, 0, 0, 0)]
-                tokenize(d, txt, eng)
+                tokenize(d, txt, eng, language=lang)
                 res.append(d)
             return res
         except Exception as e:
             logging.warning(f"python-pptx parsing failed for {filename}: {e}, trying tika as fallback")
             if callback:
                 callback(0.1, "python-pptx failed, trying tika as fallback")
-            
+
             try:
                 from tika import parser as tika_parser
             except Exception as tika_error:
@@ -201,18 +201,18 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
                     callback(0.8, error_msg)
                 logging.warning(f"{error_msg} for {filename}.")
                 raise NotImplementedError(error_msg)
-            
+
             if binary:
                 binary_data = binary
             else:
-                with open(filename, 'rb') as f:
+                with open(filename, "rb") as f:
                     binary_data = f.read()
             doc_parsed = tika_parser.from_buffer(BytesIO(binary_data))
-            
+
             if doc_parsed.get("content", None) is not None:
                 sections = doc_parsed["content"].split("\n")
                 sections = [s for s in sections if s.strip()]
-                
+
                 for pn, txt in enumerate(sections):
                     d = copy.deepcopy(doc)
                     pn += from_page
@@ -220,9 +220,9 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
                     d["page_num_int"] = [pn + 1]
                     d["top_int"] = [0]
                     d["position_int"] = [(pn + 1, 0, 0, 0, 0)]
-                    tokenize(d, txt, eng)
+                    tokenize(d, txt, eng, language=lang)
                     res.append(d)
-                
+
                 if callback:
                     callback(0.8, "Finish parsing with tika.")
                 return res
@@ -275,7 +275,7 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
             d["page_num_int"] = [pn + 1]
             d["top_int"] = [0]
             d["position_int"] = [(pn + 1, 0, img.size[0] if img else 0, 0, img.size[1] if img else 0)]
-            tokenize(d, txt, eng)
+            tokenize(d, txt, eng, language=lang)
             res.append(d)
         return res
 

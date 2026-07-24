@@ -11,7 +11,6 @@ export default {
   setting: `${restAPIv1}/users/me`,
   userInfo: `${restAPIv1}/users/me`,
   tenantInfo: `${restAPIv1}/users/me/models`,
-  setTenantInfo: `${restAPIv1}/users/me/models`,
   loginChannels: `${restAPIv1}/auth/login/channels`,
   loginChannel: (channel: string) => `${restAPIv1}/auth/login/${channel}`,
 
@@ -25,30 +24,111 @@ export default {
   agreeTenant: (tenantId: string) => `${restAPIv1}/tenants/${tenantId}`,
 
   // llm model
-  factoriesList: `${webAPI}/llm/factories`,
-  llmList: `${webAPI}/llm/list`,
-  myLlm: `${webAPI}/llm/my_llms`,
-  setApiKey: `${webAPI}/llm/set_api_key`,
-  addLlm: `${webAPI}/llm/add_llm`,
-  deleteLlm: `${webAPI}/llm/delete_llm`,
-  enableLlm: `${webAPI}/llm/enable_llm`,
-  deleteFactory: `${webAPI}/llm/delete_factory`,
+  listAllAddedModels: `${restAPIv1}/models`,
+  defaultModel: `${restAPIv1}/models/default`,
+  listProviders: `${restAPIv1}/providers`,
+  addProvider: `${restAPIv1}/providers`,
+  addProviderInstance: ({ llm_factory }: { llm_factory: string }) =>
+    `${restAPIv1}/providers/${llm_factory}/instances`,
+  verifyProviderConnection: ({ provider_name }: { provider_name: string }) =>
+    `${restAPIv1}/providers/${provider_name}/connection`,
+  listProviderModels: ({ provider_name }: { provider_name: string }) =>
+    `${restAPIv1}/providers/${provider_name}/models`,
+  listProviderInstances: ({ provider_name }: { provider_name: string }) =>
+    `${restAPIv1}/providers/${provider_name}/instances`,
+  listInstanceModels: ({
+    provider_name,
+    instance_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+  }) =>
+    `${restAPIv1}/providers/${provider_name}/instances/${instance_name}/models`,
+  showProviderInstance: ({
+    provider_name,
+    instance_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+  }) => `${restAPIv1}/providers/${provider_name}/instances/${instance_name}`,
+  addInstanceModel: ({
+    provider_name,
+    instance_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+  }) =>
+    `${restAPIv1}/providers/${provider_name}/instances/${instance_name}/models`,
+  editInstanceModel: ({
+    provider_name,
+    instance_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+  }) =>
+    `${restAPIv1}/providers/${provider_name}/instances/${instance_name}/models`,
+  deleteProviderInstance: ({ provider_name }: { provider_name: string }) =>
+    `${restAPIv1}/providers/${provider_name}/instances`,
+  updateProviderInstance: ({
+    provider_name,
+    instance_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+  }) => `${restAPIv1}/providers/${provider_name}/instances/${instance_name}`,
+  updateModelStatus: ({
+    provider_name,
+    instance_name,
+    model_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+    model_name: string;
+  }) =>
+    `${restAPIv1}/providers/${provider_name}/instances/${instance_name}/models/${model_name}`,
+  patchInstanceModel: ({
+    provider_name,
+    instance_name,
+    model_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+    model_name: string;
+  }) =>
+    `${restAPIv1}/providers/${provider_name}/instances/${instance_name}/models/${model_name}`,
+  deleteInstanceModels: ({
+    provider_name,
+    instance_name,
+  }: {
+    provider_name: string;
+    instance_name: string;
+  }) =>
+    `${restAPIv1}/providers/${provider_name}/instances/${instance_name}/models`,
 
   // data source
   dataSourceUpdate: (id: string) => `${restAPIv1}/connectors/${id}`,
   dataSourceSet: `${restAPIv1}/connectors`,
   dataSourceList: `${restAPIv1}/connectors`,
   dataSourceDel: (id: string) => `${restAPIv1}/connectors/${id}`,
-  dataSourceResume: (id: string) => `${restAPIv1}/connectors/${id}/resume`,
   dataSourceRebuild: (id: string) => `${restAPIv1}/connectors/${id}/rebuild`,
   dataSourceLogs: (id: string) => `${restAPIv1}/connectors/${id}/logs`,
   dataSourceDetail: (id: string) => `${restAPIv1}/connectors/${id}`,
+  dataSourceTest: (id: string) => `${restAPIv1}/connectors/${id}/test`,
   googleWebAuthStart: (type: 'google-drive' | 'gmail') =>
     `${restAPIv1}/connectors/google/oauth/web/start?type=${type}`,
   googleWebAuthResult: (type: 'google-drive' | 'gmail') =>
     `${restAPIv1}/connectors/google/oauth/web/result?type=${type}`,
   boxWebAuthStart: () => `${restAPIv1}/connectors/box/oauth/web/start`,
   boxWebAuthResult: () => `${restAPIv1}/connectors/box/oauth/web/result`,
+
+  // chat channel
+  chatChannelSet: `${restAPIv1}/chat-channels`,
+  chatChannelList: `${restAPIv1}/chat-channels`,
+  chatChannelDetail: (id: string) => `${restAPIv1}/chat-channels/${id}`,
+  chatChannelUpdate: (id: string) => `${restAPIv1}/chat-channels/${id}`,
+  chatChannelDel: (id: string) => `${restAPIv1}/chat-channels/${id}`,
+  chatChannelRuntime: (id: string) =>
+    `${restAPIv1}/chat-channels/${id}/runtime`,
 
   // plugin
   llmTools: `${restAPIv1}/plugin/tools`,
@@ -57,74 +137,128 @@ export default {
 
   // knowledge base
 
-  checkEmbedding: `${webAPI}/kb/check_embedding`,
+  checkEmbedding: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/embedding/check`,
   kbList: `${restAPIv1}/datasets`,
   createKb: `${restAPIv1}/datasets`,
   updateKb: (datasetId: string) => `${restAPIv1}/datasets/${datasetId}`,
   rmKb: `${restAPIv1}/datasets`,
-  getKbDetail: `${webAPI}/kb/detail`,
+  getKbDetail: (datasetId: string) => `${restAPIv1}/datasets/${datasetId}`,
   getKnowledgeGraph: (knowledgeId: string) =>
-    `${restAPIv1}/datasets/${knowledgeId}/knowledge_graph`,
+    `${restAPIv1}/datasets/${knowledgeId}/graph`,
+  knowledgeGraph: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/graph`,
   deleteKnowledgeGraph: (knowledgeId: string) =>
-    `${restAPIv1}/datasets/${knowledgeId}/knowledge_graph`,
-  getMeta: `${webAPI}/kb/get_meta`,
-  getKnowledgeBasicInfo: `${webAPI}/kb/basic_info`,
+    `${restAPIv1}/datasets/${knowledgeId}/graph`,
+  getMeta: `${restAPIv1}/datasets/metadata/flattened`,
+  getKnowledgeBasicInfo: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/ingestions/summary`,
+  artifactsList: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts`,
+  artifactsTopicList: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts_topics`,
+  getArtifactPage: (datasetId: string, pageType: string, slug: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts/${pageType}/${slug}`,
+  listWikiCommits: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/commits`,
+  getWikiCommit: (datasetId: string, commitId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/commits/${commitId}`,
+  getArtifactGraph: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts/graph`,
+  clearWiki: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/artifacts`,
+  getDatasetSkillTree: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills`,
+  getDatasetSkillPage: (datasetId: string, skillKwd: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills/${skillKwd
+      .split('/')
+      .map((s) => encodeURIComponent(s))
+      .join('/')}`,
+  deleteDatasetSkillTree: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills`,
+  deleteDatasetSkillPage: (datasetId: string, skillKwd: string) =>
+    `${restAPIv1}/datasets/${datasetId}/skills/${skillKwd
+      .split('/')
+      .map((s) => encodeURIComponent(s))
+      .join('/')}`,
+  getDatasetNav: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/nav`,
+  getDatasetNavChildren: (datasetId: string, name: string) =>
+    `${restAPIv1}/datasets/${datasetId}/nav/${name
+      .split('/')
+      .map((s) => encodeURIComponent(s))
+      .join('/')}/children`,
+  deleteDatasetNav: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/nav`,
+  deleteDatasetNavNode: (datasetId: string, name: string) =>
+    `${restAPIv1}/datasets/${datasetId}/nav/${name
+      .split('/')
+      .map((s) => encodeURIComponent(s))
+      .join('/')}`,
   // data pipeline log
-  fetchDataPipelineLog: `${webAPI}/kb/list_pipeline_logs`,
-  getPipelineDetail: `${webAPI}/kb/pipeline_log_detail`,
-  fetchPipelineDatasetLogs: `${webAPI}/kb/list_pipeline_dataset_logs`,
-  runGraphRag: (datasetId: string) =>
-    `${restAPIv1}/datasets/${datasetId}/run_graphrag`,
-  traceGraphRag: (datasetId: string) =>
-    `${restAPIv1}/datasets/${datasetId}/trace_graphrag`,
-  runRaptor: (datasetId: string) =>
-    `${restAPIv1}/datasets/${datasetId}/run_raptor`,
-  traceRaptor: (datasetId: string) =>
-    `${restAPIv1}/datasets/${datasetId}/trace_raptor`,
-  unbindPipelineTask: ({ kb_id, type }: { kb_id: string; type: string }) =>
-    `${webAPI}/kb/unbind_task?kb_id=${kb_id}&pipeline_task_type=${type}`,
+  fetchDataPipelineLog: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/ingestions`,
+  getPipelineDetail: (datasetId: string, logId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/ingestions/${logId}`,
+  fetchPipelineDatasetLogs: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/ingestions`,
+  listPipelines: `${restAPIv1}/pipelines?type=builtin`,
+  runIndex: (datasetId: string, indexType: string) =>
+    `${restAPIv1}/datasets/${datasetId}/index?type=${indexType.toLowerCase()}`,
+  traceIndex: (datasetId: string, indexType: string) =>
+    `${restAPIv1}/datasets/${datasetId}/index?type=${indexType.toLowerCase()}`,
+  unbindPipelineTask: (datasetId: string, indexType: string, wipe?: boolean) =>
+    `${restAPIv1}/datasets/${datasetId}/${indexType.toLowerCase()}${wipe === false ? '?wipe=false' : ''}`,
   pipelineRerun: `${restAPIv1}/agents/rerun`,
   getMetaData: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/metadata/summary`,
   updateDocumentsMetadata: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents/metadatas`,
-  kbUpdateMetaData: `${webAPI}/kb/update_metadata_setting`,
+  kbUpdateMetaData: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/metadata/config`,
   documentUpdateMetaDataConfig: (datasetId: string, documentId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/metadata/config`,
 
   // tags
-  listTag: (knowledgeId: string) => `${webAPI}/kb/${knowledgeId}/tags`,
-  listTagByKnowledgeIds: `${webAPI}/kb/tags`,
-  removeTag: (knowledgeId: string) => `${webAPI}/kb/${knowledgeId}/rm_tags`,
-  renameTag: (knowledgeId: string) => `${webAPI}/kb/${knowledgeId}/rename_tag`,
+  listTag: (knowledgeId: string) => `${restAPIv1}/datasets/${knowledgeId}/tags`,
+  listTagByKnowledgeIds: `${restAPIv1}/datasets/tags/aggregation`,
+  removeTag: (knowledgeId: string) =>
+    `${restAPIv1}/datasets/${knowledgeId}/tags`,
+  renameTag: (knowledgeId: string) =>
+    `${restAPIv1}/datasets/${knowledgeId}/tags`,
 
   // chunk
   chunkList: (datasetId: string, documentId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/chunks`,
   chunkDetail: (datasetId: string, documentId: string, chunkId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/chunks/${chunkId}`,
-  retrievalTest: `${webAPI}/chunk/retrieval_test`,
-  knowledgeGraph: `${webAPI}/chunk/knowledge_graph`,
+  documentStructureGraph: (datasetId: string, documentId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/documents/${documentId}/structure/graph`,
+  retrievalTest: `${restAPIv1}/datasets/search`,
 
   // document
   getDocumentList: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents`,
-  documentChangeStatus: `${webAPI}/document/change_status`,
+  documentChangeStatus: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/documents/batch-update-status`,
   documentDelete: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents`,
   documentRename: (datasetId: string, documentId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents/${documentId}`,
-  documentCreate: `${webAPI}/document/create`,
-  documentRun: `${webAPI}/document/run`,
-  documentChangeParser: `${webAPI}/document/change_parser`,
-  documentThumbnails: `${webAPI}/document/thumbnails`,
-  getDocumentFile: `${webAPI}/document/get`,
-  getDocumentFileDownload: (docId: string) =>
-    `${webAPI}/document/download/${docId}`,
+  documentIngest: `${restAPIv1}/documents/ingest`,
+  documentCreate: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/documents?type=empty`,
+  documentChangeParser: (datasetId: string, documentId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/documents/${documentId}`,
+  getDatasetDocumentFileDownload: (datasetId: string, documentId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/documents/${documentId}`,
+  documentThumbnails: `${restAPIv1}/thumbnails`,
+  getDocumentFile: `${restAPIv1}/documents`,
   documentUpload: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents`,
-  webCrawl: `${webAPI}/document/web_crawl`,
-  uploadAndParse: `${webAPI}/document/upload_info`,
+  webCrawl: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/documents?type=web`,
+  documentInfoUpload: `${restAPIv1}/documents/upload`,
   setMeta: `${webAPI}/document/set_meta`,
   getDatasetFilter: (datasetId: string) =>
     `${restAPIv1}/datasets/${datasetId}/documents?type=filter`,
@@ -151,9 +285,9 @@ export default {
   completionUrl: `${restAPIv1}/chat/completions`,
   chatsTts: `${restAPIv1}/chat/audio/speech`,
   searchCompletion: (searchId: string) =>
-    `${restAPIv1}/searches/${searchId}/completion`,
+    `${restAPIv1}/searches/${searchId}/completions`,
   chatsMindmap: `${restAPIv1}/chat/mindmap`,
-  chatsRelatedQuestions: `${restAPIv1}/chat/recommandation`,
+  chatsRelatedQuestions: `${restAPIv1}/chat/recommendation`,
 
   // next chat
   fetchExternalChatInfo: (id: string) => `${restAPIv1}/chatbots/${id}/info`,
@@ -179,10 +313,12 @@ export default {
   // flow
   listAgentTemplate: `${restAPIv1}/agents/templates`,
   listAgents: `${restAPIv1}/agents`,
+  listAgentTags: `${restAPIv1}/agents/tags`,
+  updateAgentTags: (agentId: string) => `${restAPIv1}/agents/${agentId}/tags`,
   createAgent: `${restAPIv1}/agents`,
   updateAgent: (agentId: string) => `${restAPIv1}/agents/${agentId}`,
   deleteAgent: (agentId: string) => `${restAPIv1}/agents/${agentId}`,
-  agentChatCompletion: `${restAPIv1}/agents/chat/completion`,
+  agentChatCompletion: `${restAPIv1}/agents/chat/completions`,
   resetAgent: (agentId: string) => `${restAPIv1}/agents/${agentId}/reset`,
   testDbConnect: `${restAPIv1}/agents/test_db_connection`,
   getInputElements: `${webAPI}/canvas/input_elements`,
@@ -190,7 +326,9 @@ export default {
     `${restAPIv1}/agents/${agentId}/components/${componentId}/debug`,
   trace: (agentId: string, messageId: string) =>
     `${restAPIv1}/agents/${agentId}/logs/${messageId}`,
-  cancelCanvas: (taskId: string) => `${webAPI}/canvas/cancel/${taskId}`, // cancel conversation
+  sharedTrace: (sharedId: string, messageId: string) =>
+    `${restAPIv1}/agentbots/${sharedId}/logs/${messageId}`,
+  cancelCanvas: (taskId: string) => `${restAPIv1}/tasks/${taskId}/cancel`,
   // agent
   inputForm: (agentId: string, componentId: string) =>
     `${restAPIv1}/agents/${agentId}/components/${componentId}/input-form`,
@@ -209,12 +347,41 @@ export default {
   fetchExternalAgentInputs: (canvasId: string) =>
     `${restAPIv1}/agentbots/${canvasId}/inputs`,
   prompt: `${restAPIv1}/agents/prompts`,
-  cancelDataflow: (id: string) => `${webAPI}/canvas/cancel/${id}`,
+  cancelDataflow: (id: string) => `${restAPIv1}/tasks/${id}/cancel`,
+  getAttachmentFileDownload: (docId: string) =>
+    `${restAPIv1}/agents/attachments/${docId}/download`,
+  getAttachmentFilePreview: ({
+    docId,
+    ext,
+    mimeType,
+    filename,
+  }: {
+    docId: string;
+    ext?: string;
+    mimeType?: string;
+    filename?: string;
+  }) => {
+    const params = new URLSearchParams();
+    if (ext) params.set('ext', ext);
+    if (mimeType) params.set('mime_type', mimeType);
+    if (filename) params.set('filename', filename);
+    const query = params.toString();
+    return `${restAPIv1}/agents/attachments/${docId}/preview${query ? `?${query}` : ''}`;
+  },
   downloadFile: `${restAPIv1}/agents/download`,
-  testWebhook: (id: string) => `${restAPIv1}/webhook_test/${id}`,
-  fetchWebhookTrace: (id: string) => `${restAPIv1}/webhook_trace/${id}`,
+  testWebhook: (id: string) => `${restAPIv1}/agents/${id}/webhook/test`,
+  fetchWebhookTrace: (id: string) => `${restAPIv1}/agents/${id}/webhook/logs`,
 
   // explore
+
+  // compilation templates
+  compilationTemplates: `${restAPIv1}/compilation_templates`,
+  compilationTemplate: (id: string) =>
+    `${restAPIv1}/compilation_templates/${id}`,
+  compilationTemplateGroups: `${restAPIv1}/compilation_template_groups`,
+  compilationTemplateGroup: (id: string) =>
+    `${restAPIv1}/compilation_template_groups/${id}`,
+  wikiPresets: `${restAPIv1}/compilation_templates/wiki_presets`,
 
   // mcp server
   listMcpServer: `${restAPIv1}/mcp/servers`,
@@ -262,6 +429,8 @@ export default {
   removeDataflow: `${webAPI}/dataflow/rm`,
   listDataflow: `${webAPI}/dataflow/list`,
   runDataflow: `${webAPI}/dataflow/run`,
+  listBuiltinPipelines: `${restAPIv1}/pipelines`,
+  getBuiltinPipeline: (id: string) => `${restAPIv1}/pipelines/${id}`,
 
   // admin
   adminLogin: `${restAPIv1}/admin/login`,
@@ -323,4 +492,13 @@ export default {
   adminGetSandboxConfig: `${restAPIv1}/admin/sandbox/config`,
   adminSetSandboxConfig: `${restAPIv1}/admin/sandbox/config`,
   adminTestSandboxConnection: `${restAPIv1}/admin/sandbox/test`,
+
+  // Skill spaces
+  skillSpaces: `${restAPIv1}/skills/spaces`,
+  skillSpace: (spaceId: string) => `${restAPIv1}/skills/spaces/${spaceId}`,
+  skillSpaceByFolder: `${restAPIv1}/skills/space/by-folder`,
+  skillConfig: `${restAPIv1}/skills/config`,
+  skillSearch: `${restAPIv1}/skills/search`,
+  skillIndex: `${restAPIv1}/skills/index`,
+  skillReindex: `${restAPIv1}/skills/reindex`,
 };

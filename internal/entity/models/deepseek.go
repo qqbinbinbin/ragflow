@@ -18,74 +18,336 @@ package models
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"time"
+	"ragflow/internal/common"
+	"strconv"
+	"strings"
 )
 
 // DeepSeekModel implements ModelDriver for DeepSeek
 type DeepSeekModel struct {
-	BaseURL    map[string]string
-	URLSuffix  URLSuffix
-	httpClient *http.Client // Reusable HTTP client with connection pool
+	baseModel BaseModel
 }
 
 // NewDeepSeekModel creates a new DeepSeek model instance
 func NewDeepSeekModel(baseURL map[string]string, urlSuffix URLSuffix) *DeepSeekModel {
 	return &DeepSeekModel{
-		BaseURL:   baseURL,
-		URLSuffix: urlSuffix,
-		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  false,
-			},
+		baseModel: BaseModel{
+			BaseURL:    baseURL,
+			URLSuffix:  urlSuffix,
+			httpClient: NewDriverHTTPClient(),
 		},
 	}
 }
 
-func (z *DeepSeekModel) Name() string {
+func (d *DeepSeekModel) NewInstance(baseURL map[string]string) ModelDriver {
+	return NewDeepSeekModel(baseURL, d.baseModel.URLSuffix)
+}
+
+func (d *DeepSeekModel) Name() string {
 	return "deepseek"
 }
 
-// Chat sends a message and returns response
-func (z *DeepSeekModel) Chat(modelName, message *string, apiConfig *APIConfig, chatModelConfig *ChatConfig) (*ChatResponse, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
-}
-
-// ChatStreamlyWithSender sends a message and streams response via sender function (best performance, no channel)
-func (z *DeepSeekModel) ChatStreamlyWithSender(modelName, message *string, apiConfig *APIConfig, chatModelConfig *ChatConfig, sender func(*string, *string) error) error {
-	return nil
-}
-
-// EncodeToEmbedding encodes a list of texts into embeddings
-func (z *DeepSeekModel) EncodeToEmbedding(modelName *string, texts []string, apiConfig *APIConfig, embeddingConfig *EmbeddingConfig) ([][]float64, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
-}
-
-type Model struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	OwnedBy string `json:"owned_by"`
-}
-
-type ModelList struct {
-	Object string  `json:"object"`
-	Models []Model `json:"data"`
-}
-
-func (z *DeepSeekModel) ListModels(apiConfig *APIConfig) ([]string, error) {
-	var region = "default"
-	if apiConfig.Region != nil {
-		region = *apiConfig.Region
+func (d *DeepSeekModel) ChatWithMessages(ctx context.Context, modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig, modelUsage *common.ModelUsage) (*ChatResponse, error) {
+	if err := d.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/%s", z.BaseURL[region], z.URLSuffix.Models)
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("messages is empty")
+	}
+
+	resolvedBaseURL, err := d.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s/%s", resolvedBaseURL, d.baseModel.URLSuffix.Chat)
+
+	// Build request body
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, false)
+	if chatModelConfig != nil && chatModelConfig.Thinking != nil && *chatModelConfig.Thinking {
+		var thinkingFlag string
+		effort := "high"
+		if chatModelConfig.Effort != nil {
+			effort = *chatModelConfig.Effort
+		}
+		switch effort {
+		case "none":
+			thinkingFlag = "disabled"
+			break
+		case "low":
+			thinkingFlag = "disabled"
+			break
+		case "medium":
+			thinkingFlag = "disabled"
+			break
+		case "high":
+			thinkingFlag = "enabled"
+			reqBody["reasoning_effort"] = "high"
+			break
+		case "default":
+			thinkingFlag = "enabled"
+			reqBody["reasoning_effort"] = "high"
+			break
+		case "max":
+			thinkingFlag = "enabled"
+			reqBody["reasoning_effort"] = "max"
+			break
+		}
+		reqBody["thinking"] = map[string]interface{}{
+			"type": thinkingFlag,
+		}
+	} else {
+		reqBody["thinking"] = map[string]interface{}{
+			"type": "disabled",
+		}
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
+
+	resp, err := d.baseModel.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var result map[string]interface{}
+	if err = json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	choices, ok := result["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return nil, fmt.Errorf("no choices in response")
+	}
+
+	firstChoice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid choice format")
+	}
+
+	messageMap, ok := firstChoice["message"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid message format")
+	}
+
+	var content string
+	if c, ok := messageMap["content"].(string); ok {
+		content = c
+	}
+
+	var reasonContent string
+	if rc, ok := messageMap["reasoning_content"].(string); ok {
+		reasonContent = rc
+		// if first char of reasonContent is \n remove the '\n'
+		if reasonContent != "" && reasonContent[0] == '\n' {
+			reasonContent = reasonContent[1:]
+		}
+	}
+
+	var toolCalls []map[string]interface{}
+	if tcs, ok := messageMap["tool_calls"].([]interface{}); ok {
+		for _, tc := range tcs {
+			if tcMap, ok := tc.(map[string]interface{}); ok {
+				toolCalls = append(toolCalls, tcMap)
+			}
+		}
+	}
+
+	chatResponse := &ChatResponse{
+		Answer:        &content,
+		ReasonContent: &reasonContent,
+		ToolCalls:     toolCalls,
+	}
+	if pt, ct, tt := extractUsageFromMap(result); tt > 0 {
+		chatResponse.Usage = &TokenUsage{
+			PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt,
+		}
+	}
+
+	return chatResponse, nil
+}
+
+// ChatStreamlyWithSender sends messages and streams response via sender function (best performance, no channel)
+func (d *DeepSeekModel) ChatStreamlyWithSender(ctx context.Context, modelName string, messages []Message, apiConfig *APIConfig, chatModelConfig *ChatConfig, modelUsage *common.ModelUsage, sender func(*string, *string) error) error {
+	if err := d.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return err
+	}
+
+	if len(messages) == 0 {
+		return fmt.Errorf("messages is empty")
+	}
+
+	resolvedBaseURL, err := d.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("%s/chat/completions", resolvedBaseURL)
+
+	// Build request body with streaming enabled
+	reqBody := buildRequestBody(chatModelConfig, modelName, messages, true)
+	if chatModelConfig != nil && chatModelConfig.Thinking != nil && *chatModelConfig.Thinking {
+		var thinkingFlag string
+		effort := "high"
+		if chatModelConfig.Effort != nil {
+			effort = *chatModelConfig.Effort
+		}
+		switch effort {
+		case "none":
+			thinkingFlag = "disabled"
+		case "low":
+			thinkingFlag = "disabled"
+		case "medium":
+			thinkingFlag = "disabled"
+		case "high":
+			thinkingFlag = "enabled"
+			reqBody["reasoning_effort"] = "high"
+		case "default":
+			thinkingFlag = "enabled"
+			reqBody["reasoning_effort"] = "high"
+		case "max":
+			thinkingFlag = "enabled"
+			reqBody["reasoning_effort"] = "max"
+		default:
+			return fmt.Errorf("invalid effort level")
+		}
+		reqBody["thinking"] = map[string]interface{}{
+			"type": thinkingFlag,
+		}
+	} else {
+		reqBody["thinking"] = map[string]interface{}{
+			"type": "disabled",
+		}
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, streamCallTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
+
+	resp, err := d.baseModel.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	sawTerminal := false
+	accumulatedToolCalls := make(map[int]map[string]interface{})
+	done, err := ParseSSEStream[map[string]interface{}](resp.Body, func(event map[string]interface{}) error {
+		common.Info(fmt.Sprintf("%v", event))
+
+		choices, ok := event["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
+			return nil
+		}
+
+		firstChoice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		delta, ok := firstChoice["delta"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+
+		if accumulateToolCallDeltas(delta, accumulatedToolCalls) {
+			return nil
+		}
+
+		content, ok := delta["content"].(string)
+		if ok && content != "" {
+			if err := sender(&content, nil); err != nil {
+				return err
+			}
+		}
+
+		reasoningContent, ok := delta["reasoning_content"].(string)
+		if ok && reasoningContent != "" {
+			if err := sender(nil, &reasoningContent); err != nil {
+				return err
+			}
+		}
+
+		finishReason, ok := firstChoice["finish_reason"].(string)
+		if ok && finishReason != "" {
+			sawTerminal = true
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to scan response body: %w", err)
+	}
+	if !done && !sawTerminal {
+		return fmt.Errorf("deepseek: stream ended before [DONE] or finish_reason")
+	}
+
+	setSortedToolCallsResult(chatModelConfig, accumulatedToolCalls)
+
+	// Send [DONE] marker for OpenAI compatibility
+	endOfStream := "[DONE]"
+	return sender(&endOfStream, nil)
+}
+
+// Embed embeds a list of texts into embeddings
+func (d *DeepSeekModel) Embed(ctx context.Context, modelName *string, texts []string, apiConfig *APIConfig, embeddingConfig *EmbeddingConfig, modelUsage *common.ModelUsage) ([]EmbeddingData, error) {
+	return nil, fmt.Errorf("%s, no such method", d.Name())
+}
+
+func (d *DeepSeekModel) ListModels(ctx context.Context, apiConfig *APIConfig) ([]ListModelResponse, error) {
+	if err := d.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
+	}
+
+	resolvedBaseURL, err := d.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s/%s", resolvedBaseURL, d.baseModel.URLSuffix.Models)
 
 	// Build request body
 	reqBody := map[string]interface{}{}
@@ -95,7 +357,10 @@ func (z *DeepSeekModel) ListModels(apiConfig *APIConfig) ([]string, error) {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("GET", url, bytes.NewBuffer(jsonData))
+	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -103,7 +368,7 @@ func (z *DeepSeekModel) ListModels(apiConfig *APIConfig) ([]string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
 
-	resp, err := z.httpClient.Do(req)
+	resp, err := d.baseModel.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -124,22 +389,131 @@ func (z *DeepSeekModel) ListModels(apiConfig *APIConfig) ([]string, error) {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	var models []string
-	for _, model := range modelList.Models {
-		models = append(models, model.ID)
+	return ParseListModel(modelList), nil
+}
+
+// deepseekBalanceResponse is the shape returned by
+// GET /user/balance. The balance fields are strings in the
+// upstream API, so we parse them on our side.
+type deepseekBalanceResponse struct {
+	IsAvailable  bool `json:"is_available"`
+	BalanceInfos []struct {
+		Currency        string `json:"currency"`
+		TotalBalance    string `json:"total_balance"`
+		GrantedBalance  string `json:"granted_balance"`
+		ToppedUpBalance string `json:"topped_up_balance"`
+	} `json:"balance_infos"`
+}
+
+// Balance returns the user's available balance on DeepSeek by
+// calling GET /user/balance with the configured Bearer token.
+// The result map matches the shape used by the Moonshot driver,
+// so the UI can render it without provider-specific code.
+func (d *DeepSeekModel) Balance(ctx context.Context, apiConfig *APIConfig) (map[string]interface{}, error) {
+	if err := d.baseModel.APIConfigCheck(apiConfig); err != nil {
+		return nil, err
 	}
 
-	return models, nil
+	baseURL, err := d.baseModel.GetBaseURL(apiConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("%s/%s", strings.TrimSuffix(baseURL, "/"), d.baseModel.URLSuffix.Balance)
+
+	ctx, cancel := context.WithTimeout(ctx, nonStreamCallTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *apiConfig.ApiKey))
+
+	resp, err := d.baseModel.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DeepSeek balance API error: %s, body: %s", resp.Status, string(body))
+	}
+
+	var parsed deepseekBalanceResponse
+	if err = json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if len(parsed.BalanceInfos) == 0 {
+		return nil, fmt.Errorf("no balance info in response")
+	}
+
+	// Pick the first balance entry, the same way the Moonshot
+	// driver returns a single {balance, currency} pair to the UI.
+	first := parsed.BalanceInfos[0]
+	total, err := strconv.ParseFloat(first.TotalBalance, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid total_balance %q: %w", first.TotalBalance, err)
+	}
+
+	return map[string]interface{}{
+		"balance":  total,
+		"currency": first.Currency,
+	}, nil
 }
 
-func (z *DeepSeekModel) Balance(apiConfig *APIConfig) (map[string]interface{}, error) {
-	return nil, fmt.Errorf("%s, no such method", z.Name())
-}
-
-func (z *DeepSeekModel) CheckConnection(apiConfig *APIConfig) error {
-	_, err := z.ListModels(apiConfig)
+func (d *DeepSeekModel) CheckConnection(ctx context.Context, apiConfig *APIConfig) error {
+	_, err := d.ListModels(ctx, apiConfig)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+// Rerank calculates similarity scores between query and documents
+func (d *DeepSeekModel) Rerank(ctx context.Context, modelName *string, query string, documents []string, apiConfig *APIConfig, rerankConfig *RerankConfig, modelUsage *common.ModelUsage) (*RerankResponse, error) {
+	return nil, fmt.Errorf("%s, Rerank not implemented", d.Name())
+}
+
+// TranscribeAudio transcribe audio
+func (d *DeepSeekModel) TranscribeAudio(ctx context.Context, modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig, modelUsage *common.ModelUsage) (*ASRResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", d.Name())
+}
+
+func (d *DeepSeekModel) TranscribeAudioWithSender(ctx context.Context, modelName *string, file *string, apiConfig *APIConfig, asrConfig *ASRConfig, modelUsage *common.ModelUsage, sender func(*string, *string) error) error {
+	return fmt.Errorf("%s, no such method", d.Name())
+}
+
+// AudioSpeech convert text to audio
+func (d *DeepSeekModel) AudioSpeech(ctx context.Context, modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig, modelUsage *common.ModelUsage) (*TTSResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", d.Name())
+}
+
+func (d *DeepSeekModel) AudioSpeechWithSender(ctx context.Context, modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig, modelUsage *common.ModelUsage, sender func(*string, *string) error) error {
+	return fmt.Errorf("%s, no such method", d.Name())
+}
+
+// OCRFile OCR file
+func (d *DeepSeekModel) OCRFile(ctx context.Context, modelName *string, content []byte, url *string, apiConfig *APIConfig, ocrConfig *OCRConfig, modelUsage *common.ModelUsage) (*OCRFileResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", d.Name())
+}
+
+// ParseFile parse file
+func (d *DeepSeekModel) ParseFile(ctx context.Context, modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig, modelUsage *common.ModelUsage) (*ParseFileResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", d.Name())
+}
+
+func (d *DeepSeekModel) ListTasks(ctx context.Context, apiConfig *APIConfig) ([]ListTaskStatus, error) {
+	return nil, fmt.Errorf("%s, no such method", d.Name())
+}
+
+func (d *DeepSeekModel) ShowTask(ctx context.Context, taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", d.Name())
 }

@@ -25,8 +25,6 @@ import (
 	"ragflow/internal/dao"
 )
 
-var DB = dao.DB
-
 // LLMService LLM service
 type LLMService struct {
 	tenantLLMDAO *dao.TenantLLMDAO
@@ -169,6 +167,7 @@ func (s *LLMService) ListLLMs(tenantID string, modelType string) (ListLLMsRespon
 		"LocalAI":    true,
 		"LM-Studio":  true,
 		"GPUStack":   true,
+		"ModelScope": true,
 	}
 
 	objs, err := s.tenantLLMDAO.ListAllByTenant(tenantID)
@@ -352,7 +351,7 @@ func (s *LLMService) SetAPIKey(tenantID string, req *SetAPIKeyRequest) (*SetAPIK
 		if req.Verify {
 			return &SetAPIKeyResult{Message: msg, Success: false}, nil
 		}
-		return nil, fmt.Errorf(msg)
+		return nil, fmt.Errorf("%s", msg)
 	}
 
 	llmConfig := map[string]interface{}{
@@ -381,7 +380,7 @@ func (s *LLMService) SetAPIKey(tenantID string, req *SetAPIKeyRequest) (*SetAPIK
 				"api_base":   baseURL,
 				"max_tokens": maxTokens,
 			}
-			DB.Model(&entity.TenantLLM{}).
+			dao.DB.Model(&entity.TenantLLM{}).
 				Where("tenant_id = ? AND llm_factory = ? AND llm_name = ?", tenantID, factory, llm.LLMName).
 				Updates(updates)
 		} else {

@@ -45,7 +45,7 @@ def _load_table_module(monkeypatch):
     deepdoc_parser.ExcelParser = excel_parser.RAGFlowExcelParser
     rag_nlp = types.ModuleType("rag.nlp")
     rag_nlp.rag_tokenizer = types.SimpleNamespace(tokenize=lambda text: text.split())
-    rag_nlp.tokenize = lambda document, text, _english: document.update(
+    rag_nlp.tokenize = lambda document, text, _english, **_kwargs: document.update(
         {"content_with_weight": text, "content_ltks": text.split()}
     )
     rag_nlp.tokenize_table = lambda *_args, **_kwargs: []
@@ -54,6 +54,8 @@ def _load_table_module(monkeypatch):
         DOC_ENGINE_INFINITY=False,
         DOC_ENGINE_OCEANBASE=False,
     )
+    common_constants = types.ModuleType("common.constants")
+    common_constants.MAXIMUM_TASK_PAGE_NUMBER = 100000
     xpinyin = types.ModuleType("xpinyin")
     xpinyin.Pinyin = type(
         "Pinyin",
@@ -68,6 +70,7 @@ def _load_table_module(monkeypatch):
         "deepdoc.parser": deepdoc_parser,
         "rag.nlp": rag_nlp,
         "common": common,
+        "common.constants": common_constants,
         "xpinyin": xpinyin,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
