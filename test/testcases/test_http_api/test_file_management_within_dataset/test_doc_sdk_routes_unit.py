@@ -922,6 +922,62 @@ class TestDocRoutesUnit:
 
         assert "don't own the dataset" in res["message"]
 
+    def test_active_tabular_generation_authorizes_before_repository_read(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: False)
+        monkeypatch.setattr(
+            module,
+            "_get_tabular_structure_service",
+            lambda: (_ for _ in ()).throw(AssertionError("generation service must not run before authorization")),
+        )
+
+        res = _run(_route_core(module.get_active_tabular_structure_generation)("tenant-1", "ds-1", "doc-1"))
+
+        assert "don't own the dataset" in res["message"]
+
+    def test_active_tabular_generation_returns_only_server_selected_public_identity(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        calls = []
+
+        class _Service:
+            @staticmethod
+            def get_active_generation(**kwargs):
+                calls.append(kwargs)
+                return {
+                    "producer_generation_ref": "generation-1",
+                    "projection_version": "tabular-structure-projection/v1",
+                    "producer_schema_version": "table-producer/v1",
+                    "row_count": 3,
+                    "status": "active",
+                    "manifest_object_name": "private/object/name",
+                    "source_sha256": "a" * 64,
+                }
+
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+        monkeypatch.setattr(module, "_get_tabular_structure_service", lambda: _Service)
+
+        result = _run(_route_core(module.get_active_tabular_structure_generation)("tenant-1", "ds-1", "doc-1"))
+
+        assert result == {
+            "code": 0,
+            "data": {
+                "producer_generation_ref": "generation-1",
+                "projection_version": "tabular-structure-projection/v1",
+                "producer_schema_version": "table-producer/v1",
+                "row_count": 3,
+                "status": "active",
+            },
+        }
+        assert calls == [
+            {
+                "tenant_id": "owner-tenant",
+                "dataset_id": "ds-1",
+                "document_id": "doc-1",
+            }
+        ]
+
     def test_tabular_structure_routes_require_exact_generation_and_return_bounded_data(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
         calls = []

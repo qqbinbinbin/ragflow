@@ -103,6 +103,34 @@ def _authorized_structure_owner(tenant_id, dataset_id, document_id):
     return dataset.tenant_id, None
 
 
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/active-generation", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def get_active_tabular_structure_generation(tenant_id, dataset_id, document_id):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    try:
+        generation = _get_tabular_structure_service().get_active_generation(
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+        )
+        data = {
+            key: generation[key]
+            for key in (
+                "producer_generation_ref",
+                "projection_version",
+                "producer_schema_version",
+                "row_count",
+                "status",
+            )
+        }
+        return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
 def _decode_chunk_image_base64(image_base64):
     if not isinstance(image_base64, str) or not image_base64.strip():
         return None, "`image_base64` must be a non-empty string"
