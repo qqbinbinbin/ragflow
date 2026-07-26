@@ -1714,6 +1714,19 @@ async def do_handle_task(task):
         task_time_cost = timer() - task_start_ts
         get_recording_context().record("task_status", "completed")
         progress_callback(prog=1.0, msg="Task done ({:.2f}s)".format(task_time_cost))
+        if task["parser_id"].lower() == "table":
+            try:
+                from rag.app.tabular_structure_runtime import publish_tabular_structure_generation
+
+                completed_task = {**task, "progress": 1.0}
+                await asyncio.to_thread(
+                    publish_tabular_structure_generation,
+                    completed_task,
+                    await get_storage_binary(*File2DocumentService.get_storage_address(doc_id=task_doc_id)),
+                    task_list_provider=TaskService.get_tasks,
+                )
+            except Exception:
+                logging.exception("Tabular structure publication hook failed for doc=%s", task_doc_id)
         logging.info("Chunk doc({}), page({}-{}), chunks({}), token({}), elapsed:{:.2f}".format(task_document_name, task_from_page, task_to_page, len(chunks), token_count, task_time_cost))
 
     finally:

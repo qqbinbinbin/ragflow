@@ -46,7 +46,7 @@ from api.db.joint_services.tenant_model_service import (
     get_model_config_by_id,
 )
 from api.db.services.llm_service import LLMBundle
-from api.db.services.task_service import GRAPH_RAPTOR_FAKE_DOC_ID, abort_doc_chunking_counter
+from api.db.services.task_service import GRAPH_RAPTOR_FAKE_DOC_ID, TaskService, abort_doc_chunking_counter
 from common.constants import LLMType
 from common.exceptions import TaskCanceledException
 from common.connection_utils import timeout
@@ -670,6 +670,19 @@ class TaskHandler:
         task_time_cost = timer() - task_start_ts
         ctx.recording_context.record("task_status", "completed")
         ctx.progress_cb(prog=1.0, msg="Task done ({:.2f}s)".format(task_time_cost))
+        if ctx.parser_id.lower() == "table":
+            try:
+                from rag.app.tabular_structure_runtime import publish_tabular_structure_generation
+
+                completed_task = {**ctx.raw_task, "progress": 1.0}
+                await asyncio.to_thread(
+                    publish_tabular_structure_generation,
+                    completed_task,
+                    binary,
+                    task_list_provider=TaskService.get_tasks,
+                )
+            except Exception:
+                logging.exception("Tabular structure publication hook failed for doc=%s", task_doc_id)
 
         logging.info("Chunk doc({}), page({}-{}), chunks({}), token({}), elapsed:{:.2f}".format(ctx.name, ctx.from_page, ctx.to_page, len(chunks), token_count, task_time_cost))
 
