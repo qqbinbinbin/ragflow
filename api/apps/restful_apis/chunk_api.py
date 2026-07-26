@@ -76,6 +76,12 @@ def _get_tabular_structure_service():
     return TabularStructureService
 
 
+def _publish_tabular_structure_from_source(**kwargs):
+    from rag.app.tabular_structure_runtime import publish_tabular_structure_from_source
+
+    return publish_tabular_structure_from_source(**kwargs)
+
+
 def _tabular_structure_error_response(error):
     from rag.app.tabular_structure import StructureGenerationConflict, StructureSnapshotChanged, StructureSnapshotMissing
 
@@ -127,6 +133,49 @@ async def get_active_tabular_structure_generation(tenant_id, dataset_id, documen
             )
         }
         return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations", methods=["POST"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def build_tabular_structure_generation(tenant_id, dataset_id, document_id):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    docs = DocumentService.query(id=document_id, kb_id=dataset_id)
+    document = docs[0]
+    if str(getattr(document, "parser_id", "")).lower() != "table":
+        reason = "provider_capability_unavailable"
+        return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+    try:
+        source_bucket, source_object = File2DocumentService.get_storage_address(doc_id=document_id)
+        binary = await thread_pool_exec(settings.STORAGE_IMPL.get, source_bucket, source_object)
+        result = await thread_pool_exec(
+            _publish_tabular_structure_from_source,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            filename=document.name,
+            binary=binary,
+        )
+        safe_result = {
+            key: result[key]
+            for key in ("status", "producer_generation_ref", "row_count")
+            if key in result
+        }
+        if result.get("status") == "active":
+            active = _get_tabular_structure_service().get_active_generation(
+                tenant_id=owner_tenant_id,
+                dataset_id=dataset_id,
+                document_id=document_id,
+            )
+            safe_result.update({
+                "projection_version": active["projection_version"],
+                "producer_schema_version": active["producer_schema_version"],
+            })
+        return get_result(data=safe_result)
     except Exception as error:
         return _tabular_structure_error_response(error)
 

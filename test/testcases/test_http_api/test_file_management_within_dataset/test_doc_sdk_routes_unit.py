@@ -978,6 +978,79 @@ class TestDocRoutesUnit:
             }
         ]
 
+    def test_structure_only_build_authorizes_and_never_reparses_ordinary_chunks(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        calls = []
+
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(
+            module.DocumentService,
+            "query",
+            lambda **_kwargs: [_DummyDoc(kb_id="ds-1", parser_id="table", name="anonymous.xlsx")],
+        )
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+        monkeypatch.setattr(module.File2DocumentService, "get_storage_address", lambda **_kwargs: ("source-bucket", "source-object"))
+        monkeypatch.setattr(module.settings.STORAGE_IMPL, "get", lambda *_args: b"workbook")
+
+        async def _thread_pool(func, *args, **kwargs):
+            calls.append((getattr(func, "__name__", "call"), args))
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(module, "thread_pool_exec", _thread_pool)
+        monkeypatch.setattr(
+            module,
+            "_publish_tabular_structure_from_source",
+            lambda **_kwargs: {
+                "status": "active",
+                "producer_generation_ref": "generation-1",
+                "row_count": 3,
+            },
+        )
+        monkeypatch.setattr(
+            module,
+            "_get_tabular_structure_service",
+            lambda: SimpleNamespace(
+                get_active_generation=lambda **_kwargs: {
+                    "projection_version": "tabular-structure-projection/v1",
+                    "producer_schema_version": "table-producer/v1",
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            module,
+            "queue_tasks",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ordinary parse queue must not run")),
+        )
+
+        result = _run(_route_core(module.build_tabular_structure_generation)("tenant-1", "ds-1", "doc-1"))
+
+        assert result == {
+            "code": 0,
+            "data": {
+                "status": "active",
+                "producer_generation_ref": "generation-1",
+                "row_count": 3,
+                "projection_version": "tabular-structure-projection/v1",
+                "producer_schema_version": "table-producer/v1",
+            },
+        }
+        assert len(calls) == 2
+
+    def test_structure_only_build_rejects_non_table_document_before_storage_read(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1", parser_id="naive")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+        monkeypatch.setattr(
+            module.File2DocumentService,
+            "get_storage_address",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("storage must not be read")),
+        )
+
+        result = _run(_route_core(module.build_tabular_structure_generation)("tenant-1", "ds-1", "doc-1"))
+
+        assert result["data"] == {"reason": "provider_capability_unavailable"}
+
     def test_tabular_structure_routes_require_exact_generation_and_return_bounded_data(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
         calls = []

@@ -5,6 +5,7 @@ import rag.app.tabular_structure as tabular_structure
 import rag.app.tabular_structure_runtime as runtime
 from rag.app.tabular_structure_runtime import (
     is_complete_tabular_parse,
+    publish_tabular_structure_from_source,
     publish_tabular_structure_generation,
     structure_generation_ref,
 )
@@ -47,6 +48,14 @@ def test_generation_ref_is_idempotent_for_same_document_and_source():
 def test_generation_ref_includes_the_producer_schema_version(monkeypatch):
     original = structure_generation_ref("document-1", b"workbook")
     monkeypatch.setattr(tabular_structure, "PRODUCER_SCHEMA_VERSION", "table-producer/v2")
+    changed = structure_generation_ref("document-1", b"workbook")
+
+    assert original != changed
+
+
+def test_generation_ref_includes_the_projection_version(monkeypatch):
+    original = structure_generation_ref("document-1", b"workbook")
+    monkeypatch.setattr(tabular_structure, "PROJECTION_VERSION", "tabular-structure-projection/v2")
     changed = structure_generation_ref("document-1", b"workbook")
 
     assert original != changed
@@ -202,3 +211,58 @@ def test_legacy_and_refactored_executors_call_the_same_runtime_hook():
         assert "publish_tabular_structure_generation" in source
         assert "TaskService.get_tasks" in source
         assert '"progress": 1.0' in source
+
+
+def test_structure_only_build_publishes_from_source_without_parse_tasks():
+    calls = []
+    generation_ref = structure_generation_ref("document-1", b"workbook")
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        active = False
+
+        @classmethod
+        def get_active_generation(cls, **_kwargs):
+            if cls.active:
+                return {"producer_generation_ref": generation_ref}
+            raise cls.StructureSnapshotMissing()
+
+        @classmethod
+        def register_shadow_generation(cls, storage, **kwargs):
+            calls.append(("register", storage, kwargs))
+
+        @classmethod
+        def activate_generation(cls, storage, **kwargs):
+            calls.append(("activate", storage, kwargs))
+            cls.active = True
+
+    result = publish_tabular_structure_from_source(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="anonymous.xlsx",
+        binary=b"workbook",
+        storage="projection-storage",
+        service=Service,
+        projection_builder=lambda *_args, **kwargs: {
+            "rows": [{"row_ref_kwd": "row-1"}],
+            "producer_generation_ref": kwargs["producer_generation_ref"],
+        },
+        projection_store=lambda *_args, **_kwargs: {
+            "producer_generation_ref": generation_ref,
+            "manifest_object_name": "manifest.json",
+            "manifest_sha256": "a" * 64,
+            "part_count": 1,
+            "row_count": 1,
+        },
+    )
+
+    assert result == {
+        "status": "active",
+        "producer_generation_ref": generation_ref,
+        "row_count": 1,
+    }
+    assert [call[0] for call in calls] == ["register", "activate"]
+    assert calls[-1][2]["expected_active_generation_ref"] is None
