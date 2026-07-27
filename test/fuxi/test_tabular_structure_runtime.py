@@ -47,7 +47,7 @@ def test_generation_ref_is_idempotent_for_same_document_and_source():
 
 def test_generation_ref_includes_the_producer_schema_version(monkeypatch):
     original = structure_generation_ref("document-1", b"workbook")
-    monkeypatch.setattr(tabular_structure, "PRODUCER_SCHEMA_VERSION", "table-producer/v2")
+    monkeypatch.setattr(tabular_structure, "PRODUCER_SCHEMA_VERSION", "table-producer/test-next")
     changed = structure_generation_ref("document-1", b"workbook")
 
     assert original != changed

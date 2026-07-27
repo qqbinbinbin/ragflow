@@ -9,12 +9,17 @@ from openpyxl import Workbook
 from test.fuxi.test_table_semantic_rows import _load_table_module
 
 from rag.app.tabular_structure import (
+    PRODUCER_SCHEMA_VERSION,
     PROJECTION_ROW_FIELDS,
     build_tabular_structure_projection,
     partition_tabular_structure_projection,
     store_tabular_structure_projection,
     validate_tabular_structure_projection,
 )
+
+
+def test_current_producer_schema_is_v2_for_generation_invalidation():
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v2"
 
 
 def _workbook_bytes(

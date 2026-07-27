@@ -28,7 +28,7 @@ from typing import Any
 
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
-PRODUCER_SCHEMA_VERSION = "table-producer/v1"
+PRODUCER_SCHEMA_VERSION = "table-producer/v2"
 PROJECTION_VERSION = "tabular-structure-projection/v1"
 PROJECTION_PART_VERSION = "tabular-structure-part/v1"
 PROJECTION_FIELDS = frozenset(
