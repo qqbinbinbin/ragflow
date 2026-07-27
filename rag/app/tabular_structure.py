@@ -182,23 +182,39 @@ def _has_partial_row_merge(row_ordinal: int, width: int, merged_ranges) -> bool:
     )
 
 
+def _row_merge_signature(row_ordinal: int, merged_ranges) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        sorted(
+            (merged.min_col, merged.max_col)
+            for merged in merged_ranges
+            if merged.min_row <= row_ordinal <= merged.max_row
+        )
+    )
+
+
 def _classify_body_row(
     row_ordinal: int,
     values: list[object],
     merged_ranges,
+    *,
+    repeated_merge_signatures: set[tuple[tuple[int, int], ...]] | None = None,
 ) -> str:
     width = len(values)
     populated = sum(value is not None and str(value).strip() != "" for value in values)
     if _is_full_width_merge(row_ordinal, width, merged_ranges):
         return "unknown"
-    if _has_partial_row_merge(row_ordinal, width, merged_ranges):
+    merge_signature = _row_merge_signature(row_ordinal, merged_ranges)
+    if (
+        _has_partial_row_merge(row_ordinal, width, merged_ranges)
+        and merge_signature not in (repeated_merge_signatures or set())
+    ):
         return "unknown"
     if populated >= min(2, width):
         return "data"
     return "unknown"
 
 
-def _row_shape(values: list[object]) -> tuple[str, ...]:
+def _row_shape(values: list[object], *, distinguish_text_digits: bool = False) -> tuple[str, ...]:
     shape = []
     for value in values:
         if value is None or (isinstance(value, str) and not value.strip()):
@@ -208,8 +224,23 @@ def _row_shape(values: list[object]) -> tuple[str, ...]:
         elif isinstance(value, (int, float)):
             shape.append("number")
         else:
-            shape.append("text")
+            rendered = str(value).strip()
+            if distinguish_text_digits and any(char.isdigit() for char in rendered):
+                shape.append("text_with_digit")
+            else:
+                shape.append("text")
     return tuple(shape)
+
+
+def _is_repeated_header_row(headers: list[str], values: list[object]) -> bool:
+    """Treat an exact repeated header as a structural boundary."""
+
+    if len(headers) != len(values):
+        return False
+    normalized_values = ["" if value is None else str(value).strip() for value in values]
+    if not all(normalized_values):
+        return False
+    return normalized_values == [str(header).strip() for header in headers]
 
 
 def _table_context(
@@ -334,19 +365,63 @@ def build_tabular_structure_projection(
             body_rows.append((row_ordinal, values, body_gap_seen))
             previous_body_ordinal = row_ordinal
 
+        merge_signature_counts = {}
+        for row_ordinal, _values, _follows_body_gap in body_rows:
+            signature = _row_merge_signature(row_ordinal, merged_ranges)
+            if signature:
+                merge_signature_counts[signature] = merge_signature_counts.get(signature, 0) + 1
+        repeated_merge_signatures = {
+            signature for signature, count in merge_signature_counts.items() if count >= 3
+        }
+        trailing_note_signatures = {
+            signature
+            for signature, count in merge_signature_counts.items()
+            if count >= 2 and signature not in repeated_merge_signatures
+        }
+        distinguish_text_digits = not any(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for _row_ordinal, values, _follows_body_gap in body_rows
+            for value in values
+        )
+        note_boundary = next(
+            (
+                row_ordinal
+                for row_ordinal, _values, _follows_body_gap in body_rows
+                if _row_merge_signature(row_ordinal, merged_ranges) in trailing_note_signatures
+            ),
+            None,
+        )
+
         established_shape = None
+        trailing_note_started = False
         for body_index, (row_ordinal, values, follows_body_gap) in enumerate(body_rows):
-            if follows_body_gap:
-                row_role = "unknown"
-            else:
+            row_role = "unknown"
+            merge_signature = _row_merge_signature(row_ordinal, merged_ranges)
+            populated = any(value is not None and str(value).strip() for value in values)
+            if established_shape is not None and not populated and note_boundary is not None and row_ordinal < note_boundary:
+                row_role = "note"
+            elif trailing_note_started:
+                row_role = "note"
+            elif established_shape is not None and merge_signature in trailing_note_signatures:
+                row_role = "note"
+                trailing_note_started = True
+            elif not follows_body_gap:
                 row_role = _classify_body_row(
                     row_ordinal,
                     values,
                     merged_ranges,
+                    repeated_merge_signatures=repeated_merge_signatures,
                 )
-                current_shape = _row_shape(values)
-                next_shape = _row_shape(body_rows[body_index + 1][1]) if body_index + 1 < len(body_rows) else None
-                if row_role == "data" and all(value_type == "text" for value_type in current_shape):
+                current_shape = _row_shape(values, distinguish_text_digits=distinguish_text_digits)
+                next_shape = (
+                    _row_shape(
+                        body_rows[body_index + 1][1],
+                        distinguish_text_digits=distinguish_text_digits,
+                    )
+                    if body_index + 1 < len(body_rows)
+                    else None
+                )
+                if _is_repeated_header_row(headers, values):
                     row_role = "unknown"
                 if (
                     row_role == "data"
@@ -358,7 +433,10 @@ def build_tabular_structure_projection(
             if row_role == "data":
                 data_row_index += 1
                 current_data_index = data_row_index
-                established_shape = established_shape or _row_shape(values)
+                established_shape = established_shape or _row_shape(
+                    values,
+                    distinguish_text_digits=distinguish_text_digits,
+                )
             else:
                 current_data_index = None
                 has_unknown = has_unknown or row_role == "unknown"

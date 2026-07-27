@@ -124,6 +124,84 @@ def test_duplicate_values_remain_distinct_and_rows_use_only_fixed_fields(table_p
     assert {frozenset(row) for row in alternate["rows"]} == {PROJECTION_ROW_FIELDS}
 
 
+def test_stable_plain_text_rows_are_data_and_prove_the_denominator(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "PlainText"
+    sheet.append(["Characteristic", "Type", "Requirement"])
+    sheet.append(["Rolling resistance", "SC", "<= 7.5 N/KN"])
+    sheet.append(["Uniformity", "SC", "RFV <= 170 N"])
+    sheet.append(["Stiffness", "SC", "Radial >= 320 N/mm"])
+    output = BytesIO()
+    workbook.save(output)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        output.getvalue(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+    target = [row for row in projection["rows"] if row["table_label_kwd"] == "PlainText"]
+
+    assert [row["row_role_kwd"] for row in target] == ["data", "data", "data"]
+    assert [row["data_row_index_int"] for row in target] == [1, 2, 3]
+    assert {row["source_total_count_int"] for row in target} == {3}
+
+
+def test_repeated_partial_merge_rows_are_data_when_the_shape_is_stable(table_parser, monkeypatch):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "MergedText"
+    sheet.append(["Characteristic", "Type", "Requirement"])
+    for index, requirement in enumerate(("<= 7.5 N/KN", "RFV <= 170 N", ">= 320 N/mm"), start=2):
+        sheet.merge_cells(start_row=index, start_column=1, end_row=index, end_column=2)
+        sheet.cell(index, 1, f"Characteristic {index}")
+        sheet.cell(index, 3, requirement)
+    monkeypatch.setattr(
+        table_parser,
+        "_parse_sheet_structure",
+        lambda _worksheet, _rows: (["Characteristic", "Type", "Requirement"], 0, 1),
+    )
+    output = BytesIO()
+    workbook.save(output)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        output.getvalue(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+    target = [row for row in projection["rows"] if row["table_label_kwd"] == "MergedText"]
+
+    assert [row["row_role_kwd"] for row in target] == ["data", "data", "data"]
+    assert {row["source_total_count_int"] for row in target} == {3}
+
+
+def test_repeated_header_inside_a_table_still_invalidates_completeness(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "RepeatedHeader"
+    sheet.append(["Code", "Description"])
+    sheet.append(["A-1", "First"])
+    sheet.append(["Code", "Description"])
+    sheet.append(["A-2", "Second"])
+    output = BytesIO()
+    workbook.save(output)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        output.getvalue(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+    target = [row for row in projection["rows"] if row["table_label_kwd"] == "RepeatedHeader"]
+    repeated_header = next(row for row in target if row["row_ordinal_int"] == 3)
+
+    assert repeated_header["row_role_kwd"] == "unknown"
+    assert repeated_header["data_row_index_int"] is None
+    assert {row["source_total_count_int"] for row in target} == {None}
+
+
 def test_table_parser_exposes_the_projection_producer_without_using_chunk_output(monkeypatch):
     table = _load_table_module(monkeypatch)
 
