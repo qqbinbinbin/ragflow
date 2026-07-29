@@ -28,7 +28,7 @@ from typing import Any
 
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
-PRODUCER_SCHEMA_VERSION = "table-producer/v2"
+PRODUCER_SCHEMA_VERSION = "table-producer/v3"
 PROJECTION_VERSION = "tabular-structure-projection/v1"
 PROJECTION_PART_VERSION = "tabular-structure-part/v1"
 PROJECTION_FIELDS = frozenset(
@@ -156,7 +156,11 @@ def _ordered_fields(headers: list[str], values: list[object], *, note: bool) -> 
     for name, value in zip(headers, values):
         if value is None or (isinstance(value, str) and not value.strip()):
             continue
-        rendered = str(value).strip()
+        rendered = (
+            str(int(value))
+            if isinstance(value, float) and value.is_integer()
+            else str(value).strip()
+        )
         if not rendered:
             continue
         fields.append({"name": str(name), "value": rendered})

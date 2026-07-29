@@ -11,6 +11,7 @@ from test.fuxi.test_table_semantic_rows import _load_table_module
 from rag.app.tabular_structure import (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_ROW_FIELDS,
+    _ordered_fields,
     build_tabular_structure_projection,
     partition_tabular_structure_projection,
     store_tabular_structure_projection,
@@ -18,8 +19,8 @@ from rag.app.tabular_structure import (
 )
 
 
-def test_current_producer_schema_is_v2_for_generation_invalidation():
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v2"
+def test_current_producer_schema_is_v3_for_display_semantics_invalidation():
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v3"
 
 
 def _workbook_bytes(
@@ -127,6 +128,20 @@ def test_duplicate_values_remain_distinct_and_rows_use_only_fixed_fields(table_p
         parser=table_parser,
     )
     assert {frozenset(row) for row in alternate["rows"]} == {PROJECTION_ROW_FIELDS}
+
+
+def test_ordered_fields_remove_only_insignificant_float_zeroes():
+    fields = _ordered_fields(
+        ["Integral", "Decimal", "Text"],
+        [1.0, 1.5, "01-A"],
+        note=False,
+    )
+
+    assert fields == [
+        {"name": "Integral", "value": "1"},
+        {"name": "Decimal", "value": "1.5"},
+        {"name": "Text", "value": "01-A"},
+    ]
 
 
 def test_stable_plain_text_rows_are_data_and_prove_the_denominator(table_parser):
