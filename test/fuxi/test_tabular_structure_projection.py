@@ -25,7 +25,7 @@ from rag.app.tabular_structure import (
 
 def test_current_producer_schema_is_v3_for_display_semantics_invalidation():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v3"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v4"
 
 
 def test_table_ref_identity_binds_algorithm_version_and_exact_membership(monkeypatch):
@@ -174,6 +174,19 @@ def _vertical_complete_with_headerless_continuation_bytes():
     return _save_workbook(workbook)
 
 
+def _vertical_complete_with_subset_headerless_continuation_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status", "Owner", "Revision", "Date"])
+    sheet.append(["A-1", "Open", "Team-1", "R1", "2026-01-01"])
+    sheet.append(["A-2", "Closed", "Team-2", "R2", "2026-01-02"])
+    sheet.append([None, None, None, None, None])
+    sheet.append([None, None, None, None, None])
+    sheet.append(["B-1", "Open", "Team-3", "R3"])
+    return _save_workbook(workbook)
+
+
 def _horizontal_complete_with_headerless_sibling_bytes():
     workbook = Workbook()
     sheet = workbook.active
@@ -181,6 +194,17 @@ def _horizontal_complete_with_headerless_sibling_bytes():
     sheet.append(["Left code", "Left status", None, None, "R-1", "Closed"])
     sheet.append(["L-1", "Open", None, None, "R-2", "Open"])
     sheet.append(["L-2", "Closed", None, None, "R-3", "Closed"])
+    return _save_workbook(workbook)
+
+
+def _complete_table_with_independent_repeated_header_table_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Left code", "Left status", None, None, "Right code", "Right status"])
+    sheet.append(["L-1", "Open", None, None, "R-1", "Open"])
+    sheet.append(["L-2", "Closed", None, None, "Right code", "Right status"])
+    sheet.append([None, None, None, None, "R-2", "Closed"])
     return _save_workbook(workbook)
 
 
@@ -192,6 +216,17 @@ def _complete_table_with_isolated_annotation_bytes():
     sheet.append(["A-1", "Open"])
     sheet.append(["A-2", "Closed"])
     sheet.cell(row=10, column=10, value="Annotation")
+    return _save_workbook(workbook)
+
+
+def _complete_table_with_axis_aligned_unknown_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.cell(row=10, column=1, value="Unresolved")
     return _save_workbook(workbook)
 
 
@@ -385,10 +420,43 @@ def test_vertical_headerless_continuation_downgrades_complete_sibling(table_pars
     assert all(table["source_total_count"] is None for table in projection["tables"])
 
 
+def test_subset_headerless_continuation_downgrades_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_complete_with_subset_headerless_continuation_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
 def test_horizontal_headerless_record_axis_downgrades_complete_sibling(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
         _horizontal_complete_with_headerless_sibling_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_projected_table_with_unknown_row_does_not_downgrade_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_independent_repeated_header_table_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
+
+
+def test_axis_aligned_single_unknown_downgrades_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_axis_aligned_unknown_bytes(),
         parser=table_parser,
     )
 

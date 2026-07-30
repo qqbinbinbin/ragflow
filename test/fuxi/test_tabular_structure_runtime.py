@@ -69,6 +69,12 @@ def test_generation_ref_includes_the_multi_region_algorithm_version(monkeypatch)
     assert original != changed
 
 
+def test_runtime_reexports_the_structure_producer_algorithm_version():
+    assert runtime.STRUCTURE_PRODUCER_ALGORITHM_VERSION == (
+        tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION
+    )
+
+
 def test_structure_publication_failure_is_safe_for_ordinary_parse(monkeypatch, caplog):
     current = {
         **_task("task-1", 1.0),

@@ -32,7 +32,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
 PRODUCER_SCHEMA_VERSION = "table-producer/v3"
 PROJECTION_VERSION = "tabular-structure-projection/v1"
 PROJECTION_PART_VERSION = "tabular-structure-part/v1"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v3"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v4"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -1001,9 +1001,9 @@ def _project_structure_region(
     )
 
 
-def _members_prove_repeated_axis(region: dict[str, Any]) -> bool:
+def _members_prove_repeated_axis(members: set[tuple[int, int]]) -> bool:
     rows: dict[int, set[int]] = {}
-    for row_ordinal, column_ordinal in region["members"]:
+    for row_ordinal, column_ordinal in members:
         rows.setdefault(row_ordinal, set()).add(column_ordinal)
     signatures = [
         tuple(column - min(columns) for column in sorted(columns))
@@ -1014,11 +1014,14 @@ def _members_prove_repeated_axis(region: dict[str, Any]) -> bool:
 
 
 def _region_aligns_with_projected_columns(
-    region: dict[str, Any],
+    members: set[tuple[int, int]],
     projected: list[dict[str, Any]],
 ) -> bool:
-    region_columns = {column for _row, column in region["members"]}
-    return any(region_columns == item["member_columns"] for item in projected)
+    region_columns = {column for _row, column in members}
+    return bool(region_columns) and any(
+        region_columns.issubset(item["member_columns"])
+        for item in projected
+    )
 
 
 def _unknown_structure_region(
@@ -1184,9 +1187,9 @@ def build_tabular_structure_projection(
                 )
             if result is None:
                 if (
-                    _members_prove_repeated_axis(region)
+                    _members_prove_repeated_axis(region["members"])
                     or region["unresolved_members"]
-                    or _region_aligns_with_projected_columns(region, projected)
+                    or _region_aligns_with_projected_columns(region["members"], projected)
                 ):
                     result = _unknown_structure_region(
                         parser=parser,
@@ -1239,14 +1242,14 @@ def build_tabular_structure_projection(
                     }
                 )
 
-        # A record-like unknown sibling may be a physically split continuation,
-        # so no table on the worksheet can prove its denominator independently.
+        # A wholly unknown sibling on the same physical columns may be a split
+        # continuation. This is a completeness risk, not an object adjudication.
         continuation_unknown = any(
-            any(row["row_role_kwd"] == "unknown" for row in item["rows"])
+            item["table"]["data_row_count"] == 0
             and (
-                _members_prove_repeated_axis(item)
+                _members_prove_repeated_axis(item["members"])
                 or any(
-                    item["member_columns"] == sibling["member_columns"]
+                    _region_aligns_with_projected_columns(item["members"], [sibling])
                     for sibling in projected
                     if sibling is not item
                 )

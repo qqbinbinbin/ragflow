@@ -7,6 +7,8 @@ import logging
 import uuid
 from typing import Any, Callable
 
+from rag.app.tabular_structure import STRUCTURE_PRODUCER_ALGORITHM_VERSION
+
 
 def is_complete_tabular_parse(current_task: dict[str, Any], tasks: list[dict[str, Any]] | None) -> bool:
     """Return true only when every row-range task for the document is done.
