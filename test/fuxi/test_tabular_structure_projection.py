@@ -25,7 +25,7 @@ from rag.app.tabular_structure import (
 
 def test_current_producer_schema_is_v3_for_display_semantics_invalidation():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v5"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v6"
 
 
 def test_table_ref_identity_binds_algorithm_version_and_exact_membership(monkeypatch):
@@ -468,7 +468,7 @@ def test_superset_headerless_continuation_downgrades_complete_sibling(table_pars
     assert all(table["source_total_count"] is None for table in projection["tables"])
 
 
-def test_partially_overlapping_unknown_does_not_downgrade_complete_sibling(table_parser):
+def test_partially_overlapping_unknown_downgrades_complete_sibling(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
         _complete_table_with_partially_overlapping_unknown_bytes(),
@@ -476,7 +476,7 @@ def test_partially_overlapping_unknown_does_not_downgrade_complete_sibling(table
     )
 
     assert len(projection["tables"]) == 2
-    assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
+    assert all(table["source_total_count"] is None for table in projection["tables"])
 
 
 def test_horizontal_headerless_record_axis_downgrades_complete_sibling(table_parser):

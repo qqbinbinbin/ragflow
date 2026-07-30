@@ -32,7 +32,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
 PRODUCER_SCHEMA_VERSION = "table-producer/v3"
 PROJECTION_VERSION = "tabular-structure-projection/v1"
 PROJECTION_PART_VERSION = "tabular-structure-part/v1"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v5"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v6"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -1013,21 +1013,8 @@ def _members_prove_repeated_axis(members: set[tuple[int, int]]) -> bool:
     return len(signatures) >= 2 and len(set(signatures)) == 1
 
 
-def _column_sets_are_nested(left: set[int], right: set[int]) -> bool:
-    return bool(left) and bool(right) and (
-        left.issubset(right) or right.issubset(left)
-    )
-
-
-def _region_aligns_with_projected_columns(
-    members: set[tuple[int, int]],
-    projected: list[dict[str, Any]],
-) -> bool:
-    region_columns = {column for _row, column in members}
-    return any(
-        _column_sets_are_nested(region_columns, item["member_columns"])
-        for item in projected
-    )
+def _column_sets_intersect(left: set[int], right: set[int]) -> bool:
+    return bool(left) and bool(right) and not left.isdisjoint(right)
 
 
 def _unknown_structure_region(
@@ -1192,25 +1179,8 @@ def build_tabular_structure_projection(
                     producer_generation_ref=producer_generation_ref,
                 )
             if result is None:
-                if (
-                    _members_prove_repeated_axis(region["members"])
-                    or region["unresolved_members"]
-                    or _region_aligns_with_projected_columns(region["members"], projected)
-                ):
-                    result = _unknown_structure_region(
-                        parser=parser,
-                        worksheet=worksheet,
-                        region=region,
-                        sheet_name=sheet_name,
-                        sheet_ordinal=sheet_ordinal,
-                        table_ordinal=region_index,
-                        membership_sha256=region["membership_sha256"],
-                        source_sha256=source_sha256,
-                        producer_generation_ref=producer_generation_ref,
-                    )
-                if result is None:
-                    unprojected.append((region_index, region))
-                    continue
+                unprojected.append((region_index, region))
+                continue
             table, table_rows = result
             projected.append(
                 {
@@ -1255,7 +1225,7 @@ def build_tabular_structure_projection(
             and (
                 _members_prove_repeated_axis(item["members"])
                 or any(
-                    _column_sets_are_nested(
+                    _column_sets_intersect(
                         item["member_columns"],
                         sibling["member_columns"],
                     )
