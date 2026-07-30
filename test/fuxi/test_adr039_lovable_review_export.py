@@ -168,10 +168,15 @@ def test_l1_baseline_binds_duplicate_ingest_and_adr044_content_equivalence():
     adr044 = next(sample for sample in baseline["samples"] if sample["sample_code"] == "L1-ADR044-XLS-EQUIVALENT")
     equivalence = adr044["conversion_value_equivalence"]
     assert adr044["converter_version_contract"] == "immutable_converter_build_or_service_version_not_protocol_version"
-    value_digest = _typed_value_map_digest(adr044["shape"]["anonymous_typed_cell_values"])
-    assert len(adr044["shape"]["anonymous_typed_cell_values"]) == equivalence["expected_value_entry_count"]
-    assert value_digest == equivalence["expected_original_value_map_sha256"]
-    assert value_digest == equivalence["expected_converted_value_map_sha256"]
-    merge_digest = _merge_map_digest(adr044["shape"]["merged_ranges"])
-    assert merge_digest == equivalence["expected_original_merge_map_sha256"]
-    assert merge_digest == equivalence["expected_converted_merge_map_sha256"]
+    original_values = equivalence["original_typed_cell_values"]
+    converted_values = equivalence["converted_typed_cell_values"]
+    assert len(original_values) == len(converted_values) == equivalence["expected_value_entry_count"]
+    assert _typed_value_map_digest(original_values) == equivalence["expected_original_value_map_sha256"]
+    assert _typed_value_map_digest(converted_values) == equivalence["expected_converted_value_map_sha256"]
+    assert original_values == converted_values
+
+    original_merges = equivalence["original_merged_ranges"]
+    converted_merges = equivalence["converted_merged_ranges"]
+    assert _merge_map_digest(original_merges) == equivalence["expected_original_merge_map_sha256"]
+    assert _merge_map_digest(converted_merges) == equivalence["expected_converted_merge_map_sha256"]
+    assert original_merges == converted_merges == adr044["shape"]["merged_ranges"]
