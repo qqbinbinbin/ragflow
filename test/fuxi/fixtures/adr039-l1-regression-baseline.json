@@ -1,78 +1,107 @@
 {
-  "schema": "adr039-l1-regression-baseline/v1",
+  "schema": "adr039-l1-regression-baseline/v2",
   "runtime_input": false,
+  "builder_contract": {
+    "builder_id": "adr039_anonymous_workbook",
+    "builder_version": "v1",
+    "worksheet_title": "Anonymous structure",
+    "membership_hash_input": "sorted lines of sheet_ordinal:row_ordinal:column_ordinal",
+    "production_import_forbidden": true
+  },
   "samples": [
     {
       "sample_code": "L1-FIRST-OR-DELAYED-HEADER",
-      "fixture_contract": "one field row above three isomorphic record rows",
+      "builder_case": "delayed_header_two_columns_three_records",
+      "shape": {"header_rows": [3], "record_rows": [4, 5, 6], "occupied_columns": [1, 2]},
       "expected_object_count": 1,
       "expected_source_totals": [3],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-07"
+      "expected_rules": ["L1-07"],
+      "expected_membership_sha256": ["f752daa057309928e28631d1bfc03a3ff371e44f91170445be7bdf95c84f87d4"]
     },
     {
       "sample_code": "L1-MERGED-MULTILEVEL-10",
-      "fixture_contract": "three merged header levels above ten isomorphic record rows",
+      "builder_case": "three_merged_header_levels_two_columns_ten_records",
+      "shape": {"merged_header_anchors": [[1, 1], [2, 1], [3, 1]], "leaf_header_row": 4, "record_rows": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], "occupied_columns": [1, 2]},
       "expected_object_count": 1,
       "expected_source_totals": [10],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-04"
+      "expected_rules": ["L1-04"],
+      "expected_membership_sha256": ["8edd48409c5016e089ee65e7bd54845e246eb6b88fb9c989b33b74d4e172d692"]
     },
     {
       "sample_code": "L1-SEPARATED-MULTI-LIST",
-      "fixture_contract": "two independent two-row lists separated by the geometry contract",
+      "builder_case": "two_vertical_lists_two_blank_rows_two_records_each",
+      "shape": {"object_header_rows": [1, 6], "object_record_rows": [[2, 3], [7, 8]], "occupied_columns": [1, 2]},
       "expected_object_count": 2,
       "expected_source_totals": [2, 2],
       "expected_statuses": ["supported_complete", "supported_complete"],
-      "expected_rule": "L1-03"
+      "expected_rules": ["L1-03", "L1-03"],
+      "expected_membership_sha256": ["6247a714d9ad67332603b99e22fa23212cc83764474e3a627f60188344a99eff", "7fa0ff638c46f078b734f5a2e2e90dc6366754ad15f89fe353eaa63068ae4e94"]
     },
     {
       "sample_code": "L1-CONTINUATION-EQUAL",
-      "fixture_contract": "two main records plus one continuation record with equal named columns",
+      "builder_case": "equal_columns_headerless_single_row_continuation",
+      "shape": {"main_header_row": 1, "main_record_rows": [2, 3], "continuation_record_rows": [6], "main_columns": [1, 2], "continuation_columns": [1, 2]},
       "expected_object_count": 1,
       "expected_source_totals": [3],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-02"
+      "expected_rules": ["L1-02"],
+      "component_membership_sha256": ["6247a714d9ad67332603b99e22fa23212cc83764474e3a627f60188344a99eff", "4f0762b58015c55fc6032b6daa470730fbee35ae4ff4188ef3aeadb7139068a0"],
+      "expected_membership_sha256": ["c003be53bde4451f146939d581783758aa475e1d16dd8c59aa8a61396b0c30f3"]
     },
     {
       "sample_code": "L1-CONTINUATION-SUBSET",
-      "fixture_contract": "two main records plus one continuation record with one optional field empty",
+      "builder_case": "subset_columns_headerless_single_row_continuation",
+      "shape": {"main_header_row": 1, "main_record_rows": [2, 3], "continuation_record_rows": [6], "main_columns": [1, 2, 3, 4, 5], "continuation_columns": [1, 2, 3, 4], "empty_optional_columns": [5]},
       "expected_object_count": 1,
       "expected_source_totals": [3],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-02"
+      "expected_rules": ["L1-02"],
+      "component_membership_sha256": ["24c8edcffc7351afe341cc08e139c8520866a396cdb334726a9ee9a4e88d19cc", "aff5f04311abed47e634f17fa7e571f21d8b708671d1a2a26dd49af374a12456"],
+      "expected_membership_sha256": ["635baa4cf49e754be87cc9744a3966d49ca57c6a27964a559a7a8e8a3cf0363d"]
     },
     {
       "sample_code": "L1-CONTINUATION-SUPERSET-NAMED",
-      "fixture_contract": "two main records plus one continuation record whose additional field is named by continuation header evidence",
+      "builder_case": "superset_columns_named_header_and_single_record",
+      "shape": {"main_header_row": 1, "main_record_rows": [2, 3], "continuation_header_row": 6, "continuation_record_rows": [7], "main_columns": [1, 2, 3, 4], "continuation_columns": [1, 2, 3, 4, 5], "additional_named_columns": [5]},
       "expected_object_count": 1,
       "expected_source_totals": [3],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-02"
+      "expected_rules": ["L1-02"],
+      "component_membership_sha256": ["7b5b4769cb790049304754d767b00d3ce5724c45d19204404c02b60b6825946a", "05f328103a25174eadae24473fa40461c2d3ae894a2cc1fc923d8186c1dddc70"],
+      "expected_membership_sha256": ["22fcf93099e4320559905630c77cbb66adfa0e53e32425fd634803c2f88a1ecf"]
     },
     {
       "sample_code": "L1-SINGLE-COLUMN-CATALOGUE",
-      "fixture_contract": "one field row above two single-column record slots",
+      "builder_case": "single_header_one_column_two_records",
+      "shape": {"header_rows": [1], "record_rows": [2, 3], "occupied_columns": [1]},
       "expected_object_count": 1,
       "expected_source_totals": [2],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-05"
+      "expected_rules": ["L1-05"],
+      "expected_membership_sha256": ["cfacafa317449bf1b545413b1689b74bf804374f013ef068b5235602ebe11dea"]
     },
     {
       "sample_code": "L1-SPARSE-STABLE-SLOTS",
-      "fixture_contract": "one stable anchor field across three records with optional fields empty",
+      "builder_case": "three_columns_anchor_first_three_sparse_records",
+      "shape": {"header_rows": [1], "record_rows": [2, 3, 4], "occupied_columns": [1, 2, 3], "anchor_columns": [1], "empty_cells": [[2, 3], [3, 2]]},
       "expected_object_count": 1,
       "expected_source_totals": [3],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-06"
+      "expected_rules": ["L1-06"],
+      "expected_membership_sha256": ["0006ce5beb60e4f2f4eaa2ece819745f16b69d9d424ddf28307945992ac670f6"]
     },
     {
       "sample_code": "L1-ADR044-XLS-EQUIVALENT",
-      "fixture_contract": "source-bound ADR-044 conversion of the merged multilevel ten-record fixture",
+      "builder_case": "adr044_biff8_conversion_of_three_merged_header_levels_two_columns_ten_records",
+      "shape": {"merged_header_anchors": [[1, 1], [2, 1], [3, 1]], "leaf_header_row": 4, "record_rows": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], "occupied_columns": [1, 2]},
+      "conversion_receipt_required": ["original_source_sha256", "converted_source_sha256", "converter_version"],
       "expected_object_count": 1,
       "expected_source_totals": [10],
       "expected_statuses": ["supported_complete"],
-      "expected_rule": "L1-01"
+      "expected_rules": ["L1-01"],
+      "expected_membership_sha256": ["8edd48409c5016e089ee65e7bd54845e246eb6b88fb9c989b33b74d4e172d692"]
     }
   ]
 }
