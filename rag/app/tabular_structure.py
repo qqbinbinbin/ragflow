@@ -32,6 +32,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
 PRODUCER_SCHEMA_VERSION = "table-producer/v3"
 PROJECTION_VERSION = "tabular-structure-projection/v1"
 PROJECTION_PART_VERSION = "tabular-structure-part/v1"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v3"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -90,6 +91,27 @@ def _canonical_json(value: Any) -> bytes:
 def _versioned_digest(kind: str, *parts: object) -> str:
     payload = "\x00".join([kind, *(str(part) for part in parts)]).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _table_ref(
+    source_sha256: str,
+    sheet_ordinal: int,
+    table_ordinal: int,
+    membership_sha256: str,
+) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", membership_sha256):
+        raise ValueError("table membership SHA-256 is invalid")
+    identity = _versioned_digest(
+        "tabular-table/v2",
+        PRODUCER_SCHEMA_VERSION,
+        PROJECTION_VERSION,
+        STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+        source_sha256,
+        sheet_ordinal,
+        table_ordinal,
+        membership_sha256,
+    )
+    return f"tbl_v2_{membership_sha256}_{identity}"
 
 
 def _validate_generation_ref(producer_generation_ref: str) -> None:
@@ -360,17 +382,6 @@ def _region_bbox(members: set[tuple[int, int]]) -> tuple[int, int, int, int]:
     return min(rows), min(columns), max(rows), max(columns)
 
 
-def _cell_distance_to_bbox(
-    coordinate: tuple[int, int],
-    bbox: tuple[int, int, int, int],
-) -> int:
-    row_ordinal, column_ordinal = coordinate
-    min_row, min_column, max_row, max_column = bbox
-    row_distance = max(min_row - row_ordinal, 0, row_ordinal - max_row)
-    column_distance = max(min_column - column_ordinal, 0, column_ordinal - max_column)
-    return max(row_distance, column_distance)
-
-
 def _cell_distance_to_members(
     coordinate: tuple[int, int],
     members: set[tuple[int, int]],
@@ -508,35 +519,6 @@ def _formula_coordinates_by_sheet(binary: bytes) -> tuple[list[set[tuple[int, in
             }
         )
     return result, True
-
-
-def _region_has_unknown_body_candidate(parser, worksheet, region: dict[str, Any]) -> bool:
-    if region["unresolved_members"]:
-        return True
-    region_worksheet, _row_offset = _copy_structure_region(parser, worksheet, region)
-    header_rows, populated_rows, unresolved_rows = _complete_worksheet_rows(region_worksheet)
-    if unresolved_rows:
-        return True
-    if not populated_rows:
-        return False
-    _headers, _header_start, data_start = _parse_region_structure(parser, region_worksheet, header_rows)
-    return any(row_ordinal > data_start for row_ordinal in populated_rows)
-
-
-def _region_fragment(
-    sheet_ordinal: int,
-    region: dict[str, Any],
-    members: set[tuple[int, int]],
-) -> dict[str, Any]:
-    unresolved_members = region["unresolved_members"] & members
-    return {
-        "members": members,
-        "unresolved_members": unresolved_members,
-        "bbox": _region_bbox(members),
-        "membership_sha256": _region_membership_sha256(sheet_ordinal, members),
-        "has_unbound_unresolved": region["has_unbound_unresolved"],
-        "g1_children": [members],
-    }
 
 
 def _copy_structure_region(parser, worksheet, region: dict[str, Any]):
@@ -804,6 +786,7 @@ def _project_structure_region(
     sheet_name: str,
     sheet_ordinal: int,
     table_ordinal: int,
+    membership_sha256: str,
     source_sha256: str,
     producer_generation_ref: str,
     row_offset: int,
@@ -824,12 +807,7 @@ def _project_structure_region(
     if not body_ordinals:
         return None
 
-    table_ref = "tbl_v1_" + _versioned_digest(
-        "tabular-table/v1",
-        source_sha256,
-        sheet_ordinal,
-        table_ordinal,
-    )
+    table_ref = _table_ref(source_sha256, sheet_ordinal, table_ordinal, membership_sha256)
     context = _context_with_headers(
         _table_context(
             parser,
@@ -1051,15 +1029,11 @@ def _unknown_structure_region(
     sheet_name: str,
     sheet_ordinal: int,
     table_ordinal: int,
+    membership_sha256: str,
     source_sha256: str,
     producer_generation_ref: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
-    table_ref = "tbl_v1_" + _versioned_digest(
-        "tabular-table/v1",
-        source_sha256,
-        sheet_ordinal,
-        table_ordinal,
-    )
+    table_ref = _table_ref(source_sha256, sheet_ordinal, table_ordinal, membership_sha256)
     merged_ranges = list(worksheet.merged_cells.ranges)
     rows = []
     for row_ordinal in sorted({row for row, _column in region["members"]}):
@@ -1184,6 +1158,7 @@ def build_tabular_structure_projection(
                 sheet_name=sheet_name,
                 sheet_ordinal=sheet_ordinal,
                 table_ordinal=region_index,
+                membership_sha256=region["membership_sha256"],
                 source_sha256=source_sha256,
                 producer_generation_ref=producer_generation_ref,
                 row_offset=row_offset,
@@ -1203,6 +1178,7 @@ def build_tabular_structure_projection(
                     sheet_name=sheet_name,
                     sheet_ordinal=sheet_ordinal,
                     table_ordinal=region_index,
+                    membership_sha256=region["membership_sha256"],
                     source_sha256=source_sha256,
                     producer_generation_ref=producer_generation_ref,
                 )
@@ -1219,9 +1195,10 @@ def build_tabular_structure_projection(
                         sheet_name=sheet_name,
                         sheet_ordinal=sheet_ordinal,
                         table_ordinal=region_index,
+                        membership_sha256=region["membership_sha256"],
                         source_sha256=source_sha256,
                         producer_generation_ref=producer_generation_ref,
-                )
+                    )
                 if result is None:
                     unprojected.append((region_index, region))
                     continue
@@ -1245,6 +1222,7 @@ def build_tabular_structure_projection(
                     sheet_name=sheet_name,
                     sheet_ordinal=sheet_ordinal,
                     table_ordinal=region_index,
+                    membership_sha256=region["membership_sha256"],
                     source_sha256=source_sha256,
                     producer_generation_ref=producer_generation_ref,
                 )
@@ -1261,7 +1239,21 @@ def build_tabular_structure_projection(
                     }
                 )
 
-        if unprojected and projected:
+        # A record-like unknown sibling may be a physically split continuation,
+        # so no table on the worksheet can prove its denominator independently.
+        continuation_unknown = any(
+            any(row["row_role_kwd"] == "unknown" for row in item["rows"])
+            and (
+                _members_prove_repeated_axis(item)
+                or any(
+                    item["member_columns"] == sibling["member_columns"]
+                    for sibling in projected
+                    if sibling is not item
+                )
+            )
+            for item in projected
+        )
+        if continuation_unknown and projected:
             for item in projected:
                 item["table"]["source_total_count"] = None
                 for row in item["rows"]:
@@ -1451,11 +1443,16 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         ):
             raise ValueError("table manifest source total must be a non-negative integer or null")
         table_ref = table["table_ref"]
-        expected_table_ref = "tbl_v1_" + _versioned_digest(
-            "tabular-table/v1",
-            source_sha256,
-            table["sheet_ordinal"],
-            table["table_ordinal"],
+        table_ref_match = re.fullmatch(r"tbl_v2_([0-9a-f]{64})_[0-9a-f]{64}", table_ref)
+        expected_table_ref = (
+            _table_ref(
+                source_sha256,
+                table["sheet_ordinal"],
+                table["table_ordinal"],
+                table_ref_match.group(1),
+            )
+            if table_ref_match
+            else None
         )
         if table_ref != expected_table_ref:
             raise ValueError("table reference does not match source and physical table identity")

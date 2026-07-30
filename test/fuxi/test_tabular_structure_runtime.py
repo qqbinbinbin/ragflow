@@ -63,7 +63,7 @@ def test_generation_ref_includes_the_projection_version(monkeypatch):
 
 def test_generation_ref_includes_the_multi_region_algorithm_version(monkeypatch):
     original = structure_generation_ref("document-1", b"workbook")
-    monkeypatch.setattr(runtime, "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "region-producer/test-next")
+    monkeypatch.setattr(tabular_structure, "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "region-producer/test-next")
     changed = structure_generation_ref("document-1", b"workbook")
 
     assert original != changed

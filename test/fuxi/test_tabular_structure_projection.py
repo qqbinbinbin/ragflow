@@ -9,6 +9,8 @@ from openpyxl import Workbook
 
 from test.fuxi.test_table_semantic_rows import _load_table_module
 
+import rag.app.tabular_structure as tabular_structure
+
 from rag.app.tabular_structure import (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_ROW_FIELDS,
@@ -23,6 +25,61 @@ from rag.app.tabular_structure import (
 
 def test_current_producer_schema_is_v3_for_display_semantics_invalidation():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v3"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v3"
+
+
+def test_table_ref_identity_binds_algorithm_version_and_exact_membership(monkeypatch):
+    source_sha256 = hashlib.sha256(b"same source").hexdigest()
+    first = tabular_structure._table_ref(source_sha256, 1, 1, "a" * 64)
+    changed_members = tabular_structure._table_ref(source_sha256, 1, 1, "b" * 64)
+
+    monkeypatch.setattr(tabular_structure, "PRODUCER_SCHEMA_VERSION", "table-producer/test-next")
+    changed_schema = tabular_structure._table_ref(source_sha256, 1, 1, "a" * 64)
+    monkeypatch.setattr(tabular_structure, "PRODUCER_SCHEMA_VERSION", PRODUCER_SCHEMA_VERSION)
+    monkeypatch.setattr(
+        tabular_structure,
+        "PROJECTION_VERSION",
+        "tabular-structure-projection/test-next",
+    )
+    changed_projection = tabular_structure._table_ref(source_sha256, 1, 1, "a" * 64)
+    monkeypatch.setattr(
+        tabular_structure,
+        "PROJECTION_VERSION",
+        "tabular-structure-projection/v1",
+    )
+    monkeypatch.setattr(
+        tabular_structure,
+        "STRUCTURE_PRODUCER_ALGORITHM_VERSION",
+        "region-producer/test-next",
+    )
+    changed_algorithm = tabular_structure._table_ref(source_sha256, 1, 1, "a" * 64)
+
+    assert first.startswith("tbl_v2_" + "a" * 64 + "_")
+    assert len({first, changed_members, changed_schema, changed_projection, changed_algorithm}) == 5
+
+
+def test_table_ref_rejects_membership_identity_tampering(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    original = projection["tables"][0]["table_ref"]
+    prefix, version, membership, identity = original.split("_")
+    changed_membership = "0" * 64 if membership != "0" * 64 else "1" * 64
+    tampered = f"{prefix}_{version}_{changed_membership}_{identity}"
+    projection["tables"][0]["table_ref"] = tampered
+    for row in projection["rows"]:
+        row["table_ref_kwd"] = tampered
+        row["row_ref_kwd"] = f"{tampered}:{row['row_ordinal_int']}"
+        row["id"] = "tsr_v1_" + tabular_structure._versioned_digest(
+            "tabular-row-record/v1",
+            projection["producer_generation_ref"],
+            row["row_ref_kwd"],
+        )
+
+    with pytest.raises(ValueError, match="table reference"):
+        validate_tabular_structure_projection(projection)
 
 
 def _workbook_bytes(
@@ -101,6 +158,50 @@ def _horizontal_multi_region_workbook_bytes():
     sheet.append(["Left code", "Left status", None, None, "Right code", "Right status"])
     sheet.append(["L-1", "Open", None, None, "R-1", "Closed"])
     sheet.append(["L-2", "Closed", None, None, "R-2", "Open"])
+    return _save_workbook(workbook)
+
+
+def _vertical_complete_with_headerless_continuation_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["B-1", "Open"])
+    return _save_workbook(workbook)
+
+
+def _horizontal_complete_with_headerless_sibling_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Left code", "Left status", None, None, "R-1", "Closed"])
+    sheet.append(["L-1", "Open", None, None, "R-2", "Open"])
+    sheet.append(["L-2", "Closed", None, None, "R-3", "Closed"])
+    return _save_workbook(workbook)
+
+
+def _complete_table_with_isolated_annotation_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.cell(row=10, column=10, value="Annotation")
+    return _save_workbook(workbook)
+
+
+def _complete_table_with_g_sensitive_sibling_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status", None, None, "R1 code", "R1 status", None, "R2 code", "R2 status"])
+    sheet.append(["A-1", "Open", None, None, "B-1", "Open", None, "C-1", "Closed"])
+    sheet.append(["A-2", "Closed", None, None, "B-2", "Closed", None, "C-2", "Open"])
     return _save_workbook(workbook)
 
 
@@ -273,6 +374,56 @@ def test_horizontal_tables_use_exact_columns_without_duplicate_ingestion(table_p
     ]
 
 
+def test_vertical_headerless_continuation_downgrades_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_complete_with_headerless_continuation_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_horizontal_headerless_record_axis_downgrades_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _horizontal_complete_with_headerless_sibling_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_isolated_annotation_does_not_downgrade_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_isolated_annotation_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert projection["tables"][1]["source_total_count"] is None
+
+
+def test_g_sensitive_unknown_downgrades_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_g_sensitive_sibling_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert all(
+        row["row_role_kwd"] == "unknown"
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == projection["tables"][1]["table_ref"]
+    )
+
+
 def test_g_sensitive_horizontal_boundary_cannot_produce_complete(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
@@ -302,6 +453,13 @@ def test_single_column_record_axis_gets_a_complete_projection(table_parser):
         [{"name": "Code", "value": "S-1"}],
         [{"name": "Code", "value": "S-2"}],
     ]
+    expected_membership = tabular_structure._region_membership_sha256(
+        1,
+        {(1, 1), (2, 1), (3, 1)},
+    )
+    assert projection["tables"][0]["table_ref"].startswith(
+        f"tbl_v2_{expected_membership}_"
+    )
 
 
 def test_single_column_free_text_block_cannot_prove_a_complete_record_axis(table_parser):

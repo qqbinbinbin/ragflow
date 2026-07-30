@@ -8,9 +8,6 @@ import uuid
 from typing import Any, Callable
 
 
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v2"
-
-
 def is_complete_tabular_parse(current_task: dict[str, Any], tasks: list[dict[str, Any]] | None) -> bool:
     """Return true only when every row-range task for the document is done.
 
@@ -42,7 +39,11 @@ def is_complete_tabular_parse(current_task: dict[str, Any], tasks: list[dict[str
 def structure_generation_ref(document_id: str, binary: bytes) -> str:
     """Derive an idempotent generation identity from document and source bytes."""
 
-    from rag.app.tabular_structure import PRODUCER_SCHEMA_VERSION, PROJECTION_VERSION
+    from rag.app.tabular_structure import (
+        PRODUCER_SCHEMA_VERSION,
+        PROJECTION_VERSION,
+        STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+    )
 
     if not isinstance(document_id, str) or not document_id:
         raise ValueError("document_id is required")
