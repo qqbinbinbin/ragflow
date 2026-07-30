@@ -25,7 +25,7 @@ from rag.app.tabular_structure import (
 
 def test_current_producer_schema_is_v3_for_display_semantics_invalidation():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v4"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v5"
 
 
 def test_table_ref_identity_binds_algorithm_version_and_exact_membership(monkeypatch):
@@ -184,6 +184,32 @@ def _vertical_complete_with_subset_headerless_continuation_bytes():
     sheet.append([None, None, None, None, None])
     sheet.append([None, None, None, None, None])
     sheet.append(["B-1", "Open", "Team-3", "R3"])
+    return _save_workbook(workbook)
+
+
+def _vertical_complete_with_superset_headerless_continuation_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status", "Owner", "Revision"])
+    sheet.append(["A-1", "Open", "Team-1", "R1"])
+    sheet.append(["A-2", "Closed", "Team-2", "R2"])
+    sheet.append([None, None, None, None, None])
+    sheet.append([None, None, None, None, None])
+    sheet.append(["B-1", "Open", "Team-3", "R3", "2026-01-03"])
+    return _save_workbook(workbook)
+
+
+def _complete_table_with_partially_overlapping_unknown_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None, None])
+    sheet.append([None, None, None])
+    sheet.append([None, "Unresolved", "Extra"])
     return _save_workbook(workbook)
 
 
@@ -429,6 +455,28 @@ def test_subset_headerless_continuation_downgrades_complete_sibling(table_parser
 
     assert len(projection["tables"]) == 2
     assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_superset_headerless_continuation_downgrades_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_complete_with_superset_headerless_continuation_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_partially_overlapping_unknown_does_not_downgrade_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_partially_overlapping_unknown_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
 
 
 def test_horizontal_headerless_record_axis_downgrades_complete_sibling(table_parser):

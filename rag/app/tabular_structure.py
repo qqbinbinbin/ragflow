@@ -32,7 +32,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
 PRODUCER_SCHEMA_VERSION = "table-producer/v3"
 PROJECTION_VERSION = "tabular-structure-projection/v1"
 PROJECTION_PART_VERSION = "tabular-structure-part/v1"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v4"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v5"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -1013,13 +1013,19 @@ def _members_prove_repeated_axis(members: set[tuple[int, int]]) -> bool:
     return len(signatures) >= 2 and len(set(signatures)) == 1
 
 
+def _column_sets_are_nested(left: set[int], right: set[int]) -> bool:
+    return bool(left) and bool(right) and (
+        left.issubset(right) or right.issubset(left)
+    )
+
+
 def _region_aligns_with_projected_columns(
     members: set[tuple[int, int]],
     projected: list[dict[str, Any]],
 ) -> bool:
     region_columns = {column for _row, column in members}
-    return bool(region_columns) and any(
-        region_columns.issubset(item["member_columns"])
+    return any(
+        _column_sets_are_nested(region_columns, item["member_columns"])
         for item in projected
     )
 
@@ -1242,14 +1248,17 @@ def build_tabular_structure_projection(
                     }
                 )
 
-        # A wholly unknown sibling on the same physical columns may be a split
+        # A wholly unknown sibling with nested physical columns may be a split
         # continuation. This is a completeness risk, not an object adjudication.
         continuation_unknown = any(
             item["table"]["data_row_count"] == 0
             and (
                 _members_prove_repeated_axis(item["members"])
                 or any(
-                    _region_aligns_with_projected_columns(item["members"], [sibling])
+                    _column_sets_are_nested(
+                        item["member_columns"],
+                        sibling["member_columns"],
+                    )
                     for sibling in projected
                     if sibling is not item
                 )
