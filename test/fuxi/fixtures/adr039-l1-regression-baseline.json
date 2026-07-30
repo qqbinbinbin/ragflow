@@ -1,0 +1,78 @@
+{
+  "schema": "adr039-l1-regression-baseline/v1",
+  "runtime_input": false,
+  "samples": [
+    {
+      "sample_code": "L1-FIRST-OR-DELAYED-HEADER",
+      "fixture_contract": "one field row above three isomorphic record rows",
+      "expected_object_count": 1,
+      "expected_source_totals": [3],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-07"
+    },
+    {
+      "sample_code": "L1-MERGED-MULTILEVEL-10",
+      "fixture_contract": "three merged header levels above ten isomorphic record rows",
+      "expected_object_count": 1,
+      "expected_source_totals": [10],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-04"
+    },
+    {
+      "sample_code": "L1-SEPARATED-MULTI-LIST",
+      "fixture_contract": "two independent two-row lists separated by the geometry contract",
+      "expected_object_count": 2,
+      "expected_source_totals": [2, 2],
+      "expected_statuses": ["supported_complete", "supported_complete"],
+      "expected_rule": "L1-03"
+    },
+    {
+      "sample_code": "L1-CONTINUATION-EQUAL",
+      "fixture_contract": "two main records plus one continuation record with equal named columns",
+      "expected_object_count": 1,
+      "expected_source_totals": [3],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-02"
+    },
+    {
+      "sample_code": "L1-CONTINUATION-SUBSET",
+      "fixture_contract": "two main records plus one continuation record with one optional field empty",
+      "expected_object_count": 1,
+      "expected_source_totals": [3],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-02"
+    },
+    {
+      "sample_code": "L1-CONTINUATION-SUPERSET-NAMED",
+      "fixture_contract": "two main records plus one continuation record whose additional field is named by continuation header evidence",
+      "expected_object_count": 1,
+      "expected_source_totals": [3],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-02"
+    },
+    {
+      "sample_code": "L1-SINGLE-COLUMN-CATALOGUE",
+      "fixture_contract": "one field row above two single-column record slots",
+      "expected_object_count": 1,
+      "expected_source_totals": [2],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-05"
+    },
+    {
+      "sample_code": "L1-SPARSE-STABLE-SLOTS",
+      "fixture_contract": "one stable anchor field across three records with optional fields empty",
+      "expected_object_count": 1,
+      "expected_source_totals": [3],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-06"
+    },
+    {
+      "sample_code": "L1-ADR044-XLS-EQUIVALENT",
+      "fixture_contract": "source-bound ADR-044 conversion of the merged multilevel ten-record fixture",
+      "expected_object_count": 1,
+      "expected_source_totals": [10],
+      "expected_statuses": ["supported_complete"],
+      "expected_rule": "L1-01"
+    }
+  ]
+}
