@@ -61,6 +61,14 @@ def test_generation_ref_includes_the_projection_version(monkeypatch):
     assert original != changed
 
 
+def test_generation_ref_includes_the_multi_region_algorithm_version(monkeypatch):
+    original = structure_generation_ref("document-1", b"workbook")
+    monkeypatch.setattr(runtime, "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "region-producer/test-next")
+    changed = structure_generation_ref("document-1", b"workbook")
+
+    assert original != changed
+
+
 def test_structure_publication_failure_is_safe_for_ordinary_parse(monkeypatch, caplog):
     current = {
         **_task("task-1", 1.0),

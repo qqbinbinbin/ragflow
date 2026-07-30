@@ -1,5 +1,6 @@
 import hashlib
 import json
+import struct
 import uuid
 from io import BytesIO
 
@@ -12,6 +13,7 @@ from rag.app.tabular_structure import (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_ROW_FIELDS,
     _ordered_fields,
+    _formula_coordinates_from_biff_stream,
     build_tabular_structure_projection,
     partition_tabular_structure_projection,
     store_tabular_structure_projection,
@@ -29,16 +31,20 @@ def _workbook_bytes(
     include_unknown=False,
     include_merged_body=False,
     include_note=True,
+    include_context=False,
     rows=3,
 ):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Inspection"
-    sheet.merge_cells("A1:C1")
-    sheet["A1"] = "\u9879\u76ee \u00b5\u03a9\u2103\u0085\u202e"
-    sheet["A3"] = "Program"
-    sheet["B3"] = "Platform-X"
-    sheet["A4"], sheet["B4"], sheet["C4"] = headers
+    if include_context:
+        sheet.merge_cells("A1:C1")
+        sheet["A1"] = "\u9879\u76ee \u00b5\u03a9\u2103\u0085\u202e"
+        sheet["A3"] = "Program"
+        sheet["B3"] = "Platform-X"
+        sheet["A4"], sheet["B4"], sheet["C4"] = headers
+    else:
+        sheet.append(list(headers))
 
     for index in range(1, rows + 1):
         sheet.append(["R-DUP" if index <= 2 else f"R-{index:04d}", "Repeated" if index <= 2 else "Item", 7.5])
@@ -63,10 +69,128 @@ def _workbook_bytes(
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
-
-
 def _generation_ref():
     return str(uuid.uuid4())
+
+
+def _save_workbook(workbook):
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def _vertical_multi_region_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["Code", "Status"])
+    sheet.append(["B-1", "Open"])
+    sheet.append(["B-2", "Closed"])
+    return _save_workbook(workbook)
+
+
+def _horizontal_multi_region_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Left code", "Left status", None, None, "Right code", "Right status"])
+    sheet.append(["L-1", "Open", None, None, "R-1", "Closed"])
+    sheet.append(["L-2", "Closed", None, None, "R-2", "Open"])
+    return _save_workbook(workbook)
+
+
+def _single_column_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code"])
+    sheet.append(["S-1"])
+    sheet.append(["S-2"])
+    return _save_workbook(workbook)
+
+
+def _merged_header_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.merge_cells("A1:B1")
+    sheet["A1"] = "Items"
+    sheet["A2"] = "Code"
+    sheet["B2"] = "Status"
+    sheet.append(["M-1", "Open"])
+    sheet.append(["M-2", "Closed"])
+    return _save_workbook(workbook)
+
+
+def _sparse_region_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Code", None, "Status"])
+    sheet.append(["P-1", None, "Open"])
+    sheet.append(["P-2", None, "Closed"])
+    sheet.append([None, None, None])
+    sheet.append(["P-3", None, "Open"])
+    sheet.append(["P-4", None, "Closed"])
+    return _save_workbook(workbook)
+
+
+def _g_sensitive_horizontal_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Left code", "Left status", None, "Right code", "Right status"])
+    sheet.append(["L-1", "Open", None, "R-1", "Closed"])
+    sheet.append(["L-2", "Closed", None, "R-2", "Open"])
+    return _save_workbook(workbook)
+
+
+def _three_level_header_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.merge_cells("A1:B1")
+    sheet["A1"] = "Items"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Identity"
+    sheet["A3"] = "Code"
+    sheet["B3"] = "State"
+    sheet.append(["T-1", "Open"])
+    sheet.append(["T-2", "Closed"])
+    return _save_workbook(workbook)
+
+
+def _four_level_header_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    for row_ordinal, label in enumerate(("Items", "Identity", "Detail"), start=1):
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=1,
+            end_row=row_ordinal,
+            end_column=2,
+        )
+        sheet.cell(row_ordinal, 1, label)
+    sheet["A4"] = "Code"
+    sheet["B4"] = "State"
+    sheet.append(["Q-1", "Open"])
+    sheet.append(["Q-2", "Closed"])
+    return _save_workbook(workbook)
+
+
+def _formula_only_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet["A1"] = '=CONCAT("F-", 1)'
+    sheet["A2"] = '=CONCAT("F-", 2)'
+    return _save_workbook(workbook)
 
 
 @pytest.fixture
@@ -97,10 +221,245 @@ def test_same_bytes_keep_business_identity_but_get_a_new_generation(table_parser
     assert {row["id"] for row in first["rows"]}.isdisjoint({row["id"] for row in second["rows"]})
 
 
+def test_vertical_tables_on_one_sheet_get_separate_stable_projections(table_parser):
+    source = _vertical_multi_region_workbook_bytes()
+
+    projections = [
+        build_tabular_structure_projection(
+            "anonymous.xlsx",
+            source,
+            producer_generation_ref=_generation_ref(),
+            parser=table_parser,
+        )
+        for _ in range(3)
+    ]
+
+    expected_identity = [
+        (table["table_ordinal"], table["table_ref"])
+        for table in projections[0]["tables"]
+    ]
+    assert [table["table_ordinal"] for table in projections[0]["tables"]] == [1, 2]
+    assert [table["source_total_count"] for table in projections[0]["tables"]] == [2, 2]
+    assert all(
+        [(table["table_ordinal"], table["table_ref"]) for table in projection["tables"]]
+        == expected_identity
+        for projection in projections[1:]
+    )
+
+
+def test_horizontal_tables_use_exact_columns_without_duplicate_ingestion(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _horizontal_multi_region_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert [table["table_ordinal"] for table in projection["tables"]] == [1, 2]
+    rows_by_table = {
+        table["table_ref"]: [
+            json.loads(row["ordered_fields_list"])
+            for row in projection["rows"]
+            if row["table_ref_kwd"] == table["table_ref"] and row["row_role_kwd"] == "data"
+        ]
+        for table in projection["tables"]
+    }
+    assert rows_by_table[projection["tables"][0]["table_ref"]] == [
+        [{"name": "Left code", "value": "L-1"}, {"name": "Left status", "value": "Open"}],
+        [{"name": "Left code", "value": "L-2"}, {"name": "Left status", "value": "Closed"}],
+    ]
+    assert rows_by_table[projection["tables"][1]["table_ref"]] == [
+        [{"name": "Right code", "value": "R-1"}, {"name": "Right status", "value": "Closed"}],
+        [{"name": "Right code", "value": "R-2"}, {"name": "Right status", "value": "Open"}],
+    ]
+
+
+def test_g_sensitive_horizontal_boundary_cannot_produce_complete(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _g_sensitive_horizontal_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] is None
+    assert all(row["row_role_kwd"] == "unknown" for row in projection["rows"])
+
+
+def test_single_column_record_axis_gets_a_complete_projection(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert [
+        json.loads(row["ordered_fields_list"])
+        for row in projection["rows"]
+        if row["row_role_kwd"] == "data"
+    ] == [
+        [{"name": "Code", "value": "S-1"}],
+        [{"name": "Code", "value": "S-2"}],
+    ]
+
+
+def test_single_column_free_text_block_cannot_prove_a_complete_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Instruction"])
+    sheet.append(["Review the source before use"])
+    sheet.append(["Confirm the revision before release"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+
+
+def test_single_record_slot_cannot_prove_a_complete_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["S-1", "Open"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["data_row_count"] == 1
+    assert projection["tables"][0]["source_total_count"] is None
+
+    projection["tables"][0]["source_total_count"] = 1
+    projection["rows"][0]["source_total_count_int"] = 1
+    with pytest.raises(ValueError, match="source total"):
+        validate_tabular_structure_projection(projection)
+
+
+def test_headerless_record_slots_preserve_every_row_and_cannot_claim_complete(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append(["A-3", "Open"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [1, 2, 3]
+    assert all(row["row_role_kwd"] == "unknown" for row in projection["rows"])
+
+
+def test_unbound_uncached_formula_downgrades_every_table_on_the_sheet(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["S-1", "Open"])
+    sheet.append(["S-2", "Closed"])
+    sheet.cell(row=20_001, column=20, value="=SUM(1, 1)")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"]
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_multilevel_merged_header_stays_with_its_record_axis(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _merged_header_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [3, 4]
+
+
+def test_g_sensitive_sparse_table_remains_one_unknown_projection(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _sparse_region_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] is None
+    assert {row["row_ordinal_int"] for row in projection["rows"]} >= {1, 2, 3, 5, 6}
+    assert all(row["row_role_kwd"] == "unknown" for row in projection["rows"])
+
+
+def test_two_non_isomorphic_rows_cannot_prove_a_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status", "Owner"])
+    sheet.append(["A-1", "Open", None])
+    sheet.append(["A-2", None, "North"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+
+
+def test_three_level_merged_header_does_not_become_a_data_row(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _three_level_header_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [4, 5]
+
+
+def test_four_level_merged_header_has_no_fixed_depth_limit(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _four_level_header_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [5, 6]
+
+
+def test_formula_only_region_is_preserved_as_unknown(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _formula_only_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"]
+    assert projection["tables"][0]["source_total_count"] is None
+    assert len(projection["rows"]) >= 1
+    assert all(row["row_role_kwd"] == "unknown" for row in projection["rows"])
+
+
 def test_duplicate_values_remain_distinct_and_rows_use_only_fixed_fields(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
-        _workbook_bytes(),
+        _workbook_bytes(include_context=False),
         producer_generation_ref=_generation_ref(),
         parser=table_parser,
     )
@@ -301,6 +660,32 @@ def test_final_full_width_merged_row_after_data_cannot_be_assumed_to_be_a_note(t
     assert projection["rows"][-1]["row_role_kwd"] == "unknown"
 
 
+def test_repeated_full_width_body_rows_need_positive_note_evidence(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    for row_ordinal, value in ((4, "A-3"), (5, "A-4")):
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=1,
+            end_row=row_ordinal,
+            end_column=2,
+        )
+        sheet.cell(row_ordinal, 1, value)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [2, 3, 4, 5]
+    assert [row["row_role_kwd"] for row in projection["rows"][-2:]] == ["unknown", "unknown"]
+
+
 def test_mixed_generation_and_inconsistent_totals_fail_validation(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
@@ -354,6 +739,32 @@ def test_manifest_and_record_identity_tampering_fail_validation(table_parser):
     projection["tables"][0]["table_ref"] = "tbl_v1_" + "0" * 64
 
     with pytest.raises(ValueError, match="table reference"):
+        validate_tabular_structure_projection(projection)
+
+
+def test_multi_region_manifest_requires_contiguous_physical_order(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_multi_region_workbook_bytes(),
+        parser=table_parser,
+    )
+    projection["tables"].reverse()
+
+    with pytest.raises(ValueError, match="physical order"):
+        validate_tabular_structure_projection(projection)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_multi_region_workbook_bytes(),
+        parser=table_parser,
+    )
+    second_table_ref = projection["tables"][1]["table_ref"]
+    projection["tables"] = [projection["tables"][1]]
+    projection["rows"] = [
+        row for row in projection["rows"] if row["table_ref_kwd"] == second_table_ref
+    ]
+
+    with pytest.raises(ValueError, match="contiguous"):
         validate_tabular_structure_projection(projection)
 
 
@@ -435,8 +846,9 @@ def test_header_only_sheet_produces_no_false_table_manifest(table_parser):
         parser=table_parser,
     )
 
-    assert projection["tables"] == []
-    assert projection["rows"] == []
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] is None
+    assert all(row["row_role_kwd"] == "unknown" for row in projection["rows"])
 
 
 def test_second_table_after_an_internal_separator_fails_closed(table_parser):
@@ -459,7 +871,7 @@ def test_second_table_after_an_internal_separator_fails_closed(table_parser):
 
     assert len(projection["tables"]) == 1
     assert projection["tables"][0]["source_total_count"] is None
-    assert any(row["row_role_kwd"] == "unknown" for row in projection["rows"])
+    assert all(row["row_role_kwd"] == "unknown" for row in projection["rows"])
 
 
 def test_adjacent_second_table_with_a_new_row_shape_fails_closed(table_parser):
@@ -609,6 +1021,43 @@ def test_row_with_value_and_uncached_formula_is_emitted_once_as_unknown(table_pa
     assert projection["tables"][0]["source_total_count"] is None
 
 
+def test_all_uncached_formula_rows_are_preserved_as_unknown(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.cell(row=3, column=1, value='=CONCAT("A-", 2)')
+    sheet.cell(row=3, column=2, value='=CONCAT("Closed")')
+    sheet.cell(row=4, column=1, value='=CONCAT("A-", 3)')
+    sheet.cell(row=4, column=2, value='=CONCAT("Open")')
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert {row["row_ordinal_int"] for row in projection["rows"]} >= {2, 3, 4}
+    assert {
+        row["row_ordinal_int"]: row["row_role_kwd"]
+        for row in projection["rows"]
+    } == {2: "data", 3: "unknown", 4: "unknown"}
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_biff_formula_inventory_uses_only_sheet_and_cell_coordinates():
+    global_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0005)
+    worksheet_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0010)
+    formula = struct.pack("<HHHH", 0x0006, 4, 2, 3)
+    eof = struct.pack("<HH", 0x000A, 0)
+    sheet_offset = len(global_bof) + 4 + 6 + len(eof)
+    boundsheet_payload = struct.pack("<IBB", sheet_offset, 0, 0)
+    boundsheet = struct.pack("<HH", 0x0085, len(boundsheet_payload)) + boundsheet_payload
+    stream = global_bof + boundsheet + eof + worksheet_bof + formula + eof
+
+    assert _formula_coordinates_from_biff_stream(stream) == [{(3, 4)}]
+
+
 def test_generation_reference_rejects_customer_text(table_parser):
     with pytest.raises(ValueError, match="UUID/ULID"):
         build_tabular_structure_projection(
@@ -620,9 +1069,17 @@ def test_generation_reference_rejects_customer_text(table_parser):
 
 
 def test_context_is_bounded_and_removes_controls_without_a_language_allowlist(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Inspection"
+    sheet.merge_cells("A1:C1")
+    sheet["A1"] = "\u9879\u76ee \u00b5\u03a9\u2103\u0085\u202e"
+    sheet.append(["Code", "Description", "Force"])
+    sheet.append(["A-1", "Open", 1])
+    sheet.append(["A-2", "Closed", 2])
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
-        _workbook_bytes(),
+        _save_workbook(workbook),
         producer_generation_ref=_generation_ref(),
         table_context_entry_limit=1,
         table_context_value_bytes=32,
@@ -641,7 +1098,7 @@ def test_context_is_bounded_and_removes_controls_without_a_language_allowlist(ta
 def test_global_indices_and_totals_survive_projection_part_boundaries(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
-        _workbook_bytes(rows=3002, include_note=False),
+        _workbook_bytes(rows=3002, include_note=False, include_context=False),
         producer_generation_ref=_generation_ref(),
         parser=table_parser,
     )

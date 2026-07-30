@@ -8,6 +8,9 @@ import uuid
 from typing import Any, Callable
 
 
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v2"
+
+
 def is_complete_tabular_parse(current_task: dict[str, Any], tasks: list[dict[str, Any]] | None) -> bool:
     """Return true only when every row-range task for the document is done.
 
@@ -49,7 +52,8 @@ def structure_generation_ref(document_id: str, binary: bytes) -> str:
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
-            f"fuxi:tabular-generation:{PRODUCER_SCHEMA_VERSION}:{PROJECTION_VERSION}:{document_id}:{source_sha256}",
+            f"fuxi:tabular-generation:{PRODUCER_SCHEMA_VERSION}:{PROJECTION_VERSION}:"
+            f"{STRUCTURE_PRODUCER_ALGORITHM_VERSION}:{document_id}:{source_sha256}",
         )
     )
 
