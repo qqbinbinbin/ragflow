@@ -5,7 +5,10 @@
     "builder_id": "adr039_anonymous_workbook",
     "builder_version": "v1",
     "worksheet_title": "Anonymous structure",
-    "membership_hash_input": "sorted lines of sheet_ordinal:row_ordinal:column_ordinal",
+    "membership_hash_input": "sorted unique lines of sheet_ordinal:row_ordinal:column_ordinal joined by newline with no trailing newline",
+    "emitted_cell_multiset_hash_input": "adr039-emitted-cell-multiset/v1 domain line followed by sorted sheet_ordinal:row_ordinal:column_ordinal event lines preserving duplicates joined by newline with no trailing newline",
+    "typed_value_map_hash_input": "adr039-cell-value-map/v1 domain line followed by compact ASCII JSON [sheet,row,column,type,canonical_value] lines sorted by coordinate with NFC text and ISO date values joined by newline with no trailing newline",
+    "merge_map_hash_input": "adr039-merged-ranges/v1 domain line followed by compact JSON [sheet,min_row,min_column,max_row,max_column] lines sorted by range joined by newline with no trailing newline",
     "production_import_forbidden": true
   },
   "samples": [
@@ -17,17 +20,23 @@
       "expected_source_totals": [3],
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-07"],
-      "expected_membership_sha256": ["f752daa057309928e28631d1bfc03a3ff371e44f91170445be7bdf95c84f87d4"]
+      "expected_membership_sha256": ["f752daa057309928e28631d1bfc03a3ff371e44f91170445be7bdf95c84f87d4"],
+      "expected_emitted_cell_multiset_sha256": ["f1f4f12d2ba4586e527de92021dc11e31a9ba227acd980f8d49169be8d16b9de"],
+      "expected_emitted_cell_occurrence_count": [8],
+      "expected_member_max_ingest_count": [1]
     },
     {
       "sample_code": "L1-MERGED-MULTILEVEL-10",
       "builder_case": "three_merged_header_levels_two_columns_ten_records",
-      "shape": {"merged_header_anchors": [[1, 1], [2, 1], [3, 1]], "leaf_header_row": 4, "record_rows": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], "occupied_columns": [1, 2]},
+      "shape": {"merged_ranges": [[1, 1, 1, 2], [2, 1, 2, 2], [3, 1, 3, 2]], "merged_non_anchor_membership": "included_when_anchor_nonblank", "leaf_header_row": 4, "record_rows": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], "occupied_columns": [1, 2]},
       "expected_object_count": 1,
       "expected_source_totals": [10],
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-04"],
-      "expected_membership_sha256": ["8edd48409c5016e089ee65e7bd54845e246eb6b88fb9c989b33b74d4e172d692"]
+      "expected_membership_sha256": ["ac174d9e993f981c85677b77551c57b5d0a0bf9cb32db37df8cd84290b302415"],
+      "expected_emitted_cell_multiset_sha256": ["36fc1dfc231fe6c8c8b4eecae78778c25bdf32d633c43806c9960cd8fa6f3e80"],
+      "expected_emitted_cell_occurrence_count": [28],
+      "expected_member_max_ingest_count": [1]
     },
     {
       "sample_code": "L1-SEPARATED-MULTI-LIST",
@@ -37,7 +46,10 @@
       "expected_source_totals": [2, 2],
       "expected_statuses": ["supported_complete", "supported_complete"],
       "expected_rules": ["L1-03", "L1-03"],
-      "expected_membership_sha256": ["6247a714d9ad67332603b99e22fa23212cc83764474e3a627f60188344a99eff", "7fa0ff638c46f078b734f5a2e2e90dc6366754ad15f89fe353eaa63068ae4e94"]
+      "expected_membership_sha256": ["6247a714d9ad67332603b99e22fa23212cc83764474e3a627f60188344a99eff", "7fa0ff638c46f078b734f5a2e2e90dc6366754ad15f89fe353eaa63068ae4e94"],
+      "expected_emitted_cell_multiset_sha256": ["eb7a5e979501e78ed1eb12091d0e462c48309a0057f363a4141ced9bc8862cc6", "fc2e528ea299ae43248fa9552d5edb0c90e65bacf344ff83ba3382daa46ceba0"],
+      "expected_emitted_cell_occurrence_count": [6, 6],
+      "expected_member_max_ingest_count": [1, 1]
     },
     {
       "sample_code": "L1-CONTINUATION-EQUAL",
@@ -48,7 +60,10 @@
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-02"],
       "component_membership_sha256": ["6247a714d9ad67332603b99e22fa23212cc83764474e3a627f60188344a99eff", "4f0762b58015c55fc6032b6daa470730fbee35ae4ff4188ef3aeadb7139068a0"],
-      "expected_membership_sha256": ["c003be53bde4451f146939d581783758aa475e1d16dd8c59aa8a61396b0c30f3"]
+      "expected_membership_sha256": ["c003be53bde4451f146939d581783758aa475e1d16dd8c59aa8a61396b0c30f3"],
+      "expected_emitted_cell_multiset_sha256": ["f204d52e0284b5c1603f78c11d24907baf2958c76d562a5708d556ffeffc2e04"],
+      "expected_emitted_cell_occurrence_count": [8],
+      "expected_member_max_ingest_count": [1]
     },
     {
       "sample_code": "L1-CONTINUATION-SUBSET",
@@ -59,7 +74,10 @@
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-02"],
       "component_membership_sha256": ["24c8edcffc7351afe341cc08e139c8520866a396cdb334726a9ee9a4e88d19cc", "aff5f04311abed47e634f17fa7e571f21d8b708671d1a2a26dd49af374a12456"],
-      "expected_membership_sha256": ["635baa4cf49e754be87cc9744a3966d49ca57c6a27964a559a7a8e8a3cf0363d"]
+      "expected_membership_sha256": ["635baa4cf49e754be87cc9744a3966d49ca57c6a27964a559a7a8e8a3cf0363d"],
+      "expected_emitted_cell_multiset_sha256": ["d07681176ff96f620bab8b4293a082bc93eeb2d708ff9d9c7ba1d7c01132f5e5"],
+      "expected_emitted_cell_occurrence_count": [19],
+      "expected_member_max_ingest_count": [1]
     },
     {
       "sample_code": "L1-CONTINUATION-SUPERSET-NAMED",
@@ -70,7 +88,10 @@
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-02"],
       "component_membership_sha256": ["7b5b4769cb790049304754d767b00d3ce5724c45d19204404c02b60b6825946a", "05f328103a25174eadae24473fa40461c2d3ae894a2cc1fc923d8186c1dddc70"],
-      "expected_membership_sha256": ["22fcf93099e4320559905630c77cbb66adfa0e53e32425fd634803c2f88a1ecf"]
+      "expected_membership_sha256": ["22fcf93099e4320559905630c77cbb66adfa0e53e32425fd634803c2f88a1ecf"],
+      "expected_emitted_cell_multiset_sha256": ["dd80fff8afa37f3527081cd6e7609c5602c1b4d58226e19f7442cf82d38f0bf2"],
+      "expected_emitted_cell_occurrence_count": [22],
+      "expected_member_max_ingest_count": [1]
     },
     {
       "sample_code": "L1-SINGLE-COLUMN-CATALOGUE",
@@ -80,7 +101,10 @@
       "expected_source_totals": [2],
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-05"],
-      "expected_membership_sha256": ["cfacafa317449bf1b545413b1689b74bf804374f013ef068b5235602ebe11dea"]
+      "expected_membership_sha256": ["cfacafa317449bf1b545413b1689b74bf804374f013ef068b5235602ebe11dea"],
+      "expected_emitted_cell_multiset_sha256": ["fbcce5d5a1e4afe8a92f93138c9f1cdae490b0e1541bc316affd7c3d4b711b3f"],
+      "expected_emitted_cell_occurrence_count": [3],
+      "expected_member_max_ingest_count": [1]
     },
     {
       "sample_code": "L1-SPARSE-STABLE-SLOTS",
@@ -90,18 +114,40 @@
       "expected_source_totals": [3],
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-06"],
-      "expected_membership_sha256": ["0006ce5beb60e4f2f4eaa2ece819745f16b69d9d424ddf28307945992ac670f6"]
+      "expected_membership_sha256": ["0006ce5beb60e4f2f4eaa2ece819745f16b69d9d424ddf28307945992ac670f6"],
+      "expected_emitted_cell_multiset_sha256": ["df2a94b82713db20dde381a3c4d5cb28efc616fe9a5769747eae3d40066b5103"],
+      "expected_emitted_cell_occurrence_count": [10],
+      "expected_member_max_ingest_count": [1]
     },
     {
       "sample_code": "L1-ADR044-XLS-EQUIVALENT",
       "builder_case": "adr044_biff8_conversion_of_three_merged_header_levels_two_columns_ten_records",
-      "shape": {"merged_header_anchors": [[1, 1], [2, 1], [3, 1]], "leaf_header_row": 4, "record_rows": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], "occupied_columns": [1, 2]},
+      "shape": {"merged_ranges": [[1, 1, 1, 2], [2, 1, 2, 2], [3, 1, 3, 2]], "merged_non_anchor_membership": "included_when_anchor_nonblank", "leaf_header_row": 4, "record_rows": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], "occupied_columns": [1, 2], "anonymous_typed_cell_values": [[1, 1, "text", "匿名层级一"], [2, 1, "text", "匿名层级二"], [3, 1, "text", "匿名层级三"], [4, 1, "text", "记录编号"], [4, 2, "text", "生效日期"], [5, 1, "text", "R-01"], [5, 2, "date", "2026-01-01"], [6, 1, "text", "R-02"], [6, 2, "date", "2026-01-02"], [7, 1, "text", "R-03"], [7, 2, "date", "2026-01-03"], [8, 1, "text", "R-04"], [8, 2, "date", "2026-01-04"], [9, 1, "text", "R-05"], [9, 2, "date", "2026-01-05"], [10, 1, "text", "R-06"], [10, 2, "date", "2026-01-06"], [11, 1, "text", "R-07"], [11, 2, "date", "2026-01-07"], [12, 1, "text", "R-08"], [12, 2, "date", "2026-01-08"], [13, 1, "text", "R-09"], [13, 2, "date", "2026-01-09"], [14, 1, "text", "R-10"], [14, 2, "date", "2026-01-10"]]},
       "conversion_receipt_required": ["original_source_sha256", "converted_source_sha256", "converter_version"],
+      "converter_version_contract": "immutable_converter_build_or_service_version_not_protocol_version",
       "expected_object_count": 1,
       "expected_source_totals": [10],
       "expected_statuses": ["supported_complete"],
       "expected_rules": ["L1-01"],
-      "expected_membership_sha256": ["8edd48409c5016e089ee65e7bd54845e246eb6b88fb9c989b33b74d4e172d692"]
+      "expected_membership_sha256": ["ac174d9e993f981c85677b77551c57b5d0a0bf9cb32db37df8cd84290b302415"],
+      "expected_emitted_cell_multiset_sha256": ["36fc1dfc231fe6c8c8b4eecae78778c25bdf32d633c43806c9960cd8fa6f3e80"],
+      "expected_emitted_cell_occurrence_count": [28],
+      "expected_member_max_ingest_count": [1],
+      "conversion_value_equivalence": {"canonicalization": "adr039-cell-value-map/v1", "expected_value_entry_count": 25, "expected_original_value_map_sha256": "e737748df5621eac23ce65bf2ef704fe897d4532017009490b244f5ef59c979f", "expected_converted_value_map_sha256": "e737748df5621eac23ce65bf2ef704fe897d4532017009490b244f5ef59c979f", "expected_original_merge_map_sha256": "0eb452671e34e473a49d0e347dc0408791f7efb1b5434420c971529de8814e39", "expected_converted_merge_map_sha256": "0eb452671e34e473a49d0e347dc0408791f7efb1b5434420c971529de8814e39"}
+    }
+  ],
+  "defect_samples": [
+    {
+      "sample_code": "D2-DUPLICATE-MEMBER-INGEST",
+      "membership_coordinate_set": [[1, 1], [2, 1]],
+      "emitted_member_coordinate_multiset": [[1, 1], [2, 1], [2, 1]],
+      "expected_membership_sha256": "66fc04728032c255b5df24947be221ae8a91af39222f1ec349a2c0654d820c8b",
+      "expected_emitted_cell_multiset_sha256": "411c052671e2d6570070e7941217c6fe7d2b99e9ea1529313c6e6fb59eace577",
+      "expected_emitted_cell_occurrence_count": 3,
+      "expected_member_max_ingest_count": 2,
+      "expected_check": "D2",
+      "expected_status": "defect",
+      "expected_reason": "membership_not_closed"
     }
   ]
 }
