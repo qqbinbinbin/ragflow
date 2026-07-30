@@ -7,7 +7,10 @@ import logging
 import uuid
 from typing import Any, Callable
 
-from rag.app.tabular_structure import STRUCTURE_PRODUCER_ALGORITHM_VERSION
+from rag.app.tabular_structure import (
+    ENUMERATION_RULE_VERSION,
+    STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+)
 
 
 def is_complete_tabular_parse(current_task: dict[str, Any], tasks: list[dict[str, Any]] | None) -> bool:
@@ -42,6 +45,7 @@ def structure_generation_ref(document_id: str, binary: bytes) -> str:
     """Derive an idempotent generation identity from document and source bytes."""
 
     from rag.app.tabular_structure import (
+        ENUMERATION_RULE_VERSION,
         PRODUCER_SCHEMA_VERSION,
         PROJECTION_VERSION,
         STRUCTURE_PRODUCER_ALGORITHM_VERSION,
@@ -56,7 +60,8 @@ def structure_generation_ref(document_id: str, binary: bytes) -> str:
         uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"fuxi:tabular-generation:{PRODUCER_SCHEMA_VERSION}:{PROJECTION_VERSION}:"
-            f"{STRUCTURE_PRODUCER_ALGORITHM_VERSION}:{document_id}:{source_sha256}",
+            f"{STRUCTURE_PRODUCER_ALGORITHM_VERSION}:{ENUMERATION_RULE_VERSION}:"
+            f"{document_id}:{source_sha256}",
         )
     )
 

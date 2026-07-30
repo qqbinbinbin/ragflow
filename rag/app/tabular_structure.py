@@ -29,15 +29,17 @@ from typing import Any
 
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
-PRODUCER_SCHEMA_VERSION = "table-producer/v3"
-PROJECTION_VERSION = "tabular-structure-projection/v1"
+PRODUCER_SCHEMA_VERSION = "table-producer/v4"
+PROJECTION_VERSION = "tabular-structure-projection/v2"
 PROJECTION_PART_VERSION = "tabular-structure-part/v1"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v6"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v7"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v1"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
         "producer_schema_version",
         "producer_generation_ref",
+        "enumeration_rule_version",
         "source_sha256",
         "tables",
         "rows",
@@ -48,6 +50,28 @@ DEFAULT_CONTEXT_ENTRY_LIMIT = 8
 DEFAULT_CONTEXT_VALUE_BYTES = 128
 DEFAULT_TABLE_LABEL_BYTES = 128
 DEFAULT_ROWS_PER_PART = 3000
+
+ENUMERATION_DECISIONS = {
+    "L1-01": ("supported_complete", "record_axis_proven"),
+    "L1-02": ("supported_complete", "record_axis_proven"),
+    "L1-03": ("supported_complete", "record_axis_proven"),
+    "L1-04": ("supported_complete", "record_axis_proven"),
+    "L1-05": ("supported_complete", "record_axis_proven"),
+    "L1-06": ("supported_complete", "record_axis_proven"),
+    "L1-07": ("supported_complete", "record_axis_proven"),
+    "R1": ("not_guaranteed_explained", "not_a_list"),
+    "R2": ("not_guaranteed_explained", "total_unstable"),
+    "R3": ("not_guaranteed_explained", "matrix_layout"),
+    "R4": ("not_guaranteed_explained", "subtotal_rows_mixed"),
+    "R5": ("not_guaranteed_explained", "multi_block_unseparated"),
+    "R6": ("not_guaranteed_explained", "partial_overlap_continuation"),
+    "R7": ("not_guaranteed_explained", "visual_only_boundary"),
+    "R8": ("not_guaranteed_explained", "record_axis_not_proven"),
+    "D1": ("defect", "unnamed_required_field"),
+    "D2": ("defect", "membership_not_closed"),
+    "D3": ("defect", "record_count_mismatch"),
+    "D4": ("defect", "missing_projection"),
+}
 
 PROJECTION_ROW_FIELDS = frozenset(
     {
@@ -106,6 +130,7 @@ def _table_ref(
         PRODUCER_SCHEMA_VERSION,
         PROJECTION_VERSION,
         STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+        ENUMERATION_RULE_VERSION,
         source_sha256,
         sheet_ordinal,
         table_ordinal,
@@ -124,6 +149,24 @@ def _validate_generation_ref(producer_generation_ref: str) -> None:
         is_canonical_uuid = False
     if not is_canonical_uuid and not _ULID_RE.fullmatch(producer_generation_ref):
         raise ValueError("producer_generation_ref must be an opaque UUID/ULID-compatible value")
+
+
+def _apply_enumeration_decision(table: dict[str, Any], matched_rule: str) -> None:
+    status, reason = ENUMERATION_DECISIONS[matched_rule]
+    table.update(
+        {
+            "enumeration_status": status,
+            "enumeration_reason": reason,
+            "matched_rule": matched_rule,
+        }
+    )
+
+
+def _clear_complete_decision(table: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    table["source_total_count"] = None
+    _apply_enumeration_decision(table, "R8")
+    for row in rows:
+        row["source_total_count_int"] = None
 
 
 def _sanitize_untrusted_text(value: object) -> str:
@@ -988,17 +1031,26 @@ def _project_structure_region(
     )
     for record in pending_rows:
         record["source_total_count_int"] = source_total_count
-    return (
-        {
-            "table_ref": table_ref,
-            "sheet_ordinal": sheet_ordinal,
-            "table_ordinal": table_ordinal,
-            "row_count": len(pending_rows),
-            "data_row_count": data_row_index,
-            "source_total_count": source_total_count,
-        },
-        pending_rows,
+    table = {
+        "table_ref": table_ref,
+        "sheet_ordinal": sheet_ordinal,
+        "table_ordinal": table_ordinal,
+        "row_count": len(pending_rows),
+        "data_row_count": data_row_index,
+        "source_total_count": source_total_count,
+    }
+    matched_rule = (
+        "L1-05"
+        if source_total_count is not None and len(headers) == 1
+        else "L1-07"
+        if source_total_count is not None
+        else "R8"
     )
+    _apply_enumeration_decision(
+        table,
+        matched_rule,
+    )
+    return table, pending_rows
 
 
 def _members_prove_repeated_axis(members: set[tuple[int, int]]) -> bool:
@@ -1071,17 +1123,16 @@ def _unknown_structure_region(
         )
     if not rows:
         return None
-    return (
-        {
-            "table_ref": table_ref,
-            "sheet_ordinal": sheet_ordinal,
-            "table_ordinal": table_ordinal,
-            "row_count": len(rows),
-            "data_row_count": 0,
-            "source_total_count": None,
-        },
-        rows,
-    )
+    table = {
+        "table_ref": table_ref,
+        "sheet_ordinal": sheet_ordinal,
+        "table_ordinal": table_ordinal,
+        "row_count": len(rows),
+        "data_row_count": 0,
+        "source_total_count": None,
+    }
+    _apply_enumeration_decision(table, "R8")
+    return table, rows
 
 
 def build_tabular_structure_projection(
@@ -1237,15 +1288,11 @@ def build_tabular_structure_projection(
         )
         if continuation_unknown and projected:
             for item in projected:
-                item["table"]["source_total_count"] = None
-                for row in item["rows"]:
-                    row["source_total_count_int"] = None
+                _clear_complete_decision(item["table"], item["rows"])
 
         if projected and any(region["has_unbound_unresolved"] for region in regions):
             for item in projected:
-                item["table"]["source_total_count"] = None
-                for row in item["rows"]:
-                    row["source_total_count_int"] = None
+                _clear_complete_decision(item["table"], item["rows"])
 
         projected.sort(
             key=lambda item: (
@@ -1263,6 +1310,7 @@ def build_tabular_structure_projection(
         "version": PROJECTION_VERSION,
         "producer_schema_version": PRODUCER_SCHEMA_VERSION,
         "producer_generation_ref": producer_generation_ref,
+        "enumeration_rule_version": ENUMERATION_RULE_VERSION,
         "source_sha256": source_sha256,
         "tables": tables,
         "rows": records,
@@ -1278,6 +1326,8 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         raise ValueError("unsupported tabular structure projection version")
     if projection.get("producer_schema_version") != PRODUCER_SCHEMA_VERSION:
         raise ValueError("unsupported table producer schema version")
+    if projection.get("enumeration_rule_version") != ENUMERATION_RULE_VERSION:
+        raise ValueError("unsupported enumeration rule version")
     generation_ref = projection.get("producer_generation_ref")
     _validate_generation_ref(generation_ref)
     source_sha256 = projection.get("source_sha256")
@@ -1406,6 +1456,9 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             "row_count",
             "data_row_count",
             "source_total_count",
+            "enumeration_status",
+            "enumeration_reason",
+            "matched_rule",
         }
         if not isinstance(table, dict) or set(table) != expected_keys:
             raise ValueError("table manifest does not match the fixed schema")
@@ -1424,6 +1477,12 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             not isinstance(source_total, int) or isinstance(source_total, bool) or source_total < 0
         ):
             raise ValueError("table manifest source total must be a non-negative integer or null")
+        matched_rule = table["matched_rule"]
+        decision = ENUMERATION_DECISIONS.get(matched_rule) if isinstance(matched_rule, str) else None
+        if decision != (table["enumeration_status"], table["enumeration_reason"]):
+            raise ValueError("table manifest enumeration decision is invalid")
+        if (table["enumeration_status"] == "supported_complete") != (source_total is not None):
+            raise ValueError("table manifest enumeration decision conflicts with source total")
         table_ref = table["table_ref"]
         table_ref_match = re.fullmatch(r"tbl_v2_([0-9a-f]{64})_[0-9a-f]{64}", table_ref)
         expected_table_ref = (
@@ -1550,6 +1609,7 @@ def store_tabular_structure_projection(
         "version": PROJECTION_VERSION,
         "producer_schema_version": projection["producer_schema_version"],
         "producer_generation_ref": generation_ref,
+        "enumeration_rule_version": projection["enumeration_rule_version"],
         "source_sha256": projection["source_sha256"],
         "row_count": len(projection["rows"]),
         "tables": projection["tables"],
@@ -1617,6 +1677,7 @@ def load_tabular_structure_projection(
         "version",
         "producer_schema_version",
         "producer_generation_ref",
+        "enumeration_rule_version",
         "source_sha256",
         "row_count",
         "tables",
@@ -1624,7 +1685,11 @@ def load_tabular_structure_projection(
     }
     if set(manifest) != expected_manifest_fields:
         raise StructureSnapshotChanged("manifest schema changed")
-    if manifest["version"] != PROJECTION_VERSION or manifest["producer_schema_version"] != PRODUCER_SCHEMA_VERSION:
+    if (
+        manifest["version"] != PROJECTION_VERSION
+        or manifest["producer_schema_version"] != PRODUCER_SCHEMA_VERSION
+        or manifest["enumeration_rule_version"] != ENUMERATION_RULE_VERSION
+    ):
         raise StructureSnapshotChanged("manifest version changed")
     if manifest["producer_generation_ref"] != producer_generation_ref:
         raise StructureSnapshotChanged("manifest generation changed")
@@ -1683,6 +1748,7 @@ def load_tabular_structure_projection(
         "version": manifest["version"],
         "producer_schema_version": manifest["producer_schema_version"],
         "producer_generation_ref": producer_generation_ref,
+        "enumeration_rule_version": manifest["enumeration_rule_version"],
         "source_sha256": manifest["source_sha256"],
         "tables": manifest["tables"],
         "rows": rows,

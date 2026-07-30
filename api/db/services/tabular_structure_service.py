@@ -434,6 +434,7 @@ class TabularStructureService:
             "producer_generation_ref": projection["producer_generation_ref"],
             "projection_version": projection["version"],
             "producer_schema_version": projection["producer_schema_version"],
+            "enumeration_rule_version": projection["enumeration_rule_version"],
             "row_count": record["row_count"],
             "tables": tables,
         }

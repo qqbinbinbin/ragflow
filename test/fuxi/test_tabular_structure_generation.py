@@ -1,5 +1,6 @@
 import ast
 import copy
+import hashlib
 import importlib.util
 import json
 import sys
@@ -201,6 +202,44 @@ def test_stored_projection_reader_rejects_tampered_manifest_and_part(service_mod
             producer_generation_ref=projection["producer_generation_ref"],
             manifest_object_name=receipt["manifest_object_name"],
             manifest_sha256=receipt["manifest_sha256"],
+            tenant_id="tenant-owner",
+        )
+
+
+def test_stored_projection_preserves_and_validates_enumeration_rule_version(
+    service_module,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation(table_parser)
+    manifest_key = ("dataset-1", receipt["manifest_object_name"])
+    manifest = json.loads(storage.objects[manifest_key])
+
+    assert manifest["enumeration_rule_version"] == "enumeration-rules/v1"
+    loaded = tabular_structure.load_tabular_structure_projection(
+        storage,
+        bucket="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        manifest_object_name=receipt["manifest_object_name"],
+        manifest_sha256=receipt["manifest_sha256"],
+        tenant_id="tenant-owner",
+    )
+    assert loaded["enumeration_rule_version"] == projection["enumeration_rule_version"]
+
+    manifest["enumeration_rule_version"] = "enumeration-rules/unknown"
+    tampered_payload = tabular_structure._canonical_json(manifest)
+    tampered_sha256 = hashlib.sha256(tampered_payload).hexdigest()
+    tampered_name = receipt["manifest_object_name"].rsplit("manifest-", 1)[0] + f"manifest-{tampered_sha256}.json"
+    storage.objects[("dataset-1", tampered_name)] = tampered_payload
+
+    with pytest.raises(service_module.StructureSnapshotChanged, match="manifest version"):
+        tabular_structure.load_tabular_structure_projection(
+            storage,
+            bucket="dataset-1",
+            document_id="document-1",
+            producer_generation_ref=projection["producer_generation_ref"],
+            manifest_object_name=tampered_name,
+            manifest_sha256=tampered_sha256,
             tenant_id="tenant-owner",
         )
 
@@ -446,6 +485,7 @@ def test_active_reads_require_exact_generation_and_never_fallback(service_module
         repository=generation_repository,
     )
     assert manifest["producer_generation_ref"] == projection["producer_generation_ref"]
+    assert manifest["enumeration_rule_version"] == "enumeration-rules/v1"
     assert manifest["tables"]
     assert manifest["tables"][0]["table_label"] == "Inspection"
     assert isinstance(manifest["tables"][0]["table_context"], list)

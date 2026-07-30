@@ -55,7 +55,11 @@ def test_generation_ref_includes_the_producer_schema_version(monkeypatch):
 
 def test_generation_ref_includes_the_projection_version(monkeypatch):
     original = structure_generation_ref("document-1", b"workbook")
-    monkeypatch.setattr(tabular_structure, "PROJECTION_VERSION", "tabular-structure-projection/v2")
+    monkeypatch.setattr(
+        tabular_structure,
+        "PROJECTION_VERSION",
+        "tabular-structure-projection/test-next",
+    )
     changed = structure_generation_ref("document-1", b"workbook")
 
     assert original != changed
@@ -69,10 +73,24 @@ def test_generation_ref_includes_the_multi_region_algorithm_version(monkeypatch)
     assert original != changed
 
 
-def test_runtime_reexports_the_structure_producer_algorithm_version():
+def test_generation_ref_includes_the_enumeration_rule_version(monkeypatch):
+    original = structure_generation_ref("document-1", b"workbook")
+    monkeypatch.setattr(
+        tabular_structure,
+        "ENUMERATION_RULE_VERSION",
+        "enumeration-rules/test-next",
+        raising=False,
+    )
+    changed = structure_generation_ref("document-1", b"workbook")
+
+    assert original != changed
+
+
+def test_runtime_reexports_the_structure_producer_versions():
     assert runtime.STRUCTURE_PRODUCER_ALGORITHM_VERSION == (
         tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION
     )
+    assert runtime.ENUMERATION_RULE_VERSION == tabular_structure.ENUMERATION_RULE_VERSION
 
 
 def test_structure_publication_failure_is_safe_for_ordinary_parse(monkeypatch, caplog):

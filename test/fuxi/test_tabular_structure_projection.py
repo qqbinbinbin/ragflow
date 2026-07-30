@@ -23,12 +23,14 @@ from rag.app.tabular_structure import (
 )
 
 
-def test_current_producer_schema_is_v3_for_display_semantics_invalidation():
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v6"
+def test_current_producer_versions_invalidate_pre_enumeration_generations():
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v4"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v2"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v7"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
 
 
-def test_table_ref_identity_binds_algorithm_version_and_exact_membership(monkeypatch):
+def test_table_ref_identity_binds_all_versions_and_exact_membership(monkeypatch):
     source_sha256 = hashlib.sha256(b"same source").hexdigest()
     first = tabular_structure._table_ref(source_sha256, 1, 1, "a" * 64)
     changed_members = tabular_structure._table_ref(source_sha256, 1, 1, "b" * 64)
@@ -45,7 +47,7 @@ def test_table_ref_identity_binds_algorithm_version_and_exact_membership(monkeyp
     monkeypatch.setattr(
         tabular_structure,
         "PROJECTION_VERSION",
-        "tabular-structure-projection/v1",
+        "tabular-structure-projection/v2",
     )
     monkeypatch.setattr(
         tabular_structure,
@@ -53,9 +55,104 @@ def test_table_ref_identity_binds_algorithm_version_and_exact_membership(monkeyp
         "region-producer/test-next",
     )
     changed_algorithm = tabular_structure._table_ref(source_sha256, 1, 1, "a" * 64)
+    monkeypatch.setattr(
+        tabular_structure,
+        "ENUMERATION_RULE_VERSION",
+        "enumeration-rules/test-next",
+        raising=False,
+    )
+    changed_enumeration_rules = tabular_structure._table_ref(source_sha256, 1, 1, "a" * 64)
 
     assert first.startswith("tbl_v2_" + "a" * 64 + "_")
-    assert len({first, changed_members, changed_schema, changed_projection, changed_algorithm}) == 5
+    assert len(
+        {
+            first,
+            changed_members,
+            changed_schema,
+            changed_projection,
+            changed_algorithm,
+            changed_enumeration_rules,
+        }
+    ) == 6
+
+
+def test_projection_root_requires_the_current_enumeration_rule_version(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v1"
+
+    missing = dict(projection)
+    missing.pop("enumeration_rule_version")
+    with pytest.raises(ValueError, match="fixed top-level schema"):
+        validate_tabular_structure_projection(missing)
+
+    changed = dict(projection)
+    changed["enumeration_rule_version"] = "enumeration-rules/unknown"
+    with pytest.raises(ValueError, match="enumeration rule version"):
+        validate_tabular_structure_projection(changed)
+
+
+def test_table_manifest_requires_one_strict_enumeration_decision(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    table = projection["tables"][0]
+
+    assert {
+        "enumeration_status": table["enumeration_status"],
+        "enumeration_reason": table["enumeration_reason"],
+        "matched_rule": table["matched_rule"],
+    } == {
+        "enumeration_status": "supported_complete",
+        "enumeration_reason": "record_axis_proven",
+        "matched_rule": "L1-05",
+    }
+
+    for field in ("enumeration_status", "enumeration_reason", "matched_rule"):
+        missing = json.loads(json.dumps(projection))
+        missing["tables"][0].pop(field)
+        with pytest.raises(ValueError, match="table manifest"):
+            validate_tabular_structure_projection(missing)
+
+    changed = json.loads(json.dumps(projection))
+    changed["tables"][0]["enumeration_reason"] = "record_axis_not_proven"
+    with pytest.raises(ValueError, match="enumeration decision"):
+        validate_tabular_structure_projection(changed)
+
+    invalid_rule = json.loads(json.dumps(projection))
+    invalid_rule["tables"][0]["matched_rule"] = []
+    with pytest.raises(ValueError, match="enumeration decision"):
+        validate_tabular_structure_projection(invalid_rule)
+
+
+def test_unproven_single_record_uses_the_default_l2_decision(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "State"])
+    sheet.append(["A-1", "Open"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert {
+        "enumeration_status": projection["tables"][0]["enumeration_status"],
+        "enumeration_reason": projection["tables"][0]["enumeration_reason"],
+        "matched_rule": projection["tables"][0]["matched_rule"],
+    } == {
+        "enumeration_status": "not_guaranteed_explained",
+        "enumeration_reason": "record_axis_not_proven",
+        "matched_rule": "R8",
+    }
 
 
 def test_table_ref_rejects_membership_identity_tampering(table_parser):
@@ -860,7 +957,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v1"
+    assert projection["version"] == "tabular-structure-projection/v2"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 
