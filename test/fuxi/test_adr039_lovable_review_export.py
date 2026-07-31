@@ -1,5 +1,8 @@
 import hashlib
+import importlib.util
 import json
+import subprocess
+import sys
 import unicodedata
 from collections import Counter
 from datetime import date
@@ -17,6 +20,7 @@ from rag.app.tabular_structure import build_tabular_structure_projection
 
 
 BASELINE_PATH = Path(__file__).parent / "fixtures" / "adr039-l1-regression-baseline.json"
+EXPORTER_PATH = Path(__file__).parents[2] / "tools" / "export_adr039_lovable_review.py"
 
 FROZEN_L1_EXPECTATIONS = {
     "L1-FIRST-OR-DELAYED-HEADER": (1, (3,), ("supported_complete",), ("L1-07",)),
@@ -68,6 +72,14 @@ ORDERED_COLLISION_FIXTURES = {
 
 def _load_baseline():
     return json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+
+
+def _load_exporter_module():
+    spec = importlib.util.spec_from_file_location("adr039_lovable_review_exporter", EXPORTER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _coordinate_digest(coordinates):
@@ -422,6 +434,123 @@ def test_anonymous_l1_baseline_runs_through_the_real_producer(sample, table_pars
             range(1, table["source_total_count"] + 1)
         )
         assert all(row["source_total_count_int"] == table["source_total_count"] for row in data_rows)
+
+
+def test_review_b_export_uses_exact_approved_columns_and_filters_private_audit_fields(
+    table_parser,
+):
+    exporter = _load_exporter_module()
+    workbook = Workbook()
+    workbook.active.append(["Code"])
+    workbook.active.append(["DO_NOT_EXPORT"])
+    workbook.active.append(["ANOTHER_PRIVATE_VALUE"])
+    binary = _save_workbook(workbook)
+    generation_ref = exporter.review_generation_ref_from_bytes("anonymous-document", binary)
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "customer-secret.xls",
+        binary,
+        producer_generation_ref=generation_ref,
+        parser=table_parser,
+    )
+
+    source_tsv, output_tsv = exporter.render_review_b_tsv(
+        audit,
+        expected_generation_ref=generation_ref,
+    )
+
+    assert source_tsv.splitlines()[0].split("\t") == list(exporter.SOURCE_REGION_FIELDS)
+    assert output_tsv.splitlines()[0].split("\t") == list(exporter.OUTPUT_OBJECT_FIELDS)
+    assert "emitted_data_row_ordinals" not in output_tsv
+    assert "DO_NOT_EXPORT" not in source_tsv + output_tsv
+    assert "ANOTHER_PRIVATE_VALUE" not in source_tsv + output_tsv
+    assert "customer-secret.xls" not in source_tsv + output_tsv
+    assert "\tvalidated\t" in output_tsv
+
+
+def test_review_b_export_is_deterministic_and_serializes_nested_values_as_compact_json(
+    table_parser,
+):
+    exporter = _load_exporter_module()
+    binary = _build_anonymous_workbook(_load_baseline()["samples"][0])
+    generation_ref = exporter.review_generation_ref_from_bytes("anonymous-document", binary)
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        binary,
+        producer_generation_ref=generation_ref,
+        parser=table_parser,
+    )
+
+    first = exporter.render_review_b_tsv(
+        audit,
+        expected_generation_ref=generation_ref,
+    )
+    second = exporter.render_review_b_tsv(
+        json.loads(json.dumps(audit)),
+        expected_generation_ref=generation_ref,
+    )
+
+    assert first == second
+    assert "NULL" in first[1] or "[" in first[0]
+    assert all("\r" not in payload for payload in first)
+
+
+def test_source_bound_review_b_export_stops_before_parsing_on_sha_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    exporter = _load_exporter_module()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"not a workbook")
+    called = False
+
+    def fail_if_parsed(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("Producer must not run before the SHA gate")
+
+    monkeypatch.setattr(exporter, "_build_audit", fail_if_parsed)
+
+    with pytest.raises(ValueError, match="source SHA-256 mismatch"):
+        exporter.export_source_bound_review_b(
+            source,
+            "0" * 64,
+            tmp_path / "out",
+            "anonymous-document",
+        )
+    assert called is False
+
+
+def test_review_b_export_cli_resolves_the_repository_import_root(tmp_path):
+    workbook = Workbook()
+    workbook.active.append(["Code"])
+    workbook.active.append(["A-1"])
+    workbook.active.append(["A-2"])
+    source = tmp_path / "source.xlsx"
+    source.write_bytes(_save_workbook(workbook))
+    output = tmp_path / "output"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(EXPORTER_PATH),
+            "--source",
+            str(source),
+            "--expected-source-sha256",
+            hashlib.sha256(source.read_bytes()).hexdigest(),
+            "--output-directory",
+            str(output),
+            "--document-id",
+            "anonymous-document",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (output / "source_regions.tsv").is_file()
+    assert (output / "output_objects.tsv").is_file()
 
 
 def test_adr044_rule_requires_a_receipt_bound_to_the_converted_bytes(table_parser):
