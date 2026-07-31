@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from pathlib import Path
 
@@ -84,6 +85,33 @@ def test_generation_ref_includes_the_enumeration_rule_version(monkeypatch):
     changed = structure_generation_ref("document-1", b"workbook")
 
     assert original != changed
+
+
+def test_adr044_generation_ref_binds_original_and_converter_identity():
+    converted = b"converted workbook"
+    receipt = {
+        "original_source_sha256": "1" * 64,
+        "converted_source_sha256": hashlib.sha256(converted).hexdigest(),
+        "converter_version": "converter-build/one",
+    }
+
+    original = structure_generation_ref(
+        "document-1",
+        converted,
+        adr044_conversion_receipt=receipt,
+    )
+    changed_source = structure_generation_ref(
+        "document-1",
+        converted,
+        adr044_conversion_receipt={**receipt, "original_source_sha256": "2" * 64},
+    )
+    changed_converter = structure_generation_ref(
+        "document-1",
+        converted,
+        adr044_conversion_receipt={**receipt, "converter_version": "converter-build/two"},
+    )
+
+    assert len({original, changed_source, changed_converter}) == 3
 
 
 def test_runtime_reexports_the_structure_producer_versions():
@@ -187,6 +215,149 @@ def test_structure_publication_is_shadow_first_and_idempotent():
     assert [item[0] for item in calls] == [
         "build", "store", "shadow", "activate",
     ]
+
+
+def test_explicit_receipt_publication_binds_identity_and_reaches_the_producer():
+    converted = b"converted workbook"
+    receipt = {
+        "original_source_sha256": "1" * 64,
+        "converted_source_sha256": hashlib.sha256(converted).hexdigest(),
+        "converter_version": "converter-build/one",
+    }
+    current = {
+        **_task("task-1", 1.0),
+        "name": "anonymous.xlsx",
+        "tenant_id": "tenant-1",
+        "kb_id": "dataset-1",
+    }
+    expected_generation_ref = structure_generation_ref(
+        "document-1",
+        converted,
+        adr044_conversion_receipt=receipt,
+    )
+    builder_calls = []
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def register_shadow_generation(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            return None
+
+    def build(_name, _binary, **kwargs):
+        builder_calls.append(kwargs)
+        return {"rows": [], "producer_generation_ref": kwargs["producer_generation_ref"]}
+
+    result = publish_tabular_structure_generation(
+        current,
+        converted,
+        tasks=[current],
+        adr044_conversion_receipt=receipt,
+        storage="storage",
+        service=Service,
+        projection_builder=build,
+        projection_store=lambda *_args, **_kwargs: {
+            "producer_generation_ref": expected_generation_ref,
+            "manifest_object_name": "manifest.json",
+            "manifest_sha256": "a" * 64,
+            "part_count": 1,
+            "row_count": 0,
+        },
+    )
+
+    assert result["producer_generation_ref"] == expected_generation_ref
+    assert builder_calls == [
+        {
+            "producer_generation_ref": expected_generation_ref,
+            "adr044_conversion_receipt": receipt,
+        }
+    ]
+
+
+def test_invalid_explicit_adr044_receipt_fails_without_calling_the_producer():
+    converted = b"converted workbook"
+    current = {
+        **_task("task-1", 1.0),
+        "name": "anonymous.xlsx",
+        "tenant_id": "tenant-1",
+        "kb_id": "dataset-1",
+    }
+    builder_calls = []
+
+    result = publish_tabular_structure_generation(
+        current,
+        converted,
+        tasks=[current],
+        adr044_conversion_receipt={
+            "original_source_sha256": "1" * 64,
+            "converted_source_sha256": "2" * 64,
+            "converter_version": "converter-build/one",
+        },
+        projection_builder=lambda *_args, **_kwargs: builder_calls.append(True),
+    )
+
+    assert result == {"status": "failed"}
+    assert builder_calls == []
+
+
+def test_publication_without_a_receipt_does_not_infer_adr044_identity():
+    current = {
+        **_task("task-1", 1.0),
+        "name": "anonymous.xlsx",
+        "tenant_id": "tenant-1",
+        "kb_id": "dataset-1",
+    }
+    binary = b"workbook bytes without a governed conversion receipt"
+    generation_ref = structure_generation_ref("document-1", binary)
+    builder_calls = []
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def register_shadow_generation(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            return None
+
+    def build(_name, _binary, **kwargs):
+        builder_calls.append(kwargs)
+        return {"rows": [], "producer_generation_ref": kwargs["producer_generation_ref"]}
+
+    result = publish_tabular_structure_generation(
+        current,
+        binary,
+        tasks=[current],
+        storage="storage",
+        service=Service,
+        projection_builder=build,
+        projection_store=lambda *_args, **_kwargs: {
+            "producer_generation_ref": generation_ref,
+            "manifest_object_name": "manifest.json",
+            "manifest_sha256": "a" * 64,
+            "part_count": 1,
+            "row_count": 0,
+        },
+    )
+
+    assert result["producer_generation_ref"] == generation_ref
+    assert builder_calls == [{"producer_generation_ref": generation_ref}]
 
 
 def test_concurrent_shadow_registration_accepts_an_already_active_generation():
@@ -298,3 +469,65 @@ def test_structure_only_build_publishes_from_source_without_parse_tasks():
     }
     assert [call[0] for call in calls] == ["register", "activate"]
     assert calls[-1][2]["expected_active_generation_ref"] is None
+
+
+def test_explicit_receipt_structure_build_passes_the_receipt_to_the_producer():
+    converted = b"converted workbook"
+    receipt = {
+        "original_source_sha256": "1" * 64,
+        "converted_source_sha256": hashlib.sha256(converted).hexdigest(),
+        "converter_version": "converter-build/one",
+    }
+    generation_ref = structure_generation_ref(
+        "document-1",
+        converted,
+        adr044_conversion_receipt=receipt,
+    )
+    builder_calls = []
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def register_shadow_generation(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            return None
+
+    def build(_name, _binary, **kwargs):
+        builder_calls.append(kwargs)
+        return {"rows": [], "producer_generation_ref": kwargs["producer_generation_ref"]}
+
+    result = publish_tabular_structure_from_source(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="anonymous.xlsx",
+        binary=converted,
+        adr044_conversion_receipt=receipt,
+        storage="storage",
+        service=Service,
+        projection_builder=build,
+        projection_store=lambda *_args, **_kwargs: {
+            "producer_generation_ref": generation_ref,
+            "manifest_object_name": "manifest.json",
+            "manifest_sha256": "a" * 64,
+            "part_count": 1,
+            "row_count": 0,
+        },
+    )
+
+    assert result["producer_generation_ref"] == generation_ref
+    assert builder_calls == [
+        {
+            "producer_generation_ref": generation_ref,
+            "adr044_conversion_receipt": receipt,
+        }
+    ]

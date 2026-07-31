@@ -41,14 +41,25 @@ def is_complete_tabular_parse(current_task: dict[str, Any], tasks: list[dict[str
     return True
 
 
-def structure_generation_ref(document_id: str, binary: bytes) -> str:
-    """Derive an idempotent generation identity from document and source bytes."""
+def structure_generation_ref(
+    document_id: str,
+    binary: bytes,
+    *,
+    adr044_conversion_receipt: dict[str, str] | None = None,
+) -> str:
+    """Derive identity from source bytes and an explicitly supplied conversion receipt.
+
+    The background worker and manual rebuild endpoint currently provide no
+    governed ADR-044 receipt. In that case this function binds only the bytes it
+    received and must not infer original-source or converter identity.
+    """
 
     from rag.app.tabular_structure import (
         ENUMERATION_RULE_VERSION,
         PRODUCER_SCHEMA_VERSION,
         PROJECTION_VERSION,
         STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+        _validate_adr044_conversion_receipt,
     )
 
     if not isinstance(document_id, str) or not document_id:
@@ -56,12 +67,22 @@ def structure_generation_ref(document_id: str, binary: bytes) -> str:
     if not isinstance(binary, bytes) or not binary:
         raise ValueError("complete source bytes are required")
     source_sha256 = hashlib.sha256(binary).hexdigest()
+    has_adr044_receipt = _validate_adr044_conversion_receipt(
+        adr044_conversion_receipt,
+        source_sha256,
+    )
+    source_identity = (
+        f"{adr044_conversion_receipt['original_source_sha256']}:"
+        f"{source_sha256}:{adr044_conversion_receipt['converter_version']}"
+        if has_adr044_receipt
+        else source_sha256
+    )
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"fuxi:tabular-generation:{PRODUCER_SCHEMA_VERSION}:{PROJECTION_VERSION}:"
             f"{STRUCTURE_PRODUCER_ALGORITHM_VERSION}:{ENUMERATION_RULE_VERSION}:"
-            f"{document_id}:{source_sha256}",
+            f"{document_id}:{source_identity}",
         )
     )
 
@@ -89,15 +110,25 @@ def publish_tabular_structure_from_source(
     document_id: str,
     filename: str,
     binary: bytes,
+    adr044_conversion_receipt: dict[str, str] | None = None,
     storage=None,
     service=None,
     projection_builder: Callable[..., dict[str, Any]] | None = None,
     projection_store: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build and atomically publish a structure projection from source bytes."""
+    """Build and publish from source bytes plus an optional caller-owned receipt."""
 
-    generation_ref = structure_generation_ref(document_id, binary)
+    generation_ref = None
     try:
+        generation_ref = (
+            structure_generation_ref(
+                document_id,
+                binary,
+                adr044_conversion_receipt=adr044_conversion_receipt,
+            )
+            if adr044_conversion_receipt is not None
+            else structure_generation_ref(document_id, binary)
+        )
         if service is None:
             from api.db.services.tabular_structure_service import TabularStructureService
 
@@ -134,11 +165,10 @@ def publish_tabular_structure_from_source(
 
             projection_store = store_tabular_structure_projection
 
-        projection = projection_builder(
-            filename,
-            binary,
-            producer_generation_ref=generation_ref,
-        )
+        builder_kwargs = {"producer_generation_ref": generation_ref}
+        if adr044_conversion_receipt is not None:
+            builder_kwargs["adr044_conversion_receipt"] = adr044_conversion_receipt
+        projection = projection_builder(filename, binary, **builder_kwargs)
         receipt = projection_store(
             storage,
             bucket=dataset_id,
@@ -182,22 +212,26 @@ def publish_tabular_structure_from_source(
             "row_count": len(projection["rows"]),
         }
     except Exception as error:
-        try:
-            if _active_generation_ref(
-                service,
-                tenant_id=tenant_id,
-                dataset_id=dataset_id,
-                document_id=document_id,
-            ) == generation_ref:
-                return {"status": "active", "producer_generation_ref": generation_ref}
-        except Exception:
-            pass
+        if generation_ref is not None:
+            try:
+                if _active_generation_ref(
+                    service,
+                    tenant_id=tenant_id,
+                    dataset_id=dataset_id,
+                    document_id=document_id,
+                ) == generation_ref:
+                    return {"status": "active", "producer_generation_ref": generation_ref}
+            except Exception:
+                pass
         logging.warning(
             "Tabular structure generation unavailable generation=%s reason=%s",
-            generation_ref,
+            generation_ref or "unavailable",
             error.__class__.__name__,
         )
-        return {"status": "failed", "producer_generation_ref": generation_ref}
+        result = {"status": "failed"}
+        if generation_ref is not None:
+            result["producer_generation_ref"] = generation_ref
+        return result
 
 
 def publish_tabular_structure_generation(
@@ -205,6 +239,7 @@ def publish_tabular_structure_generation(
     binary: bytes,
     *,
     tasks: list[dict[str, Any]] | None = None,
+    adr044_conversion_receipt: dict[str, str] | None = None,
     storage=None,
     service=None,
     task_list_provider: Callable[[str], list[dict[str, Any]] | None] | None = None,
@@ -223,16 +258,21 @@ def publish_tabular_structure_generation(
     if not is_complete_tabular_parse(current_task, tasks):
         return {"status": "pending"}
 
+    publish_kwargs = {
+        "tenant_id": current_task["tenant_id"],
+        "dataset_id": current_task["kb_id"],
+        "document_id": current_task["doc_id"],
+        "filename": current_task["name"],
+        "binary": binary,
+        "storage": storage,
+        "service": service,
+        "projection_builder": projection_builder,
+        "projection_store": projection_store,
+    }
+    if adr044_conversion_receipt is not None:
+        publish_kwargs["adr044_conversion_receipt"] = adr044_conversion_receipt
     return publish_tabular_structure_from_source(
-        tenant_id=current_task["tenant_id"],
-        dataset_id=current_task["kb_id"],
-        document_id=current_task["doc_id"],
-        filename=current_task["name"],
-        binary=binary,
-        storage=storage,
-        service=service,
-        projection_builder=projection_builder,
-        projection_store=projection_store,
+        **publish_kwargs,
     )
 
 

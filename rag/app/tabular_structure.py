@@ -24,6 +24,7 @@ import json
 import re
 import struct
 import uuid
+from collections import Counter
 from io import BytesIO
 from typing import Any
 
@@ -72,6 +73,7 @@ ENUMERATION_DECISIONS = {
     "D3": ("defect", "record_count_mismatch"),
     "D4": ("defect", "missing_projection"),
 }
+NEGATIVE_ENUMERATION_RULES = ("R1", "R2", "R3", "R4", "R5", "R6", "R7")
 
 PROJECTION_ROW_FIELDS = frozenset(
     {
@@ -162,11 +164,57 @@ def _apply_enumeration_decision(table: dict[str, Any], matched_rule: str) -> Non
     )
 
 
-def _clear_complete_decision(table: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+def _ordered_enumeration_rule(
+    negative_predicates: dict[str, bool],
+    l1_rule: str | None,
+) -> str:
+    if (
+        not isinstance(negative_predicates, dict)
+        or set(negative_predicates) != set(NEGATIVE_ENUMERATION_RULES)
+        or any(not isinstance(value, bool) for value in negative_predicates.values())
+    ):
+        raise ValueError("enumeration predicate vector must contain seven booleans")
+    if l1_rule is not None and l1_rule not in ENUMERATION_DECISIONS:
+        raise ValueError("enumeration L1 rule is invalid")
+    for rule in NEGATIVE_ENUMERATION_RULES:
+        if negative_predicates[rule]:
+            return rule
+    return l1_rule or "R8"
+
+
+def _clear_complete_decision(
+    table: dict[str, Any],
+    rows: list[dict[str, Any]],
+    matched_rule: str = "R8",
+) -> None:
     table["source_total_count"] = None
-    _apply_enumeration_decision(table, "R8")
+    _apply_enumeration_decision(table, matched_rule)
     for row in rows:
         row["source_total_count_int"] = None
+
+
+def _validate_adr044_conversion_receipt(
+    receipt: dict[str, str] | None,
+    converted_source_sha256: str,
+) -> bool:
+    if receipt is None:
+        return False
+    required = {"original_source_sha256", "converted_source_sha256", "converter_version"}
+    if not isinstance(receipt, dict) or set(receipt) != required:
+        raise ValueError("ADR-044 conversion receipt does not match the fixed schema")
+    for field in ("original_source_sha256", "converted_source_sha256"):
+        if not isinstance(receipt[field], str) or not re.fullmatch(r"[0-9a-f]{64}", receipt[field]):
+            raise ValueError(f"ADR-044 {field.replace('_', ' ')} is invalid")
+    if receipt["converted_source_sha256"] != converted_source_sha256:
+        raise ValueError("ADR-044 converted source SHA-256 does not match the workbook bytes")
+    converter_version = receipt["converter_version"]
+    if (
+        not isinstance(converter_version, str)
+        or not converter_version.strip()
+        or _sanitize_untrusted_text(converter_version) != converter_version
+    ):
+        raise ValueError("ADR-044 converter version is invalid")
+    return True
 
 
 def _sanitize_untrusted_text(value: object) -> str:
@@ -303,6 +351,16 @@ def _row_shape(values: list[object], *, distinguish_text_digits: bool = False) -
             else:
                 shape.append("text")
     return tuple(shape)
+
+
+def _record_axis_value_shape(value: object) -> tuple[str, ...]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ("empty",)
+    if isinstance(value, bool):
+        return ("boolean",)
+    if isinstance(value, (int, float)):
+        return ("number",)
+    return ("text", *_text_structure(value))
 
 
 def _is_repeated_header_row(headers: list[str], values: list[object]) -> bool:
@@ -564,6 +622,70 @@ def _formula_coordinates_by_sheet(binary: bytes) -> tuple[list[set[tuple[int, in
     return result, True
 
 
+def _formula_values_by_sheet(binary: bytes) -> list[dict[tuple[int, int], str]]:
+    """Return OOXML formula expressions for structural dependency checks."""
+
+    if not binary.startswith(b"PK\x03\x04"):
+        return []
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(binary), data_only=False, read_only=False)
+    except Exception:
+        return []
+    result = []
+    for sheet_name in workbook.sheetnames:
+        worksheet = workbook[sheet_name]
+        result.append(
+            {
+                (cell.row, cell.column): cell.value
+                for cell in getattr(worksheet, "_cells", {}).values()
+                if cell.__class__.__name__ != "MergedCell"
+                and cell.data_type == "f"
+                and isinstance(cell.value, str)
+            }
+        )
+    return result
+
+
+def _formula_reference_ranges(
+    formula: str,
+    sheet_name: str,
+) -> tuple[list[tuple[int, int, int, int]], bool]:
+    """Parse local A1 references without exposing formula text downstream."""
+
+    from openpyxl.formula.tokenizer import Tokenizer
+    from openpyxl.utils.cell import range_boundaries
+
+    ranges = []
+    unresolved = False
+    try:
+        tokens = Tokenizer(formula).items
+    except Exception:
+        return [], True
+    for token in tokens:
+        if token.type != "OPERAND" or token.subtype != "RANGE":
+            continue
+        reference = token.value
+        if "!" in reference:
+            reference_sheet, reference = reference.rsplit("!", 1)
+            reference_sheet = reference_sheet.strip("'").replace("''", "'")
+            if reference_sheet != sheet_name:
+                unresolved = True
+                continue
+        reference = reference.replace("$", "")
+        try:
+            min_column, min_row, max_column, max_row = range_boundaries(reference)
+        except ValueError:
+            unresolved = True
+            continue
+        if None in (min_column, min_row, max_column, max_row):
+            unresolved = True
+            continue
+        ranges.append((min_row, min_column, max_row, max_column))
+    return ranges, unresolved
+
+
 def _copy_structure_region(parser, worksheet, region: dict[str, Any]):
     from openpyxl import Workbook
 
@@ -648,6 +770,7 @@ def _parse_region_structure(parser, worksheet, rows):
             if not headers:
                 continue
             following_offset_counts: dict[tuple[int, ...], int] = {}
+            following_offsets = []
             for row_index, row in enumerate(rows[end:], start=end + 1):
                 if parser._is_empty_row([cell.value for cell in row]):
                     continue
@@ -659,16 +782,34 @@ def _parse_region_structure(parser, worksheet, rows):
                 ]
                 offsets = _record_field_offsets(values)
                 if offsets:
+                    following_offsets.append(offsets)
                     following_offset_counts[offsets] = following_offset_counts.get(offsets, 0) + 1
             proven_offsets = [
                 offsets for offsets, count in following_offset_counts.items() if count >= 2
             ]
-            if not proven_offsets:
-                continue
-            record_offsets = max(
-                proven_offsets,
-                key=lambda offsets: (following_offset_counts[offsets], len(offsets), offsets),
-            )
+            if proven_offsets:
+                record_offsets = max(
+                    proven_offsets,
+                    key=lambda offsets: (following_offset_counts[offsets], len(offsets), offsets),
+                )
+                record_count = following_offset_counts[record_offsets]
+            else:
+                offset_sets = [set(offsets) for offsets in following_offsets]
+                if len(offset_sets) < 3:
+                    continue
+                common_offsets = set.intersection(*offset_sets)
+                record_offsets = tuple(sorted(set.union(*offset_sets)))
+                optional_offsets = set(record_offsets) - common_offsets
+                if (
+                    not common_offsets
+                    or not optional_offsets
+                    or any(
+                        sum(offset in offsets for offsets in offset_sets) < 2
+                        for offset in optional_offsets
+                    )
+                ):
+                    continue
+                record_count = len(following_offsets)
             if any(
                 offset >= len(headers) or headers[offset].startswith("Column_")
                 for offset in record_offsets
@@ -680,7 +821,7 @@ def _parse_region_structure(parser, worksheet, rows):
             candidates.append(
                 (
                     len(record_offsets),
-                    following_offset_counts[record_offsets],
+                    record_count,
                     -start,
                     depth,
                     headers,
@@ -799,6 +940,32 @@ def _single_column_axis_proven(
         len(shapes) == 1
         and next(iter(shapes)) != header_shape
         and any(kind in {"digit", "symbol"} for kind in next(iter(shapes)))
+    )
+
+
+def _sparse_record_axis_proven(
+    headers: list[str],
+    body_rows: list[tuple[int, list[object], bool]],
+    data_field_offsets: list[tuple[int, ...]],
+) -> bool:
+    if len(data_field_offsets) < 2 or len(data_field_offsets) != len(body_rows):
+        return False
+    if any(follows_body_gap for _row, _values, follows_body_gap in body_rows):
+        return False
+    offset_sets = [set(offsets) for offsets in data_field_offsets]
+    common_offsets = set.intersection(*offset_sets)
+    occupied_offsets = set.union(*offset_sets)
+    optional_offsets = occupied_offsets - common_offsets
+    if not common_offsets or not optional_offsets or len(set(data_field_offsets)) < 2:
+        return False
+    if any(
+        offset >= len(headers) or headers[offset].startswith("Column_")
+        for offset in occupied_offsets
+    ):
+        return False
+    return all(
+        sum(offset in offsets for offsets in offset_sets) >= 2
+        for offset in optional_offsets
     )
 
 
@@ -1016,7 +1183,7 @@ def _project_structure_region(
         ) == "data"
         and not _is_repeated_header_row(headers, values)
     ]
-    record_axis_proven = (
+    regular_record_axis_proven = (
         len(data_field_offsets) >= 2
         and len(set(data_field_offsets)) == 1
         and len(set(data_value_shapes)) == 1
@@ -1024,6 +1191,11 @@ def _project_structure_region(
         and data_row_index == len(data_field_offsets)
         and _single_column_axis_proven(headers, body_rows)
     )
+    sparse_record_axis_proven = (
+        data_row_index == len(data_field_offsets)
+        and _sparse_record_axis_proven(headers, body_rows, data_field_offsets)
+    )
+    record_axis_proven = regular_record_axis_proven or sparse_record_axis_proven
     source_total_count = (
         data_row_index
         if record_axis_proven and not has_unknown and not force_unknown_total
@@ -1042,6 +1214,10 @@ def _project_structure_region(
     matched_rule = (
         "L1-05"
         if source_total_count is not None and len(headers) == 1
+        else "L1-04"
+        if source_total_count is not None and data_start - header_start > 1
+        else "L1-06"
+        if source_total_count is not None and sparse_record_axis_proven
         else "L1-07"
         if source_total_count is not None
         else "R8"
@@ -1067,6 +1243,1385 @@ def _members_prove_repeated_axis(members: set[tuple[int, int]]) -> bool:
 
 def _column_sets_intersect(left: set[int], right: set[int]) -> bool:
     return bool(left) and bool(right) and not left.isdisjoint(right)
+
+
+def _column_sets_are_nested(left: set[int], right: set[int]) -> bool:
+    return bool(left) and bool(right) and (
+        left.issubset(right) or right.issubset(left)
+    )
+
+
+def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dict[str, Any] | None:
+    region_worksheet, row_offset = _copy_structure_region(parser, worksheet, region)
+    header_rows, populated_rows, _unresolved_rows = _complete_worksheet_rows(region_worksheet)
+    if not header_rows or not populated_rows:
+        return None
+    headers, header_start, data_start = _parse_region_structure(
+        parser,
+        region_worksheet,
+        header_rows,
+    )
+    body_rows = [row for row in populated_rows if row > data_start]
+    if not headers or not body_rows:
+        return None
+    min_column = region["bbox"][1]
+    return {
+        "headers_by_column": {
+            min_column + offset: header for offset, header in enumerate(headers)
+        },
+        "body_row_ordinals": [row + row_offset for row in body_rows],
+        "header_depth": data_start - header_start,
+    }
+
+
+def _new_projected_item(
+    *,
+    parser,
+    worksheet,
+    region: dict[str, Any],
+    source_region_key: tuple[int, int],
+    table: dict[str, Any],
+    rows: list[dict[str, Any]],
+    positive_rule: str | None,
+) -> dict[str, Any]:
+    members = set(region["members"])
+    structure_evidence = _region_structure_evidence(parser, worksheet, region)
+    emitted_row_ordinals = {row["row_ordinal_int"] for row in rows}
+    body_row_ordinals = (
+        set(structure_evidence["body_row_ordinals"])
+        if structure_evidence is not None
+        else set()
+    )
+    context_row_ordinals = (
+        {row for row, _column in members} - body_row_ordinals
+        if structure_evidence is not None
+        else set()
+    )
+    emitted_member_events = [
+        coordinate
+        for coordinate in members
+        if coordinate[0] in emitted_row_ordinals
+        or coordinate[0] in context_row_ordinals
+    ]
+    return {
+        "table": table,
+        "rows": rows,
+        "bbox": region["bbox"],
+        "members": members,
+        "member_columns": {column for _row, column in members},
+        "structure_evidence": structure_evidence,
+        "positive_rule": positive_rule,
+        "source_components": {source_region_key: members},
+        # This is an internal event stream. It must not be reconstructed from a
+        # deduplicated set when continuation components are combined.
+        "emitted_member_events": emitted_member_events,
+        "proven_record_slots": [
+            row["row_ordinal_int"]
+            for row in rows
+            if positive_rule is not None and row["row_role_kwd"] == "data"
+        ],
+    }
+
+
+def _member_rows(members: set[tuple[int, int]]) -> dict[int, set[int]]:
+    rows: dict[int, set[int]] = {}
+    for row_ordinal, column_ordinal in members:
+        rows.setdefault(row_ordinal, set()).add(column_ordinal)
+    return rows
+
+
+def _formula_is_unstable(
+    *,
+    sheet_name: str,
+    members: set[tuple[int, int]],
+    formula_coordinates: set[tuple[int, int]],
+    formula_values: dict[tuple[int, int], str],
+    formula_inventory_proven: bool,
+) -> bool:
+    if not formula_inventory_proven:
+        return True
+    local_formula_coordinates = members & formula_coordinates
+    if local_formula_coordinates - set(formula_values):
+        return True
+    for coordinate in local_formula_coordinates:
+        ranges, unresolved = _formula_reference_ranges(
+            formula_values[coordinate],
+            sheet_name,
+        )
+        if unresolved or not ranges:
+            return True
+        for min_row, min_column, max_row, max_column in ranges:
+            references = {
+                (row_ordinal, column_ordinal)
+                for row_ordinal in range(min_row, max_row + 1)
+                for column_ordinal in range(min_column, max_column + 1)
+            }
+            if not references.issubset(members):
+                return True
+    return bool(local_formula_coordinates)
+
+
+def _has_hidden_record_member(
+    worksheet,
+    members: set[tuple[int, int]],
+    structure_evidence: dict[str, Any] | None,
+) -> bool:
+    from openpyxl.utils import get_column_letter
+
+    member_columns = {column_ordinal for _row_ordinal, column_ordinal in members}
+    candidate_rows = (
+        set(structure_evidence["body_row_ordinals"])
+        if structure_evidence
+        else {row_ordinal for row_ordinal, _column_ordinal in members}
+    )
+    return any(worksheet.row_dimensions[row_ordinal].hidden for row_ordinal in candidate_rows) or any(
+        worksheet.column_dimensions[get_column_letter(column_ordinal)].hidden
+        for column_ordinal in member_columns
+    )
+
+
+def _is_matrix_layout(worksheet, members: set[tuple[int, int]]) -> bool:
+    min_row, min_column, max_row, max_column = _region_bbox(members)
+    if max_row - min_row < 2 or max_column - min_column < 2:
+        return False
+    body_rows = list(range(min_row + 1, max_row + 1))
+    measure_columns = list(range(min_column + 1, max_column + 1))
+    column_axis = {(min_row, column) for column in measure_columns}
+    if not column_axis.issubset(members):
+        return False
+    column_axis_values = tuple(
+        worksheet.cell(min_row, column).value for column in measure_columns
+    )
+    repeated_column_axis_rows = {
+        row
+        for row in body_rows
+        if (row, min_column) not in members
+        and all((row, column) in members for column in measure_columns)
+        and tuple(worksheet.cell(row, column).value for column in measure_columns)
+        == column_axis_values
+    }
+    record_rows = [row for row in body_rows if row not in repeated_column_axis_rows]
+    row_axis = {(row, min_column) for row in record_rows}
+    if len(record_rows) < 2 or not row_axis.issubset(members):
+        return False
+    if any(
+        not any((row, column) in members for column in measure_columns)
+        for row in record_rows
+    ):
+        return False
+
+    row_axis_shapes = [
+        _row_shape(
+            [worksheet.cell(row, min_column).value],
+            distinguish_text_digits=True,
+        )[0]
+        for row in record_rows
+    ]
+    row_axis_values = [
+        str(worksheet.cell(row, min_column).value).strip()
+        for row in record_rows
+    ]
+    corner_is_empty = (min_row, min_column) not in members
+    if (
+        not corner_is_empty
+        and set(row_axis_shapes) != {"text"}
+    ) or len(set(row_axis_values)) != len(row_axis_values):
+        return False
+
+    column_body_shapes = []
+    for column in measure_columns:
+        occupied_cells = [
+            worksheet.cell(row, column)
+            for row in record_rows
+            if (row, column) in members
+        ]
+        if len(occupied_cells) < 2:
+            return False
+        non_formula_shapes = {
+            _row_shape([cell.value], distinguish_text_digits=True)[0]
+            for cell in occupied_cells
+            if cell.data_type != "f" and cell.value is not None
+        }
+        if len(non_formula_shapes) > 1:
+            return False
+        column_body_shapes.append(non_formula_shapes)
+
+    return bool(column_body_shapes) and any(
+        isinstance(worksheet.cell(row, column).value, (bool, int, float))
+        for row in record_rows
+        for column in measure_columns
+        if (row, column) in members
+    )
+
+
+def _has_mixed_aggregate_rows(
+    *,
+    sheet_name: str,
+    members: set[tuple[int, int]],
+    formula_values: dict[tuple[int, int], str],
+) -> bool:
+    member_rows = _member_rows(members)
+    for (formula_row, formula_column), formula in formula_values.items():
+        if (formula_row, formula_column) not in members:
+            continue
+        ranges, unresolved = _formula_reference_ranges(formula, sheet_name)
+        if unresolved:
+            continue
+        for min_row, min_column, max_row, max_column in ranges:
+            referenced_rows = list(range(min_row, max_row + 1))
+            if (
+                len(referenced_rows) < 2
+                or max_row >= formula_row
+                or formula_row != max_row + 1
+                or formula_column < min_column
+                or formula_column > max_column
+            ):
+                continue
+            signatures = [member_rows.get(row, set()) for row in referenced_rows]
+            if signatures and signatures[0] and all(signature == signatures[0] for signature in signatures):
+                return True
+    return False
+
+
+def _has_unseparated_multiple_blocks(
+    worksheet,
+    members: set[tuple[int, int]],
+) -> bool:
+    member_rows = _member_rows(members)
+    row_ordinals = sorted(member_rows)
+    if len(row_ordinals) < 6:
+        return False
+    for repeated_index in range(3, len(row_ordinals) - 2):
+        first_row = row_ordinals[0]
+        repeated_row = row_ordinals[repeated_index]
+        if repeated_row != row_ordinals[repeated_index - 1] + 1:
+            continue
+        if member_rows[first_row] != member_rows[repeated_row]:
+            continue
+        first_values = tuple(
+            worksheet.cell(first_row, column).value for column in sorted(member_rows[first_row])
+        )
+        repeated_values = tuple(
+            worksheet.cell(repeated_row, column).value
+            for column in sorted(member_rows[repeated_row])
+        )
+        if first_values != repeated_values:
+            continue
+        before = [member_rows[row] for row in row_ordinals[1:repeated_index]]
+        after = [member_rows[row] for row in row_ordinals[repeated_index + 1 :]]
+        if len(before) >= 2 and len(after) >= 2 and len(set(map(frozenset, before + after))) == 1:
+            return True
+    return False
+
+
+def _has_visual_only_boundary(
+    worksheet,
+    members: set[tuple[int, int]],
+    structure_evidence: dict[str, Any] | None,
+) -> bool:
+    merged_coordinates = {
+        (row_ordinal, column_ordinal)
+        for merged in worksheet.merged_cells.ranges
+        for row_ordinal in range(merged.min_row, merged.max_row + 1)
+        for column_ordinal in range(merged.min_col, merged.max_col + 1)
+    }
+    if merged_coordinates & members:
+        return False
+    member_rows = _member_rows(members)
+
+    def axis_implies_boundary(
+        ordinals: list[int],
+        slot_coordinates: list[list[tuple[int, int]]],
+    ) -> bool:
+        if len(ordinals) < 4 or any(
+            right != left + 1 for left, right in zip(ordinals, ordinals[1:])
+        ):
+            return False
+        relative_geometry = [
+            tuple(
+                (row - min(row for row, _column in coordinates), column - min(column for _row, column in coordinates))
+                for row, column in coordinates
+            )
+            for coordinates in slot_coordinates
+        ]
+        if len(set(relative_geometry)) != 1:
+            return False
+        style_signatures = [
+            tuple(worksheet.cell(row, column).style_id for row, column in coordinates)
+            for coordinates in slot_coordinates
+        ]
+        if len(set(style_signatures)) < 2 or not any(
+            style_id != 0 for signature in style_signatures for style_id in signature
+        ):
+            return False
+        style_runs = []
+        for signature in style_signatures:
+            if not style_runs or style_runs[-1][0] != signature:
+                style_runs.append([signature, 1])
+            else:
+                style_runs[-1][1] += 1
+        if len(style_runs) < 2 or any(length < 2 for _signature, length in style_runs):
+            return False
+        style_boundaries = {
+            index
+            for index in range(1, len(style_signatures))
+            if style_signatures[index - 1] != style_signatures[index]
+        }
+        value_shapes = [
+            _row_shape(
+                [worksheet.cell(row, column).value for row, column in coordinates],
+                distinguish_text_digits=True,
+            )
+            for coordinates in slot_coordinates
+        ]
+        value_boundaries = {
+            index
+            for index in range(1, len(value_shapes))
+            if value_shapes[index - 1] != value_shapes[index]
+        }
+        return style_boundaries.isdisjoint(value_boundaries)
+
+    body_rows = (
+        structure_evidence["body_row_ordinals"]
+        if structure_evidence
+        else sorted(member_rows)
+    )
+    if structure_evidence and len(body_rows) < 4:
+        body_rows = sorted(member_rows)[1:]
+    row_slots = [
+        [(row, column) for column in sorted(member_rows[row])]
+        for row in body_rows
+        if row in member_rows
+    ]
+    if axis_implies_boundary(body_rows, row_slots):
+        return True
+
+    body_row_set = set(body_rows)
+    columns = sorted({column for row, column in members if row in body_row_set})
+    column_slots = [
+        [(row, column) for row in body_rows if (row, column) in members]
+        for column in columns
+    ]
+    return axis_implies_boundary(columns, column_slots)
+
+
+def _region_negative_predicates(
+    *,
+    worksheet,
+    sheet_name: str,
+    item: dict[str, Any],
+    siblings: list[dict[str, Any]],
+    formula_coordinates: set[tuple[int, int]],
+    formula_values: dict[tuple[int, int], str],
+    formula_inventory_proven: bool,
+    partial_overlap: bool,
+) -> dict[str, bool]:
+    members = item["members"]
+    member_rows = _member_rows(members)
+    row_signatures = [frozenset(columns) for columns in member_rows.values() if columns]
+    outside_record_axes = not any(
+        sibling.get("positive_rule") is not None
+        and _column_sets_intersect(item["member_columns"], sibling["member_columns"])
+        for sibling in siblings
+        if sibling is not item
+    )
+    no_repeated_slots = len(row_signatures) < 2 or len(set(row_signatures)) == len(row_signatures)
+    aggregate_rows = _has_mixed_aggregate_rows(
+        sheet_name=sheet_name,
+        members=members,
+        formula_values=formula_values,
+    )
+    return {
+        "R1": outside_record_axes
+        and no_repeated_slots
+        and item.get("structure_evidence") is None,
+        "R2": _has_hidden_record_member(
+            worksheet,
+            members,
+            item.get("structure_evidence"),
+        )
+        or (
+            not aggregate_rows
+            and _formula_is_unstable(
+                sheet_name=sheet_name,
+                members=members,
+                formula_coordinates=formula_coordinates,
+                formula_values=formula_values,
+                formula_inventory_proven=formula_inventory_proven,
+            )
+        ),
+        "R3": _is_matrix_layout(worksheet, members),
+        "R4": aggregate_rows,
+        "R5": _has_unseparated_multiple_blocks(worksheet, members),
+        "R6": partial_overlap,
+        "R7": _has_visual_only_boundary(
+            worksheet,
+            members,
+            item.get("structure_evidence"),
+        ),
+    }
+
+
+def _canonical_union_context(
+    main_rows: list[dict[str, Any]],
+    headers_by_column: dict[int, str],
+    *,
+    entry_limit: int,
+    value_bytes: int,
+) -> str:
+    existing = json.loads(main_rows[0]["table_context_list"]) if main_rows else []
+    context_only = [item for item in existing if item["name"] != "field"]
+    context = _context_with_headers(
+        context_only,
+        [headers_by_column[column] for column in sorted(headers_by_column)],
+        entry_limit=entry_limit,
+        value_bytes=value_bytes,
+    )
+    return json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+
+
+def _rekey_projected_item(
+    item: dict[str, Any],
+    *,
+    table_ordinal: int,
+    source_sha256: str,
+    producer_generation_ref: str,
+) -> None:
+    table = item["table"]
+    membership_sha256 = _region_membership_sha256(table["sheet_ordinal"], item["members"])
+    table_ref = _table_ref(
+        source_sha256,
+        table["sheet_ordinal"],
+        table_ordinal,
+        membership_sha256,
+    )
+    table["table_ref"] = table_ref
+    table["table_ordinal"] = table_ordinal
+    for row in item["rows"]:
+        row_ref = f"{table_ref}:{row['row_ordinal_int']}"
+        row["table_ref_kwd"] = table_ref
+        row["row_ref_kwd"] = row_ref
+        row["id"] = "tsr_v1_" + _versioned_digest(
+            "tabular-row-record/v1",
+            producer_generation_ref,
+            row_ref,
+        )
+
+
+def _continuation_record_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
+    data_rows = [row for row in item["rows"] if row["row_role_kwd"] == "data"]
+    if data_rows:
+        if any(row["row_role_kwd"] == "unknown" for row in item["rows"]):
+            return []
+        return data_rows
+    if item["table"]["data_row_count"] == 0:
+        return list(item["rows"])
+    return []
+
+
+def _continuation_rows_match_proven_axis(
+    *,
+    parser,
+    worksheet,
+    main: dict[str, Any],
+    continuation: dict[str, Any],
+    continuation_rows: list[dict[str, Any]],
+) -> bool:
+    main_evidence = main.get("structure_evidence")
+    if not main_evidence:
+        return False
+    shared_columns = sorted(main["member_columns"] & continuation["member_columns"])
+    if not shared_columns:
+        return False
+    merged_ranges = list(worksheet.merged_cells.ranges)
+
+    def shape(row_ordinal: int) -> tuple[tuple[str, ...], ...]:
+        return tuple(
+            _record_axis_value_shape(
+                _cell_value(parser, worksheet, row_ordinal, column, merged_ranges)
+            )
+            for column in shared_columns
+        )
+
+    proven_shapes = {
+        shape(row["row_ordinal_int"])
+        for row in main["rows"]
+        if row["row_role_kwd"] == "data"
+        and row["row_ordinal_int"] in main_evidence["body_row_ordinals"]
+    }
+    shapes_match = bool(proven_shapes) and all(
+        shape(row["row_ordinal_int"]) in proven_shapes
+        for row in continuation_rows
+    )
+    if not shapes_match or len(continuation_rows) != 1:
+        return shapes_match
+
+    anchor_column = shared_columns[0]
+    main_anchor_shapes = {
+        _text_structure(
+            _cell_value(
+                parser,
+                worksheet,
+                row["row_ordinal_int"],
+                anchor_column,
+                merged_ranges,
+            )
+        )
+        for row in main["rows"]
+        if row["row_role_kwd"] == "data"
+        and row["row_ordinal_int"] in main_evidence["body_row_ordinals"]
+    }
+    continuation_anchor_shape = _text_structure(
+        _cell_value(
+            parser,
+            worksheet,
+            continuation_rows[0]["row_ordinal_int"],
+            anchor_column,
+            merged_ranges,
+        )
+    )
+    return (
+        main_anchor_shapes == {continuation_anchor_shape}
+        and any(kind in {"digit", "symbol"} for kind in continuation_anchor_shape)
+    )
+
+
+def _merge_continuation_pair(
+    *,
+    parser,
+    worksheet,
+    main: dict[str, Any],
+    continuation: dict[str, Any],
+    source_sha256: str,
+    producer_generation_ref: str,
+    table_context_entry_limit: int,
+    table_context_value_bytes: int,
+) -> dict[str, Any] | None:
+    main_total = main["table"]["source_total_count"]
+    if main_total is None or main["bbox"][2] >= continuation["bbox"][0]:
+        return None
+    main_columns = main["member_columns"]
+    continuation_columns = continuation["member_columns"]
+    if not _column_sets_are_nested(main_columns, continuation_columns):
+        return None
+    if (
+        continuation["table"]["source_total_count"] is not None
+        and main_columns == continuation_columns
+    ):
+        return None
+    continuation_rows = _continuation_record_rows(continuation)
+    if not continuation_rows or len(continuation_columns) < 2:
+        return None
+
+    main_evidence = main.get("structure_evidence")
+    if not main_evidence:
+        return None
+    headers_by_column = dict(main_evidence["headers_by_column"])
+    continuation_evidence = continuation.get("structure_evidence")
+    if continuation["table"]["data_row_count"] == 0 and continuation_evidence is not None:
+        return None
+    named_continuation = (
+        continuation["table"]["data_row_count"] == len(continuation_rows)
+        and continuation_evidence is not None
+        and set(continuation_evidence["body_row_ordinals"])
+        == {row["row_ordinal_int"] for row in continuation_rows}
+    )
+    if (
+        named_continuation
+        and len(continuation_rows) > 1
+        and continuation.get("positive_rule") is None
+    ):
+        return None
+    if named_continuation:
+        continuation_headers = continuation_evidence["headers_by_column"]
+        if any(
+            column in headers_by_column
+            and headers_by_column[column] != continuation_headers.get(column)
+            for column in main_columns & continuation_columns
+        ):
+            return None
+        headers_by_column.update(continuation_headers)
+    elif not _continuation_rows_match_proven_axis(
+        parser=parser,
+        worksheet=worksheet,
+        main=main,
+        continuation=continuation,
+        continuation_rows=continuation_rows,
+    ):
+        return None
+
+    missing_names = {
+        column
+        for column in continuation_columns
+        if column not in headers_by_column
+        or not headers_by_column[column]
+        or headers_by_column[column].startswith("Column_")
+    }
+    is_unnamed_superset = bool(continuation_columns - main_columns) and bool(missing_names)
+    if missing_names and not is_unnamed_superset:
+        return None
+    if not named_continuation and len(continuation_rows) > 1 and not _members_prove_repeated_axis(
+        continuation["members"]
+    ):
+        return None
+
+    table_ref = _table_ref(
+        source_sha256,
+        main["table"]["sheet_ordinal"],
+        main["table"]["table_ordinal"],
+        _region_membership_sha256(
+            main["table"]["sheet_ordinal"],
+            main["members"] | continuation["members"],
+        ),
+    )
+    context = _canonical_union_context(
+        main["rows"],
+        headers_by_column,
+        entry_limit=table_context_entry_limit,
+        value_bytes=table_context_value_bytes,
+    )
+    rows = [dict(row) for row in main["rows"]]
+    for source_row in continuation_rows:
+        row = dict(source_row)
+        row_fields = []
+        for column in sorted(
+            column
+            for member_row, column in continuation["members"]
+            if member_row == row["row_ordinal_int"]
+        ):
+            if column not in headers_by_column:
+                continue
+            value = _cell_value(
+                parser,
+                worksheet,
+                row["row_ordinal_int"],
+                column,
+                list(worksheet.merged_cells.ranges),
+            )
+            row_fields.extend(
+                _ordered_fields([headers_by_column[column]], [value], note=False)
+            )
+        row["ordered_fields_list"] = json.dumps(
+            row_fields,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if not is_unnamed_superset:
+            row["row_role_kwd"] = "data"
+        rows.append(row)
+
+    rows.sort(key=lambda row: row["row_ordinal_int"])
+    data_index = 0
+    for row in rows:
+        row["table_ref_kwd"] = table_ref
+        row["table_context_list"] = context
+        if row["row_role_kwd"] == "data":
+            data_index += 1
+            row["data_row_index_int"] = data_index
+        else:
+            row["data_row_index_int"] = None
+
+    table = dict(main["table"])
+    table.update(
+        {
+            "table_ref": table_ref,
+            "row_count": len(rows),
+            "data_row_count": data_index,
+            "source_total_count": None if is_unnamed_superset else data_index,
+        }
+    )
+    _apply_enumeration_decision(table, "D1" if is_unnamed_superset else "L1-02")
+    for row in rows:
+        row["source_total_count_int"] = table["source_total_count"]
+        row_ref = f"{table_ref}:{row['row_ordinal_int']}"
+        row["row_ref_kwd"] = row_ref
+        row["id"] = "tsr_v1_" + _versioned_digest(
+            "tabular-row-record/v1",
+            producer_generation_ref,
+            row_ref,
+        )
+
+    members = main["members"] | continuation["members"]
+    structure_evidence = {
+        "headers_by_column": headers_by_column,
+        "body_row_ordinals": sorted(
+            set(main_evidence["body_row_ordinals"])
+            | {row["row_ordinal_int"] for row in continuation_rows}
+        ),
+        "header_depth": main_evidence["header_depth"],
+    }
+    source_components = {
+        **main["source_components"],
+        **continuation["source_components"],
+    }
+    return {
+        "table": table,
+        "rows": rows,
+        "bbox": (
+            min(main["bbox"][0], continuation["bbox"][0]),
+            min(main["bbox"][1], continuation["bbox"][1]),
+            max(main["bbox"][2], continuation["bbox"][2]),
+            max(main["bbox"][3], continuation["bbox"][3]),
+        ),
+        "members": members,
+        "member_columns": {column for _row, column in members},
+        "structure_evidence": structure_evidence,
+        "positive_rule": None if is_unnamed_superset else "L1-02",
+        "source_components": source_components,
+        "emitted_member_events": [
+            *main["emitted_member_events"],
+            *continuation["emitted_member_events"],
+        ],
+        "proven_record_slots": (
+            []
+            if is_unnamed_superset
+            else [
+                *main["proven_record_slots"],
+                *(row["row_ordinal_int"] for row in continuation_rows),
+            ]
+        ),
+    }
+
+
+def _apply_projection_invariants(
+    projected: list[dict[str, Any]],
+    source_regions: dict[tuple[int, int], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    assignments = Counter(
+        source_region_key
+        for item in projected
+        for source_region_key in item["source_components"]
+    )
+
+    for item in projected:
+        expected_members = set().union(*item["source_components"].values())
+        expected_events = Counter(expected_members)
+        actual_events = Counter(item["emitted_member_events"])
+        membership_closed = (
+            item["members"] == expected_members
+            and actual_events == expected_events
+            and all(assignments[key] == 1 for key in item["source_components"])
+        )
+        if not membership_closed:
+            item["positive_rule"] = None
+            _clear_complete_decision(item["table"], item["rows"], "D2")
+            continue
+
+        if item["positive_rule"] is None:
+            continue
+        data_rows = [row for row in item["rows"] if row["row_role_kwd"] == "data"]
+        proven_slots = item["proven_record_slots"]
+        record_count_closed = (
+            len(proven_slots) == len(set(proven_slots))
+            and len(proven_slots) == len(data_rows)
+            and proven_slots == [row["row_ordinal_int"] for row in data_rows]
+            and item["table"]["data_row_count"] == len(data_rows)
+            and item["table"]["source_total_count"] == len(proven_slots)
+            and [row["data_row_index_int"] for row in data_rows]
+            == list(range(1, len(data_rows) + 1))
+        )
+        if record_count_closed:
+            continue
+        item["positive_rule"] = None
+        item["table"]["data_row_count"] = len(data_rows)
+        for data_index, row in enumerate(data_rows, start=1):
+            row["data_row_index_int"] = data_index
+        _clear_complete_decision(item["table"], item["rows"], "D3")
+
+    defects = []
+    for source_region_key, region in source_regions.items():
+        if assignments[source_region_key] != 0:
+            continue
+        sheet_ordinal, source_region_ordinal = source_region_key
+        status, reason = ENUMERATION_DECISIONS["D4"]
+        defects.append(
+            {
+                "row_kind": "defect_tombstone",
+                "table_ref": None,
+                "sheet_ordinal": sheet_ordinal,
+                "source_region_ordinal": source_region_ordinal,
+                "membership_sha256": region["membership_sha256"],
+                "enumeration_status": status,
+                "enumeration_reason": reason,
+                "matched_rule": "D4",
+            }
+        )
+    return defects
+
+
+def _validate_tabular_structure_producer_audit(audit: dict[str, Any]) -> None:
+    expected_fields = {
+        "version",
+        "producer_generation_ref",
+        "enumeration_rule_version",
+        "source_sha256",
+        "source_regions",
+        "output_objects",
+        "defects",
+    }
+    if not isinstance(audit, dict) or set(audit) != expected_fields:
+        raise ValueError("producer audit does not match the fixed schema")
+    if audit["version"] != "tabular-structure-producer-audit/v1":
+        raise ValueError("unsupported producer audit version")
+    _validate_generation_ref(audit["producer_generation_ref"])
+    if audit["enumeration_rule_version"] != ENUMERATION_RULE_VERSION:
+        raise ValueError("unsupported producer audit enumeration rule version")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(audit["source_sha256"])):
+        raise ValueError("producer audit source SHA-256 is invalid")
+    if not isinstance(audit["defects"], list):
+        raise ValueError("producer audit defects must be a list")
+
+    source_regions = audit["source_regions"]
+    output_objects = audit["output_objects"]
+    if not isinstance(source_regions, list) or not isinstance(output_objects, list):
+        raise ValueError("producer audit source/output evidence must be lists")
+    source_by_ref = {}
+    source_ordinals_by_sheet: dict[int, list[int]] = {}
+    for source in source_regions:
+        expected_source_fields = {
+            "source_region_ref",
+            "worksheet_ordinal",
+            "bbox",
+            "row_count",
+            "column_count",
+            "membership_sha256",
+            "member_count",
+            "member_coordinate_set",
+            "assigned_object_ref",
+            "assignment_count",
+        }
+        if not isinstance(source, dict) or set(source) != expected_source_fields:
+            raise ValueError("producer audit source region does not match the fixed schema")
+        source_ref = source["source_region_ref"]
+        if not isinstance(source_ref, str) or source_ref in source_by_ref:
+            raise ValueError("producer audit source region references are not unique")
+        source_ref_match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", source_ref)
+        if (
+            source_ref_match is None
+            or int(source_ref_match.group(1)) != source["worksheet_ordinal"]
+        ):
+            raise ValueError("producer audit source region reference is inconsistent")
+        source_ordinals_by_sheet.setdefault(source["worksheet_ordinal"], []).append(
+            int(source_ref_match.group(2))
+        )
+        source_by_ref[source_ref] = source
+        if (
+            not isinstance(source["assignment_count"], int)
+            or isinstance(source["assignment_count"], bool)
+            or source["assignment_count"] < 0
+        ):
+            raise ValueError("producer audit source assignment count is invalid")
+        if source["assigned_object_ref"] is not None and not isinstance(
+            source["assigned_object_ref"], str
+        ):
+            raise ValueError("producer audit source object reference is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(source["membership_sha256"])):
+            raise ValueError("producer audit source membership SHA-256 is invalid")
+        member_coordinates = source["member_coordinate_set"]
+        if (
+            not isinstance(member_coordinates, list)
+            or any(not isinstance(value, str) for value in member_coordinates)
+            or member_coordinates
+            != sorted(set(member_coordinates), key=_audit_coordinate_key)
+        ):
+            raise ValueError("producer audit source members are not a deterministic set")
+        expected_membership = hashlib.sha256(
+            "\n".join(member_coordinates).encode("ascii")
+        ).hexdigest()
+        if (
+            source["membership_sha256"] != expected_membership
+            or source["member_count"] != len(member_coordinates)
+        ):
+            raise ValueError("producer audit source membership closure is invalid")
+        parsed_members = [_audit_coordinate_key(value) for value in member_coordinates]
+        member_rows = {row for sheet, row, _column in parsed_members}
+        member_columns = {column for sheet, _row, column in parsed_members}
+        if (
+            not parsed_members
+            or any(sheet != source["worksheet_ordinal"] for sheet, _row, _column in parsed_members)
+            or source["bbox"]
+            != [min(member_rows), min(member_columns), max(member_rows), max(member_columns)]
+            or source["row_count"] != len(member_rows)
+            or source["column_count"] != len(member_columns)
+        ):
+            raise ValueError("producer audit source geometry is inconsistent")
+    if any(
+        ordinals != list(range(1, len(ordinals) + 1))
+        for ordinals in source_ordinals_by_sheet.values()
+    ):
+        raise ValueError("producer audit source region references are not contiguous")
+
+    output_refs = set()
+    real_assignments = Counter()
+    object_ordinals_by_sheet: Counter[int] = Counter()
+    tombstone_components = []
+    for output in output_objects:
+        required_output_fields = {
+            "row_kind",
+            "object_ref",
+            "worksheet_ordinal",
+            "component_region_refs",
+            "component_membership_sha256_list",
+            "union_membership_sha256",
+            "union_member_count",
+            "emitted_member_coordinate_multiset",
+            "emitted_cell_multiset_sha256",
+            "emitted_member_occurrence_count",
+            "member_max_ingest_count",
+            "record_slot_sha256",
+            "proven_record_slot_count",
+            "record_slot_coordinate_sets",
+            "emitted_data_row_ordinals",
+            "enumeration_rule_version",
+            "structure_generation_ref",
+            "table_ref",
+            "identity_validation_status",
+            "matched_rule",
+            "decision_chain_stop",
+            "enumeration_status",
+            "enumeration_reason",
+            "covered_count",
+            "source_total_count",
+        }
+        if not isinstance(output, dict) or set(output) != required_output_fields:
+            raise ValueError("producer audit output object does not match the fixed schema")
+        if output["row_kind"] == "object":
+            if not isinstance(output["object_ref"], str) or output["object_ref"] in output_refs:
+                raise ValueError("producer audit object references are not unique")
+            output_refs.add(output["object_ref"])
+            if output["table_ref"] != output["object_ref"]:
+                raise ValueError("producer audit object table identity is inconsistent")
+            object_ordinals_by_sheet[output["worksheet_ordinal"]] += 1
+            object_ordinal = object_ordinals_by_sheet[output["worksheet_ordinal"]]
+        elif output["row_kind"] == "defect_tombstone":
+            if output["object_ref"] is not None or output["table_ref"] is not None:
+                raise ValueError("producer audit tombstone cannot fabricate an object identity")
+            object_ordinal = None
+        else:
+            raise ValueError("producer audit output row kind is invalid")
+        if output["structure_generation_ref"] != audit["producer_generation_ref"]:
+            raise ValueError("producer audit output generation is inconsistent")
+        if output["enumeration_rule_version"] != audit["enumeration_rule_version"]:
+            raise ValueError("producer audit output rule version is inconsistent")
+        if output["identity_validation_status"] != "pending_independent_validation":
+            raise ValueError("producer audit identity validation status is invalid")
+        component_refs = output["component_region_refs"]
+        if not isinstance(component_refs, list) or not component_refs:
+            raise ValueError("producer audit output components are missing")
+        if any(ref not in source_by_ref for ref in component_refs):
+            raise ValueError("producer audit output references an unknown source region")
+        if component_refs != sorted(
+            set(component_refs),
+            key=lambda ref: tuple(int(part) for part in ref.split(":")),
+        ):
+            raise ValueError("producer audit component references are not numerically ordered")
+        if output["row_kind"] == "defect_tombstone" and output["matched_rule"] != "D4":
+            raise ValueError("producer audit tombstone rule is invalid")
+        decision = ENUMERATION_DECISIONS.get(output["matched_rule"])
+        if decision != (output["enumeration_status"], output["enumeration_reason"]):
+            raise ValueError("producer audit output decision is invalid")
+        if output["decision_chain_stop"] != output["matched_rule"]:
+            raise ValueError("producer audit decision chain stop is inconsistent")
+        if (output["enumeration_status"] == "supported_complete") != (
+            output["source_total_count"] is not None
+        ):
+            raise ValueError("producer audit decision conflicts with source total")
+
+        component_sources = [source_by_ref[ref] for ref in component_refs]
+        if any(
+            source["worksheet_ordinal"] != output["worksheet_ordinal"]
+            for source in component_sources
+        ):
+            raise ValueError("producer audit output worksheet does not match its components")
+        if output["component_membership_sha256_list"] != [
+            source["membership_sha256"] for source in component_sources
+        ]:
+            raise ValueError("producer audit component membership closure is invalid")
+        component_coordinate_sets = [
+            set(source["member_coordinate_set"]) for source in component_sources
+        ]
+        if output["enumeration_status"] == "supported_complete" and any(
+            left & right
+            for index, left in enumerate(component_coordinate_sets)
+            for right in component_coordinate_sets[index + 1 :]
+        ):
+            raise ValueError("producer audit complete component memberships are not disjoint")
+        union_coordinates = sorted(
+            {
+                coordinate
+                for coordinates in component_coordinate_sets
+                for coordinate in coordinates
+            },
+            key=_audit_coordinate_key,
+        )
+        union_digest = hashlib.sha256("\n".join(union_coordinates).encode("ascii")).hexdigest()
+        if (
+            output["union_membership_sha256"] != union_digest
+            or output["union_member_count"] != len(union_coordinates)
+        ):
+            raise ValueError("producer audit union membership closure is invalid")
+        if output["row_kind"] == "object" and output["table_ref"] != _table_ref(
+            audit["source_sha256"],
+            output["worksheet_ordinal"],
+            object_ordinal,
+            union_digest,
+        ):
+            raise ValueError("producer audit table identity is inconsistent")
+
+        emitted = output["emitted_member_coordinate_multiset"]
+        if (
+            not isinstance(emitted, list)
+            or any(not isinstance(value, str) for value in emitted)
+            or emitted != sorted(emitted, key=_audit_coordinate_key)
+        ):
+            raise ValueError("producer audit emitted member events are not deterministic")
+        emitted_counts = Counter(emitted)
+        if (
+            output["emitted_cell_multiset_sha256"]
+            != _audit_digest("adr039-emitted-cell-multiset/v1", emitted)
+            or output["emitted_member_occurrence_count"] != len(emitted)
+            or output["member_max_ingest_count"] != max(emitted_counts.values(), default=0)
+        ):
+            raise ValueError("producer audit emitted member closure is invalid")
+        membership_is_closed = (
+            output["member_max_ingest_count"] == 1
+            and output["emitted_member_occurrence_count"] == output["union_member_count"]
+            and set(emitted) == set(union_coordinates)
+        )
+        component_assignment_is_closed = all(
+            sum(
+                candidate.get("row_kind") == "object"
+                and ref in candidate.get("component_region_refs", [])
+                for candidate in output_objects
+                if isinstance(candidate, dict)
+            )
+            == 1
+            for ref in component_refs
+        )
+        d2_evidence = not membership_is_closed or not component_assignment_is_closed
+        if output["row_kind"] == "object" and output["matched_rule"] == "D2" and not d2_evidence:
+            raise ValueError("producer audit D2 defect decision does not match its evidence")
+        if output["row_kind"] == "object" and d2_evidence and output["matched_rule"] != "D2":
+            if not membership_is_closed:
+                raise ValueError("producer audit unclosed membership must reach D2")
+            raise ValueError("producer audit multiple assignments must reach D2")
+
+        record_slots = output["record_slot_coordinate_sets"]
+        emitted_data_row_ordinals = output["emitted_data_row_ordinals"]
+        if (
+            not isinstance(emitted_data_row_ordinals, list)
+            or any(
+                not isinstance(row_ordinal, int)
+                or isinstance(row_ordinal, bool)
+                or row_ordinal < 1
+                for row_ordinal in emitted_data_row_ordinals
+            )
+            or emitted_data_row_ordinals != sorted(set(emitted_data_row_ordinals))
+        ):
+            raise ValueError("producer audit emitted data rows are not deterministic")
+        if output["row_kind"] == "defect_tombstone" and emitted_data_row_ordinals:
+            raise ValueError("producer audit tombstone cannot emit data rows")
+        if (
+            not isinstance(record_slots, list)
+            or any(
+                not isinstance(slot, list)
+                or any(not isinstance(value, str) for value in slot)
+                or slot != sorted(set(slot), key=_audit_coordinate_key)
+                for slot in record_slots
+            )
+        ):
+            raise ValueError("producer audit record slots are not deterministic sets")
+        record_slot_lines = ["|".join(slot) for slot in record_slots]
+        if (
+            output["record_slot_sha256"]
+            != _audit_digest("adr039-record-slot/v1", record_slot_lines)
+            or output["proven_record_slot_count"] != len(record_slots)
+        ):
+            raise ValueError("producer audit record slot closure is invalid")
+
+        union_coordinate_set = set(union_coordinates)
+        slot_row_ordinals = []
+        record_slot_geometry_is_closed = True
+        for slot in record_slots:
+            parsed_slot = [_audit_coordinate_key(coordinate) for coordinate in slot]
+            slot_rows = {row_ordinal for _sheet, row_ordinal, _column in parsed_slot}
+            if not slot or not set(slot).issubset(union_coordinate_set) or len(slot_rows) != 1:
+                record_slot_geometry_is_closed = False
+                continue
+            slot_row_ordinal = next(iter(slot_rows))
+            expected_slot = {
+                coordinate
+                for coordinate in union_coordinate_set
+                if _audit_coordinate_key(coordinate)[1] == slot_row_ordinal
+            }
+            if set(slot) != expected_slot:
+                record_slot_geometry_is_closed = False
+            slot_row_ordinals.append(slot_row_ordinal)
+        record_slot_geometry_is_closed = (
+            record_slot_geometry_is_closed
+            and len(slot_row_ordinals) == len(set(slot_row_ordinals))
+            and slot_row_ordinals == sorted(slot_row_ordinals)
+        )
+        record_slots_match_data_rows = slot_row_ordinals == emitted_data_row_ordinals
+        if output["enumeration_status"] == "supported_complete" and not record_slot_geometry_is_closed:
+            if any(not set(slot).issubset(union_coordinate_set) for slot in record_slots):
+                raise ValueError("producer audit record slot is outside the union membership")
+            if len(slot_row_ordinals) != len(set(slot_row_ordinals)):
+                raise ValueError("producer audit complete record slots are not unique")
+            raise ValueError("producer audit record slot is not the complete source row")
+        if output["enumeration_status"] == "supported_complete" and not record_slots_match_data_rows:
+            raise ValueError("producer audit record slots do not match emitted data rows")
+        record_count_is_closed = (
+            record_slot_geometry_is_closed
+            and record_slots_match_data_rows
+            and output["covered_count"] == output["proven_record_slot_count"]
+        )
+        d3_evidence = (
+            not d2_evidence
+            and output["proven_record_slot_count"] > 0
+            and not record_count_is_closed
+        )
+        if output["row_kind"] == "object" and output["matched_rule"] == "D3" and not d3_evidence:
+            raise ValueError("producer audit D3 defect decision does not match its evidence")
+        if output["row_kind"] == "object" and d3_evidence and output["matched_rule"] != "D3":
+            raise ValueError("producer audit record count evidence must reach D3")
+        if output["row_kind"] == "object" and output["matched_rule"] == "D4":
+            raise ValueError("producer audit D4 defect decision lacks tombstone evidence")
+
+        if output["row_kind"] == "object":
+            real_assignments.update(component_refs)
+        else:
+            tombstone_components.extend(component_refs)
+
+        if output["enumeration_status"] == "supported_complete":
+            if (
+                not membership_is_closed
+                or not record_count_is_closed
+                or output["covered_count"] != output["source_total_count"]
+            ):
+                raise ValueError("producer audit supported object is not closed")
+
+    zero_assignment_refs = {
+        source_ref
+        for source_ref, source in source_by_ref.items()
+        if source["assignment_count"] == 0
+    }
+    if set(tombstone_components) != zero_assignment_refs or len(tombstone_components) != len(
+        zero_assignment_refs
+    ):
+        raise ValueError("producer audit tombstone assignment closure is inconsistent")
+    for source_ref, source in source_by_ref.items():
+        assignment_count = real_assignments[source_ref]
+        assigned_outputs = [
+            output
+            for output in output_objects
+            if output["row_kind"] == "object"
+            and source_ref in output["component_region_refs"]
+        ]
+        if assignment_count > 1 and any(
+            output["matched_rule"] != "D2" for output in assigned_outputs
+        ):
+            raise ValueError("producer audit multiple assignments must reach D2")
+        expected_object_ref = next(
+            (
+                output["object_ref"]
+                for output in assigned_outputs
+            ),
+            None,
+        ) if assignment_count == 1 else None
+        if (
+            source["assignment_count"] != assignment_count
+            or source["assigned_object_ref"] != expected_object_ref
+        ):
+            raise ValueError("producer audit source/output assignment closure is inconsistent")
+
+    coordinates = []
+    for defect in audit["defects"]:
+        expected_defect_fields = {
+            "row_kind",
+            "table_ref",
+            "sheet_ordinal",
+            "source_region_ordinal",
+            "membership_sha256",
+            "enumeration_status",
+            "enumeration_reason",
+            "matched_rule",
+        }
+        if not isinstance(defect, dict) or set(defect) != expected_defect_fields:
+            raise ValueError("producer audit tombstone does not match the fixed schema")
+        if defect["row_kind"] != "defect_tombstone" or defect["table_ref"] is not None:
+            raise ValueError("producer audit tombstone cannot fabricate an object identity")
+        for field_name in ("sheet_ordinal", "source_region_ordinal"):
+            value = defect[field_name]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError("producer audit tombstone ordinals must be positive integers")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(defect["membership_sha256"])):
+            raise ValueError("producer audit tombstone membership SHA-256 is invalid")
+        decision = ENUMERATION_DECISIONS.get(defect["matched_rule"])
+        if defect["matched_rule"] != "D4" or decision != (
+            defect["enumeration_status"],
+            defect["enumeration_reason"],
+        ):
+            raise ValueError("producer audit tombstone decision is invalid")
+        source_ref = f"{defect['sheet_ordinal']}:{defect['source_region_ordinal']}"
+        if (
+            source_ref not in source_by_ref
+            or defect["membership_sha256"] != source_by_ref[source_ref]["membership_sha256"]
+        ):
+            raise ValueError("producer audit D4 defect does not match its source region")
+        coordinates.append((defect["sheet_ordinal"], defect["source_region_ordinal"]))
+    if coordinates != sorted(set(coordinates)):
+        raise ValueError("producer audit tombstones are not unique deterministic source regions")
+    defect_coordinates = {
+        (defect["sheet_ordinal"], defect["source_region_ordinal"])
+        for defect in audit["defects"]
+    }
+    tombstone_coordinates = {
+        tuple(int(part) for part in source_ref.split(":"))
+        for source_ref in tombstone_components
+    }
+    if defect_coordinates != tombstone_coordinates:
+        raise ValueError("producer audit D4 defects do not match their tombstones")
+
+
+def _audit_coordinate_strings(
+    sheet_ordinal: int,
+    coordinates: set[tuple[int, int]] | list[tuple[int, int]],
+) -> list[str]:
+    return [
+        f"{sheet_ordinal}:{row_ordinal}:{column_ordinal}"
+        for row_ordinal, column_ordinal in sorted(coordinates)
+    ]
+
+
+def _audit_coordinate_key(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*):([1-9][0-9]*)", value)
+    if not match:
+        raise ValueError("producer audit coordinate is invalid")
+    return tuple(int(part) for part in match.groups())
+
+
+def _audit_digest(kind: str, values: list[str]) -> str:
+    return hashlib.sha256("\n".join([kind, *values]).encode("utf-8")).hexdigest()
+
+
+def _audit_output_object(
+    item: dict[str, Any],
+    *,
+    producer_generation_ref: str,
+    enumeration_rule_version: str,
+) -> dict[str, Any]:
+    table = item["table"]
+    sheet_ordinal = table["sheet_ordinal"]
+    member_events = _audit_coordinate_strings(sheet_ordinal, item["emitted_member_events"])
+    record_slot_coordinates = [
+        _audit_coordinate_strings(
+            sheet_ordinal,
+            {
+                coordinate
+                for coordinate in item["members"]
+                if coordinate[0] == row_ordinal
+            },
+        )
+        for row_ordinal in item["proven_record_slots"]
+    ]
+    record_slot_lines = ["|".join(coordinates) for coordinates in record_slot_coordinates]
+    component_refs = [
+        f"{source_sheet}:{source_ordinal}"
+        for source_sheet, source_ordinal in sorted(item["source_components"])
+    ]
+    component_digests = [
+        _region_membership_sha256(source_sheet, item["source_components"][key])
+        for key in sorted(item["source_components"])
+        for source_sheet in [key[0]]
+    ]
+    event_counts = Counter(member_events)
+    table_ref = table["table_ref"]
+    data_row_ordinals = {
+        row["row_ordinal_int"]
+        for row in item["rows"]
+        if row["row_role_kwd"] == "data"
+    }
+    covered_count = (
+        sum(row_ordinal in data_row_ordinals for row_ordinal in item["proven_record_slots"])
+        if table["matched_rule"] == "D3"
+        else table["data_row_count"]
+    )
+    return {
+        "row_kind": "object",
+        "object_ref": table_ref,
+        "worksheet_ordinal": sheet_ordinal,
+        "component_region_refs": component_refs,
+        "component_membership_sha256_list": component_digests,
+        "union_membership_sha256": _region_membership_sha256(sheet_ordinal, item["members"]),
+        "union_member_count": len(item["members"]),
+        "emitted_member_coordinate_multiset": member_events,
+        "emitted_cell_multiset_sha256": _audit_digest(
+            "adr039-emitted-cell-multiset/v1",
+            member_events,
+        ),
+        "emitted_member_occurrence_count": len(member_events),
+        "member_max_ingest_count": max(event_counts.values(), default=0),
+        "record_slot_sha256": _audit_digest(
+            "adr039-record-slot/v1",
+            record_slot_lines,
+        ),
+        "proven_record_slot_count": len(record_slot_coordinates),
+        "record_slot_coordinate_sets": record_slot_coordinates,
+        "emitted_data_row_ordinals": sorted(data_row_ordinals),
+        "enumeration_rule_version": enumeration_rule_version,
+        "structure_generation_ref": producer_generation_ref,
+        "table_ref": table_ref,
+        "identity_validation_status": "pending_independent_validation",
+        "matched_rule": table["matched_rule"],
+        "decision_chain_stop": table["matched_rule"],
+        "enumeration_status": table["enumeration_status"],
+        "enumeration_reason": table["enumeration_reason"],
+        "covered_count": covered_count,
+        "source_total_count": table["source_total_count"],
+    }
+
+
+def _audit_d4_object(
+    defect: dict[str, Any],
+    *,
+    source_region: dict[str, Any],
+    producer_generation_ref: str,
+    enumeration_rule_version: str,
+) -> dict[str, Any]:
+    sheet_ordinal = defect["sheet_ordinal"]
+    member_coordinates = set(source_region["members"])
+    component_ref = f"{sheet_ordinal}:{defect['source_region_ordinal']}"
+    return {
+        "row_kind": "defect_tombstone",
+        "object_ref": None,
+        "worksheet_ordinal": sheet_ordinal,
+        "component_region_refs": [component_ref],
+        "component_membership_sha256_list": [source_region["membership_sha256"]],
+        "union_membership_sha256": source_region["membership_sha256"],
+        "union_member_count": len(member_coordinates),
+        "emitted_member_coordinate_multiset": [],
+        "emitted_cell_multiset_sha256": _audit_digest(
+            "adr039-emitted-cell-multiset/v1",
+            [],
+        ),
+        "emitted_member_occurrence_count": 0,
+        "member_max_ingest_count": 0,
+        "record_slot_sha256": _audit_digest("adr039-record-slot/v1", []),
+        "proven_record_slot_count": 0,
+        "record_slot_coordinate_sets": [],
+        "emitted_data_row_ordinals": [],
+        "enumeration_rule_version": enumeration_rule_version,
+        "structure_generation_ref": producer_generation_ref,
+        "table_ref": None,
+        "identity_validation_status": "pending_independent_validation",
+        "matched_rule": "D4",
+        "decision_chain_stop": "D4",
+        "enumeration_status": "defect",
+        "enumeration_reason": "missing_projection",
+        "covered_count": 0,
+        "source_total_count": None,
+    }
 
 
 def _unknown_structure_region(
@@ -1135,15 +2690,16 @@ def _unknown_structure_region(
     return table, rows
 
 
-def build_tabular_structure_projection(
+def _build_tabular_structure_projection_with_audit(
     filename: str,
     binary: bytes,
     *,
     producer_generation_ref: str | None = None,
+    adr044_conversion_receipt: dict[str, str] | None = None,
     table_context_entry_limit: int = DEFAULT_CONTEXT_ENTRY_LIMIT,
     table_context_value_bytes: int = DEFAULT_CONTEXT_VALUE_BYTES,
     parser=None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build one immutable generation from complete workbook bytes.
 
     The returned records are a derived read model. They contain no vectors and
@@ -1161,11 +2717,24 @@ def build_tabular_structure_projection(
         from rag.app.table import Excel
 
         parser = Excel()
+    converted_source_sha256 = hashlib.sha256(binary).hexdigest()
+    has_adr044_receipt = _validate_adr044_conversion_receipt(
+        adr044_conversion_receipt,
+        converted_source_sha256,
+    )
+    source_sha256 = (
+        adr044_conversion_receipt["original_source_sha256"]
+        if has_adr044_receipt
+        else converted_source_sha256
+    )
     workbook = parser._load_excel_to_workbook(BytesIO(binary))
     formula_coordinates, formula_inventory_proven = _formula_coordinates_by_sheet(binary)
-    source_sha256 = hashlib.sha256(binary).hexdigest()
+    formula_values = _formula_values_by_sheet(binary)
     records = []
     tables = []
+    defects = []
+    audit_source_regions = []
+    audit_output_objects = []
 
     for sheet_ordinal, sheet_name in enumerate(workbook.sheetnames, start=1):
         worksheet = workbook[sheet_name]
@@ -1173,6 +2742,11 @@ def build_tabular_structure_projection(
             formula_coordinates[sheet_ordinal - 1]
             if sheet_ordinal <= len(formula_coordinates)
             else set()
+        )
+        sheet_formula_values = (
+            formula_values[sheet_ordinal - 1]
+            if sheet_ordinal <= len(formula_values)
+            else {}
         )
         regions = _worksheet_structure_regions(
             parser,
@@ -1192,11 +2766,11 @@ def build_tabular_structure_projection(
             # the exact G2 member set as one unknown candidate until a governed
             # adjudicator can decide whether it contains one object or several.
             candidates.append((region, True))
+        source_regions = {
+            (sheet_ordinal, region_index): region
+            for region_index, (region, _force_unknown_total) in enumerate(candidates, start=1)
+        }
 
-        sheet_has_unresolved = any(
-            region["unresolved_members"] or region["has_unbound_unresolved"]
-            for region in regions
-        )
         for region_index, (region, force_unknown_total) in enumerate(candidates, start=1):
             region_worksheet, row_offset = _copy_structure_region(parser, worksheet, region)
             result = _project_structure_region(
@@ -1213,7 +2787,6 @@ def build_tabular_structure_projection(
                 table_context_value_bytes=table_context_value_bytes,
                 force_unknown_total=(
                     force_unknown_total
-                    or sheet_has_unresolved
                     or not formula_inventory_proven
                 ),
             )
@@ -1234,13 +2807,19 @@ def build_tabular_structure_projection(
                 continue
             table, table_rows = result
             projected.append(
-                {
-                    "table": table,
-                    "rows": table_rows,
-                    "bbox": region["bbox"],
-                    "members": region["members"],
-                    "member_columns": {column for _row, column in region["members"]},
-                }
+                _new_projected_item(
+                    parser=parser,
+                    worksheet=worksheet,
+                    region=region,
+                    source_region_key=(sheet_ordinal, region_index),
+                    table=table,
+                    rows=table_rows,
+                    positive_rule=(
+                        table["matched_rule"]
+                        if table["source_total_count"] is not None
+                        else None
+                    ),
+                )
             )
 
         if unprojected:
@@ -1260,39 +2839,131 @@ def build_tabular_structure_projection(
                     continue
                 table, table_rows = result
                 projected.append(
-                    {
-                        "table": table,
-                        "rows": table_rows,
-                        "bbox": region["bbox"],
-                        "members": region["members"],
-                        "member_columns": {column for _row, column in region["members"]},
-                    }
+                    _new_projected_item(
+                        parser=parser,
+                        worksheet=worksheet,
+                        region=region,
+                        source_region_key=(sheet_ordinal, region_index),
+                        table=table,
+                        rows=table_rows,
+                        positive_rule=None,
+                    )
                 )
 
-        # A wholly unknown sibling with nested physical columns may be a split
-        # continuation. This is a completeness risk, not an object adjudication.
-        continuation_unknown = any(
-            item["table"]["data_row_count"] == 0
-            and (
-                _members_prove_repeated_axis(item["members"])
-                or any(
-                    _column_sets_intersect(
-                        item["member_columns"],
-                        sibling["member_columns"],
+        changed = True
+        while changed:
+            changed = False
+            for continuation in sorted(projected, key=lambda item: item["bbox"]):
+                candidates = []
+                for main in projected:
+                    if main is continuation:
+                        continue
+                    merged = _merge_continuation_pair(
+                        parser=parser,
+                        worksheet=worksheet,
+                        main=main,
+                        continuation=continuation,
+                        source_sha256=source_sha256,
+                        producer_generation_ref=producer_generation_ref,
+                        table_context_entry_limit=table_context_entry_limit,
+                        table_context_value_bytes=table_context_value_bytes,
                     )
-                    for sibling in projected
-                    if sibling is not item
-                )
+                    if merged is not None:
+                        candidates.append((main, merged))
+                if len(candidates) != 1:
+                    continue
+                main, merged = candidates[0]
+                projected = [
+                    item
+                    for item in projected
+                    if item is not main and item is not continuation
+                ] + [merged]
+                changed = True
+                break
+
+        defects.extend(_apply_projection_invariants(projected, source_regions))
+
+        complete_items = [
+            item for item in projected if item["table"]["source_total_count"] is not None
+        ]
+        if len(complete_items) > 1:
+            for item in complete_items:
+                _apply_enumeration_decision(item["table"], "L1-03")
+                item["positive_rule"] = "L1-03"
+
+        partial_overlap_ids = set()
+        nested_unknown_ids = set()
+        preliminary_predicates = {
+            id(item): _region_negative_predicates(
+                worksheet=worksheet,
+                sheet_name=sheet_name,
+                item=item,
+                siblings=projected,
+                formula_coordinates=sheet_formula_coordinates,
+                formula_values=sheet_formula_values,
+                formula_inventory_proven=formula_inventory_proven,
+                partial_overlap=False,
             )
             for item in projected
-        )
-        if continuation_unknown and projected:
-            for item in projected:
-                _clear_complete_decision(item["table"], item["rows"])
+            if not item["table"]["matched_rule"].startswith("D")
+        }
+        for index, item in enumerate(projected):
+            for sibling in projected[index + 1 :]:
+                if not _column_sets_intersect(
+                    item["member_columns"],
+                    sibling["member_columns"],
+                ):
+                    continue
+                if _column_sets_are_nested(
+                    item["member_columns"],
+                    sibling["member_columns"],
+                ):
+                    risk_ids = nested_unknown_ids
+                else:
+                    risk_ids = partial_overlap_ids
+                earlier, later = sorted((item, sibling), key=lambda candidate: candidate["bbox"])
+                later_predicates = preliminary_predicates.get(id(later), {})
+                later_axis_proven = later.get("positive_rule") is not None and not any(
+                    later_predicates.values()
+                )
+                later_rows = _continuation_record_rows(later)
+                nested_axis_compatible = (
+                    risk_ids is not nested_unknown_ids
+                    or len(later["member_columns"]) == 1
+                    or len(later_rows) != 1
+                    or (
+                        bool(later_rows)
+                        and _continuation_rows_match_proven_axis(
+                            parser=parser,
+                            worksheet=worksheet,
+                            main=earlier,
+                            continuation=later,
+                            continuation_rows=later_rows,
+                        )
+                    )
+                )
+                if (
+                    earlier["bbox"][2] < later["bbox"][0]
+                    and not later_axis_proven
+                    and nested_axis_compatible
+                ):
+                    risk_ids.update((id(earlier), id(later)))
 
-        if projected and any(region["has_unbound_unresolved"] for region in regions):
-            for item in projected:
-                _clear_complete_decision(item["table"], item["rows"])
+        for item in projected:
+            if item["table"]["matched_rule"].startswith("D"):
+                continue
+            predicates = dict(preliminary_predicates[id(item)])
+            predicates["R6"] = id(item) in partial_overlap_ids
+            l1_rule = (
+                None
+                if id(item) in nested_unknown_ids
+                else item["positive_rule"]
+            )
+            matched_rule = _ordered_enumeration_rule(predicates, l1_rule)
+            if matched_rule.startswith("L1-"):
+                _apply_enumeration_decision(item["table"], matched_rule)
+            else:
+                _clear_complete_decision(item["table"], item["rows"], matched_rule)
 
         projected.sort(
             key=lambda item: (
@@ -1300,11 +2971,72 @@ def build_tabular_structure_projection(
                 item["table"]["table_ordinal"],
             )
         )
-        for item in projected:
+        for table_ordinal, item in enumerate(projected, start=1):
+            _rekey_projected_item(
+                item,
+                table_ordinal=table_ordinal,
+                source_sha256=source_sha256,
+                producer_generation_ref=producer_generation_ref,
+            )
+            if has_adr044_receipt and item["table"]["source_total_count"] is not None:
+                _apply_enumeration_decision(item["table"], "L1-01")
             item["rows"].sort(key=lambda row: row["row_ordinal_int"])
             item["table"]["row_count"] = len(item["rows"])
             tables.append(item["table"])
             records.extend(item["rows"])
+
+        for source_region_key, region in sorted(source_regions.items()):
+            assigned_items = [
+                item
+                for item in projected
+                if source_region_key in item["source_components"]
+            ]
+            source_sheet, source_ordinal = source_region_key
+            source_members = set(region["members"])
+            assigned_ref = (
+                assigned_items[0]["table"]["table_ref"]
+                if len(assigned_items) == 1
+                else None
+            )
+            audit_source_regions.append(
+                {
+                    "source_region_ref": f"{source_sheet}:{source_ordinal}",
+                    "worksheet_ordinal": source_sheet,
+                    "bbox": list(region["bbox"]),
+                    "row_count": len({row for row, _column in source_members}),
+                    "column_count": len({column for _row, column in source_members}),
+                    "membership_sha256": region["membership_sha256"],
+                    "member_count": len(source_members),
+                    "member_coordinate_set": _audit_coordinate_strings(
+                        source_sheet,
+                        source_members,
+                    ),
+                    "assigned_object_ref": assigned_ref,
+                    "assignment_count": len(assigned_items),
+                }
+            )
+        audit_output_objects.extend(
+            _audit_output_object(
+                item,
+                producer_generation_ref=producer_generation_ref,
+                enumeration_rule_version=ENUMERATION_RULE_VERSION,
+            )
+            for item in projected
+        )
+        for defect in defects:
+            if defect["sheet_ordinal"] != sheet_ordinal:
+                continue
+            source_region = source_regions[
+                (sheet_ordinal, defect["source_region_ordinal"])
+            ]
+            audit_output_objects.append(
+                _audit_d4_object(
+                    defect,
+                    source_region=source_region,
+                    producer_generation_ref=producer_generation_ref,
+                    enumeration_rule_version=ENUMERATION_RULE_VERSION,
+                )
+            )
 
     projection = {
         "version": PROJECTION_VERSION,
@@ -1316,6 +3048,38 @@ def build_tabular_structure_projection(
         "rows": records,
     }
     validate_tabular_structure_projection(projection)
+    audit = {
+        "version": "tabular-structure-producer-audit/v1",
+        "producer_generation_ref": producer_generation_ref,
+        "enumeration_rule_version": ENUMERATION_RULE_VERSION,
+        "source_sha256": source_sha256,
+        "source_regions": audit_source_regions,
+        "output_objects": audit_output_objects,
+        "defects": defects,
+    }
+    _validate_tabular_structure_producer_audit(audit)
+    return projection, audit
+
+
+def build_tabular_structure_projection(
+    filename: str,
+    binary: bytes,
+    *,
+    producer_generation_ref: str | None = None,
+    adr044_conversion_receipt: dict[str, str] | None = None,
+    table_context_entry_limit: int = DEFAULT_CONTEXT_ENTRY_LIMIT,
+    table_context_value_bytes: int = DEFAULT_CONTEXT_VALUE_BYTES,
+    parser=None,
+) -> dict[str, Any]:
+    projection, _audit = _build_tabular_structure_projection_with_audit(
+        filename,
+        binary,
+        producer_generation_ref=producer_generation_ref,
+        adr044_conversion_receipt=adr044_conversion_receipt,
+        table_context_entry_limit=table_context_entry_limit,
+        table_context_value_bytes=table_context_value_bytes,
+        parser=parser,
+    )
     return projection
 
 

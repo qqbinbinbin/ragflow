@@ -6,6 +6,7 @@ from io import BytesIO
 
 import pytest
 from openpyxl import Workbook
+from openpyxl.styles import PatternFill
 
 from test.fuxi.test_table_semantic_rows import _load_table_module
 
@@ -131,6 +132,546 @@ def test_table_manifest_requires_one_strict_enumeration_decision(table_parser):
         validate_tabular_structure_projection(invalid_rule)
 
 
+def test_duplicate_source_member_ingestion_reaches_d2(table_parser, monkeypatch):
+    original = tabular_structure._new_projected_item
+
+    def duplicate_member_event(**kwargs):
+        item = original(**kwargs)
+        item["emitted_member_events"].append(item["emitted_member_events"][0])
+        return item
+
+    monkeypatch.setattr(tabular_structure, "_new_projected_item", duplicate_member_event)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "D2"
+    assert projection["tables"][0]["enumeration_reason"] == "membership_not_closed"
+
+
+def test_unassigned_source_member_ingestion_reaches_d2(table_parser, monkeypatch):
+    original = tabular_structure._new_projected_item
+
+    def drop_last_member_event(**kwargs):
+        item = original(**kwargs)
+        item["emitted_member_events"] = item["emitted_member_events"][:-1]
+        return item
+
+    monkeypatch.setattr(tabular_structure, "_new_projected_item", drop_last_member_event)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["matched_rule"] == "D2"
+    assert projection["tables"][0]["enumeration_reason"] == "membership_not_closed"
+
+
+def test_proven_record_slot_count_mismatch_reaches_d3(table_parser, monkeypatch):
+    original = tabular_structure._new_projected_item
+
+    def add_unemitted_proven_slot(**kwargs):
+        item = original(**kwargs)
+        item["proven_record_slots"].append(99)
+        return item
+
+    monkeypatch.setattr(tabular_structure, "_new_projected_item", add_unemitted_proven_slot)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "D3"
+    assert projection["tables"][0]["enumeration_reason"] == "record_count_mismatch"
+
+
+def test_proven_record_slots_must_match_emitted_data_row_ordinals(table_parser, monkeypatch):
+    original = tabular_structure._new_projected_item
+
+    def replace_first_slot_with_header(**kwargs):
+        item = original(**kwargs)
+        item["proven_record_slots"][0] = min(row for row, _column in item["members"])
+        return item
+
+    monkeypatch.setattr(
+        tabular_structure,
+        "_new_projected_item",
+        replace_first_slot_with_header,
+    )
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "D3"
+    assert projection["tables"][0]["enumeration_reason"] == "record_count_mismatch"
+
+
+def test_missing_unknown_projection_emits_d4_tombstone(table_parser, monkeypatch):
+    workbook = Workbook()
+    workbook.active["A1"] = "Standalone note"
+    monkeypatch.setattr(tabular_structure, "_unknown_structure_region", lambda **_kwargs: None)
+
+    projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"] == []
+    assert projection["rows"] == []
+    assert set(projection) == tabular_structure.PROJECTION_FIELDS
+    assert audit["version"] == "tabular-structure-producer-audit/v1"
+    assert audit["producer_generation_ref"] == projection["producer_generation_ref"]
+    assert audit["enumeration_rule_version"] == projection["enumeration_rule_version"]
+    assert audit["source_sha256"] == projection["source_sha256"]
+    assert audit["defects"] == [
+        {
+            "row_kind": "defect_tombstone",
+            "table_ref": None,
+            "sheet_ordinal": 1,
+            "source_region_ordinal": 1,
+            "membership_sha256": tabular_structure._region_membership_sha256(1, {(1, 1)}),
+            "enumeration_status": "defect",
+            "enumeration_reason": "missing_projection",
+            "matched_rule": "D4",
+        }
+    ]
+
+    fabricated_identity = json.loads(json.dumps(audit))
+    fabricated_identity["defects"][0]["table_ref"] = "tbl_v2_" + "0" * 128
+    with pytest.raises(ValueError, match="cannot fabricate"):
+        tabular_structure._validate_tabular_structure_producer_audit(fabricated_identity)
+
+    wrong_reason = json.loads(json.dumps(audit))
+    wrong_reason["defects"][0]["enumeration_reason"] = "membership_not_closed"
+    with pytest.raises(ValueError, match="decision is invalid"):
+        tabular_structure._validate_tabular_structure_producer_audit(wrong_reason)
+
+    duplicate_region = json.loads(json.dumps(audit))
+    duplicate_region["defects"].append(dict(duplicate_region["defects"][0]))
+    with pytest.raises(ValueError, match="not unique deterministic"):
+        tabular_structure._validate_tabular_structure_producer_audit(duplicate_region)
+
+
+def test_producer_audit_exports_content_free_closed_object_evidence(table_parser):
+    projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+
+    assert set(projection) == tabular_structure.PROJECTION_FIELDS
+    assert audit["defects"] == []
+    assert len(audit["source_regions"]) == 1
+    assert len(audit["output_objects"]) == 1
+    source = audit["source_regions"][0]
+    output = audit["output_objects"][0]
+    assert source["assigned_object_ref"] == output["object_ref"] == projection["tables"][0]["table_ref"]
+    assert source["assignment_count"] == 1
+    assert output["row_kind"] == "object"
+    assert output["identity_validation_status"] == "pending_independent_validation"
+    assert output["enumeration_status"] == "supported_complete"
+    tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_rejects_record_slot_outside_union_members(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    forged = json.loads(json.dumps(audit))
+    output = forged["output_objects"][0]
+    output["record_slot_coordinate_sets"][0] = ["1:999:999"]
+    output["record_slot_sha256"] = tabular_structure._audit_digest(
+        "adr039-record-slot/v1",
+        ["|".join(slot) for slot in output["record_slot_coordinate_sets"]],
+    )
+
+    with pytest.raises(ValueError, match="record slot.*union"):
+        tabular_structure._validate_tabular_structure_producer_audit(forged)
+
+
+def test_producer_audit_rejects_duplicate_complete_record_slots(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    forged = json.loads(json.dumps(audit))
+    output = forged["output_objects"][0]
+    output["record_slot_coordinate_sets"][1] = list(
+        output["record_slot_coordinate_sets"][0]
+    )
+    output["record_slot_sha256"] = tabular_structure._audit_digest(
+        "adr039-record-slot/v1",
+        ["|".join(slot) for slot in output["record_slot_coordinate_sets"]],
+    )
+
+    with pytest.raises(ValueError, match="record slots.*unique"):
+        tabular_structure._validate_tabular_structure_producer_audit(forged)
+
+
+def test_producer_audit_rejects_header_row_as_a_complete_record_slot(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code"])
+    sheet.append(["S-1"])
+    sheet.append(["S-2"])
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    forged = json.loads(json.dumps(audit))
+    output = forged["output_objects"][0]
+    assert output.get("emitted_data_row_ordinals") == [2, 3]
+    output["record_slot_coordinate_sets"] = [["1:1:1"], ["1:2:1"]]
+    output["record_slot_sha256"] = tabular_structure._audit_digest(
+        "adr039-record-slot/v1",
+        ["1:1:1", "1:2:1"],
+    )
+
+    with pytest.raises(ValueError, match="record slots.*data rows"):
+        tabular_structure._validate_tabular_structure_producer_audit(forged)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("bbox", [1, 1, 999, 999], "source geometry"),
+        ("row_count", 999, "source geometry"),
+        ("column_count", 999, "source geometry"),
+        ("worksheet_ordinal", 2, "source region reference"),
+        ("source_region_ref", "1:99", "source region reference"),
+    ],
+)
+def test_producer_audit_recomputes_source_region_geometry(
+    table_parser,
+    field,
+    value,
+    message,
+):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    audit["source_regions"][0][field] = value
+    if field == "source_region_ref":
+        audit["output_objects"][0]["component_region_refs"][0] = value
+
+    with pytest.raises(ValueError, match=message):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_cannot_self_approve_identity_validation(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    audit["output_objects"][0]["identity_validation_status"] = "validated"
+
+    with pytest.raises(ValueError, match="identity validation status"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_requires_each_d4_defect_to_match_its_tombstone(
+    table_parser,
+    monkeypatch,
+):
+    workbook = Workbook()
+    workbook.active["A1"] = "Standalone note"
+    monkeypatch.setattr(tabular_structure, "_unknown_structure_region", lambda **_kwargs: None)
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    audit["defects"] = []
+
+    with pytest.raises(ValueError, match="D4 defect.*tombstone"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_rejects_overlapping_complete_components(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _vertical_complete_with_headerless_continuation_bytes(),
+        parser=table_parser,
+    )
+    assert len(audit["source_regions"]) == 2
+    first, second = audit["source_regions"]
+    second["member_coordinate_set"].append(first["member_coordinate_set"][0])
+    second["member_coordinate_set"].sort(key=tabular_structure._audit_coordinate_key)
+    second["membership_sha256"] = hashlib.sha256(
+        "\n".join(second["member_coordinate_set"]).encode("ascii")
+    ).hexdigest()
+    second["member_count"] = len(second["member_coordinate_set"])
+    parsed_members = [
+        tabular_structure._audit_coordinate_key(value)
+        for value in second["member_coordinate_set"]
+    ]
+    member_rows = {row for _sheet, row, _column in parsed_members}
+    member_columns = {column for _sheet, _row, column in parsed_members}
+    second["bbox"] = [
+        min(member_rows),
+        min(member_columns),
+        max(member_rows),
+        max(member_columns),
+    ]
+    second["row_count"] = len(member_rows)
+    second["column_count"] = len(member_columns)
+    output = audit["output_objects"][0]
+    output["component_membership_sha256_list"][1] = second["membership_sha256"]
+
+    with pytest.raises(ValueError, match="component memberships.*disjoint"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_recomputes_table_identity(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    forged_ref = "tbl_v2_" + audit["output_objects"][0]["union_membership_sha256"] + "_" + "0" * 64
+    output = audit["output_objects"][0]
+    output["object_ref"] = forged_ref
+    output["table_ref"] = forged_ref
+    audit["source_regions"][0]["assigned_object_ref"] = forged_ref
+
+    with pytest.raises(ValueError, match="table identity"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_binds_output_worksheet_to_components(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    audit["output_objects"][0]["worksheet_ordinal"] = 2
+
+    with pytest.raises(ValueError, match="output worksheet"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_requires_numeric_component_order(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _vertical_complete_with_headerless_continuation_bytes(),
+        parser=table_parser,
+    )
+    output = audit["output_objects"][0]
+    output["component_region_refs"].reverse()
+    output["component_membership_sha256_list"].reverse()
+
+    with pytest.raises(ValueError, match="component references.*ordered"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_requires_multiple_assignments_to_reach_d2(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    first = audit["output_objects"][0]
+    second = json.loads(json.dumps(first))
+    second_ref = tabular_structure._table_ref(
+        audit["source_sha256"],
+        1,
+        2,
+        second["union_membership_sha256"],
+    )
+    second.update(
+        {
+            "object_ref": second_ref,
+            "table_ref": second_ref,
+            "matched_rule": "R8",
+            "decision_chain_stop": "R8",
+            "enumeration_status": "not_guaranteed_explained",
+            "enumeration_reason": "record_axis_not_proven",
+            "source_total_count": None,
+        }
+    )
+    audit["output_objects"].append(second)
+    audit["source_regions"][0]["assigned_object_ref"] = None
+    audit["source_regions"][0]["assignment_count"] = 2
+
+    with pytest.raises(ValueError, match="multiple assignments.*D2"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_requires_the_decision_stop_to_match_the_rule(table_parser):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    audit["output_objects"][0]["decision_chain_stop"] = "R8"
+
+    with pytest.raises(ValueError, match="decision chain stop"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_rejects_a_total_on_a_noncomplete_decision(table_parser):
+    workbook = Workbook()
+    workbook.active.append(["Code", "State"])
+    workbook.active.append(["A-1", "Open"])
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    assert audit["output_objects"][0]["enumeration_status"] == "not_guaranteed_explained"
+    audit["output_objects"][0]["source_total_count"] = 1
+
+    with pytest.raises(ValueError, match="decision conflicts with source total"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_requires_unclosed_membership_to_be_d2(table_parser):
+    workbook = Workbook()
+    workbook.active.append(["Code", "State"])
+    workbook.active.append(["A-1", "Open"])
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    output = audit["output_objects"][0]
+    output["emitted_member_coordinate_multiset"] = output[
+        "emitted_member_coordinate_multiset"
+    ][:-1]
+    emitted = output["emitted_member_coordinate_multiset"]
+    output["emitted_cell_multiset_sha256"] = tabular_structure._audit_digest(
+        "adr039-emitted-cell-multiset/v1",
+        emitted,
+    )
+    output["emitted_member_occurrence_count"] = len(emitted)
+    output["member_max_ingest_count"] = 1
+
+    with pytest.raises(ValueError, match="unclosed membership.*D2"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_record_slots_cover_the_complete_source_rows(table_parser):
+    workbook = Workbook()
+    workbook.active.append(["Code", "State"])
+    workbook.active.append(["A-1", "Open"])
+    workbook.active.append(["A-2", "Closed"])
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    output = audit["output_objects"][0]
+    output["record_slot_coordinate_sets"][0] = output[
+        "record_slot_coordinate_sets"
+    ][0][:-1]
+    output["record_slot_sha256"] = tabular_structure._audit_digest(
+        "adr039-record-slot/v1",
+        ["|".join(slot) for slot in output["record_slot_coordinate_sets"]],
+    )
+
+    with pytest.raises(ValueError, match="record slot.*complete source row"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+@pytest.mark.parametrize("defect_rule", ["D2", "D3", "D4"])
+def test_producer_audit_rejects_unsupported_defect_labels(table_parser, defect_rule):
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    output = audit["output_objects"][0]
+    status, reason = tabular_structure.ENUMERATION_DECISIONS[defect_rule]
+    output.update(
+        {
+            "matched_rule": defect_rule,
+            "decision_chain_stop": defect_rule,
+            "enumeration_status": status,
+            "enumeration_reason": reason,
+            "source_total_count": None,
+        }
+    )
+
+    with pytest.raises(ValueError, match="defect decision.*evidence"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_cannot_hide_d3_evidence_as_l2(table_parser, monkeypatch):
+    original = tabular_structure._new_projected_item
+
+    def add_unemitted_proven_slot(**kwargs):
+        item = original(**kwargs)
+        item["proven_record_slots"].append(99)
+        return item
+
+    monkeypatch.setattr(tabular_structure, "_new_projected_item", add_unemitted_proven_slot)
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    output = audit["output_objects"][0]
+    status, reason = tabular_structure.ENUMERATION_DECISIONS["R8"]
+    output.update(
+        {
+            "matched_rule": "R8",
+            "decision_chain_stop": "R8",
+            "enumeration_status": status,
+            "enumeration_reason": reason,
+        }
+    )
+
+    with pytest.raises(ValueError, match="record count evidence.*D3"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+def test_producer_audit_cannot_hide_d3_evidence_as_d1(table_parser, monkeypatch):
+    original = tabular_structure._new_projected_item
+
+    def add_unemitted_proven_slot(**kwargs):
+        item = original(**kwargs)
+        item["proven_record_slots"].append(99)
+        return item
+
+    monkeypatch.setattr(tabular_structure, "_new_projected_item", add_unemitted_proven_slot)
+    _projection, audit = tabular_structure._build_tabular_structure_projection_with_audit(
+        "anonymous.xlsx",
+        _single_column_workbook_bytes(),
+        parser=table_parser,
+    )
+    output = audit["output_objects"][0]
+    status, reason = tabular_structure.ENUMERATION_DECISIONS["D1"]
+    output.update(
+        {
+            "matched_rule": "D1",
+            "decision_chain_stop": "D1",
+            "enumeration_status": status,
+            "enumeration_reason": reason,
+        }
+    )
+
+    with pytest.raises(ValueError, match="record count evidence.*D3"):
+        tabular_structure._validate_tabular_structure_producer_audit(audit)
+
+
+
 def test_unproven_single_record_uses_the_default_l2_decision(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -153,6 +694,489 @@ def test_unproven_single_record_uses_the_default_l2_decision(table_parser):
         "enumeration_reason": "record_axis_not_proven",
         "matched_rule": "R8",
     }
+
+
+def _l2_reason_workbook_bytes(rule):
+    workbook = Workbook()
+    sheet = workbook.active
+    if rule == "R1":
+        sheet["A1"] = "Standalone note"
+    elif rule == "R2":
+        sheet.append(["Code", "Value"])
+        sheet.append(["A-1", 1])
+        sheet.append(["A-2", 2])
+        sheet.append(["A-3", 3])
+        sheet.row_dimensions[3].hidden = True
+    elif rule == "R3":
+        sheet.append([None, "Column A", "Column B"])
+        sheet.append(["Row A", 1, 2])
+        sheet.append(["Row B", 3, 4])
+    elif rule == "R4":
+        sheet.append(["Code", "Value"])
+        sheet.append(["A-1", 1])
+        sheet.append(["A-2", 2])
+        sheet.append(["Aggregate", "=SUM(B2:B3)"])
+    elif rule == "R5":
+        sheet.append(["Code", "Value"])
+        sheet.append(["A-1", 1])
+        sheet.append(["A-2", 2])
+        sheet.append(["Code", "Value"])
+        sheet.append(["B-1", 3])
+        sheet.append(["B-2", 4])
+    elif rule == "R6":
+        return _complete_table_with_partially_overlapping_unknown_bytes()
+    elif rule == "R7":
+        sheet.append(["Code", "Value"])
+        fills = ("FFF2CC", "FFF2CC", "D9EAD3", "D9EAD3")
+        for index, color in enumerate(fills, start=1):
+            sheet.append([f"A-{index}", index])
+            for cell in sheet[sheet.max_row]:
+                cell.fill = PatternFill(fill_type="solid", fgColor=color)
+    else:
+        raise AssertionError(f"unhandled L2 rule: {rule}")
+    return _save_workbook(workbook)
+
+
+@pytest.mark.parametrize(
+    ("rule", "reason"),
+    [
+        ("R1", "not_a_list"),
+        ("R2", "total_unstable"),
+        ("R3", "matrix_layout"),
+        ("R4", "subtotal_rows_mixed"),
+        ("R5", "multi_block_unseparated"),
+        ("R6", "partial_overlap_continuation"),
+        ("R7", "visual_only_boundary"),
+    ],
+)
+def test_real_workbook_structures_reach_each_ordered_l2_reason(
+    table_parser,
+    rule,
+    reason,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _l2_reason_workbook_bytes(rule),
+        parser=table_parser,
+    )
+
+    assert projection["tables"]
+    assert projection["rows"]
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert {table["matched_rule"] for table in projection["tables"]} == {rule}
+    assert {table["enumeration_reason"] for table in projection["tables"]} == {reason}
+
+
+def _collision_workbook_bytes(fixture_id):
+    workbook = Workbook()
+    sheet = workbook.active
+    if fixture_id == "C12":
+        sheet["A1"] = "=UNKNOWN_FUNCTION(1)"
+        return _save_workbook(workbook)
+    if fixture_id == "C16":
+        sheet.cell(1, 1, "Earlier")
+        sheet.cell(1, 2, "Detail")
+        sheet.cell(4, 2, "Later")
+        sheet.cell(4, 3, "Extra")
+        return _save_workbook(workbook)
+    if fixture_id == "C17":
+        for column, color in enumerate(("FFF2CC", "FFF2CC", "D9EAD3", "D9EAD3"), start=1):
+            sheet.cell(1, column, f"Text-{column}")
+            sheet.cell(1, column).fill = PatternFill(fill_type="solid", fgColor=color)
+        return _save_workbook(workbook)
+
+    sheet.append(["Code", "State"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+
+    if fixture_id in {"C23", "C34", "C37", "M02_R3_R4_R7"}:
+        workbook = Workbook()
+        sheet = workbook.active
+        row_count = 5 if fixture_id in {"C37", "M02_R3_R4_R7"} else 4
+        sheet.cell(1, 2, "Column A")
+        sheet.cell(1, 3, "Column B")
+        for row in range(2, row_count + 1):
+            sheet.cell(row, 1, f"Row-{row}")
+            sheet.cell(row, 2, row)
+            sheet.cell(row, 3, row * 10)
+        if fixture_id == "C23":
+            sheet.row_dimensions[3].hidden = True
+        if fixture_id in {"C34", "M02_R3_R4_R7"}:
+            sheet.cell(row_count, 3, f"=SUM(C2:C{row_count - 1})")
+        if fixture_id in {"C37", "M02_R3_R4_R7"}:
+            for row, color in zip(range(2, row_count + 1), ("FFF2CC", "FFF2CC", "D9EAD3", "D9EAD3")):
+                for column in range(1, 4):
+                    sheet.cell(row, column).fill = PatternFill(fill_type="solid", fgColor=color)
+        return _save_workbook(workbook)
+    if fixture_id in {"C24", "C47", "M01_R2_R4_R7"}:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Code", "Value"])
+        for row in range(2, 6):
+            sheet.cell(row, 1, f"A-{row}")
+            sheet.cell(row, 2, row)
+        sheet.cell(6, 1, "Aggregate")
+        sheet.cell(6, 2, "=SUM(B2:B5)")
+        if fixture_id in {"C24", "M01_R2_R4_R7"}:
+            sheet.row_dimensions[3].hidden = True
+        if fixture_id in {"C47", "M01_R2_R4_R7"}:
+            for row, color in zip(range(2, 7), ("FFF2CC", "FFF2CC", "D9EAD3", "D9EAD3", "D9EAD3")):
+                for column in (1, 2):
+                    sheet.cell(row, column).fill = PatternFill(fill_type="solid", fgColor=color)
+        return _save_workbook(workbook)
+    if fixture_id in {"C25", "C45", "C57"}:
+        workbook = Workbook()
+        sheet = workbook.active
+        rows = (
+            (1, ("Code", "Value")),
+            (2, ("A-1", 1)),
+            (3, ("A-2", 2)),
+            (4, ("Code", "Value")),
+            (5, ("B-1", 3)),
+            (6, ("B-2", 4)),
+            (7, ("B-3", 5)),
+        )
+        for row, values in rows:
+            sheet.cell(row, 1, values[0])
+            sheet.cell(row, 2, values[1])
+        if fixture_id == "C25":
+            sheet.row_dimensions[3].hidden = True
+        if fixture_id == "C45":
+            sheet.cell(7, 2, "=SUM(B5:B6)")
+        if fixture_id == "C57":
+            for row, color in zip(range(2, 8), ("FFF2CC", "FFF2CC", "FFF2CC", "FFF2CC", "D9EAD3", "D9EAD3")):
+                for column in (1, 2):
+                    sheet.cell(row, column).fill = PatternFill(fill_type="solid", fgColor=color)
+        return _save_workbook(workbook)
+    if fixture_id in {"C26", "C27"}:
+        if fixture_id == "C26":
+            sheet.cell(6, 2, "Later")
+            sheet.cell(6, 3, "=UNKNOWN_FUNCTION(1)")
+        else:
+            for row, color in zip(range(2, 6), ("FFF2CC", "FFF2CC", "D9EAD3", "D9EAD3")):
+                if row > 3:
+                    sheet.cell(row, 1, f"A-{row}")
+                    sheet.cell(row, 2, "Open")
+                for column in (1, 2):
+                    sheet.cell(row, column).fill = PatternFill(fill_type="solid", fgColor=color)
+            sheet.row_dimensions[3].hidden = True
+        return _save_workbook(workbook)
+    if fixture_id == "C35":
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.cell(1, 2, "Column A")
+        sheet.cell(1, 3, "Column B")
+        for row in range(2, 4):
+            sheet.cell(row, 1, f"Row-{row}")
+            sheet.cell(row, 2, row)
+            sheet.cell(row, 3, row * 10)
+        sheet.cell(4, 2, "Column A")
+        sheet.cell(4, 3, "Column B")
+        for row in range(5, 7):
+            sheet.cell(row, 1, f"Row-{row}")
+            sheet.cell(row, 2, row)
+            sheet.cell(row, 3, row * 10)
+        return _save_workbook(workbook)
+    if fixture_id == "C36":
+        sheet.cell(6, 2, None)
+        sheet.cell(6, 3, "Column A")
+        sheet.cell(6, 4, "Column B")
+        sheet.cell(7, 2, "Row A")
+        sheet.cell(7, 3, 1)
+        sheet.cell(7, 4, 2)
+        sheet.cell(8, 2, "Row B")
+        sheet.cell(8, 3, 3)
+        sheet.cell(8, 4, 4)
+    elif fixture_id == "C46":
+        sheet.cell(6, 2, "B-1")
+        sheet.cell(6, 3, 1)
+        sheet.cell(7, 2, "B-2")
+        sheet.cell(7, 3, 2)
+        sheet.cell(8, 2, "Aggregate")
+        sheet.cell(8, 3, "=SUM(C6:C7)")
+    elif fixture_id == "C56":
+        for row, values in (
+            (6, ("Code", "Value")),
+            (7, ("B-1", 1)),
+            (8, ("B-2", 2)),
+            (9, ("Code", "Value")),
+            (10, ("C-1", 3)),
+            (11, ("C-2", 4)),
+        ):
+            sheet.cell(row, 2, values[0])
+            sheet.cell(row, 3, values[1])
+    elif fixture_id == "C67":
+        fills = ("FFF2CC", "FFF2CC", "D9EAD3", "D9EAD3")
+        sheet.cell(6, 2, "Code")
+        sheet.cell(6, 3, "Value")
+        for offset, color in enumerate(fills, start=7):
+            sheet.cell(offset, 2, f"B-{offset}")
+            sheet.cell(offset, 3, offset)
+            for column in (2, 3):
+                sheet.cell(offset, column).fill = PatternFill(fill_type="solid", fgColor=color)
+    else:
+        raise AssertionError(f"unhandled collision fixture: {fixture_id}")
+    return _save_workbook(workbook)
+
+
+@pytest.mark.parametrize(
+    ("fixture_id", "expected_rules", "expected_stop"),
+    [
+        ("C12", {"R1", "R2"}, "R1"),
+        ("C16", {"R1", "R6"}, "R1"),
+        ("C17", {"R1", "R7"}, "R1"),
+        ("C23", {"R2", "R3"}, "R2"),
+        ("C24", {"R2", "R4"}, "R2"),
+        ("C25", {"R2", "R5"}, "R2"),
+        ("C26", {"R2", "R6"}, "R2"),
+        ("C27", {"R2", "R7"}, "R2"),
+        ("C34", {"R3", "R4"}, "R3"),
+        ("C35", {"R3", "R5"}, "R3"),
+        ("C36", {"R3", "R6"}, "R3"),
+        ("C37", {"R3", "R7"}, "R3"),
+        ("C45", {"R4", "R5"}, "R4"),
+        ("C46", {"R4", "R6"}, "R4"),
+        ("C47", {"R4", "R7"}, "R4"),
+        ("C56", {"R5", "R6"}, "R5"),
+        ("C57", {"R5", "R7"}, "R5"),
+        ("C67", {"R6", "R7"}, "R6"),
+        ("M01_R2_R4_R7", {"R2", "R4", "R7"}, "R2"),
+        ("M02_R3_R4_R7", {"R3", "R4", "R7"}, "R3"),
+    ],
+)
+def test_real_workbook_collision_vectors_use_production_predicates(
+    table_parser,
+    monkeypatch,
+    fixture_id,
+    expected_rules,
+    expected_stop,
+):
+    captured = []
+    ordered = tabular_structure._ordered_enumeration_rule
+
+    def capture(predicates, l1_rule):
+        captured.append(dict(predicates))
+        return ordered(predicates, l1_rule)
+
+    monkeypatch.setattr(tabular_structure, "_ordered_enumeration_rule", capture)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _collision_workbook_bytes(fixture_id),
+        parser=table_parser,
+    )
+
+    expected_vector = {rule: rule in expected_rules for rule in tabular_structure.NEGATIVE_ENUMERATION_RULES}
+    assert expected_vector in captured
+    assert expected_stop in {table["matched_rule"] for table in projection["tables"]}
+
+
+def test_visual_only_boundary_uses_style_clusters_without_formula_or_merge(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Value"])
+    for row, color in ((2, "FFF2CC"), (3, "FFF2CC"), (4, "D9EAD3"), (5, "D9EAD3")):
+        sheet.cell(row, 1, f"A-{row}")
+        sheet.cell(row, 2, row)
+        for column in (1, 2):
+            sheet.cell(row, column).fill = PatternFill(fill_type="solid", fgColor=color)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["matched_rule"] == "R7"
+
+
+def test_dense_matrix_with_occupied_corner_stops_at_matrix_rule(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Dimension", "Column A", "Column B"])
+    sheet.append(["Row A", 1, 2])
+    sheet.append(["Row B", 3, 4])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R3"
+
+
+def test_dense_three_column_text_list_is_not_a_matrix(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status", "Owner"])
+    sheet.append(["A-1", "Open", "Team-1"])
+    sheet.append(["A-2", "Closed", "Team-2"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert projection["tables"][0]["matched_rule"] == "L1-07"
+
+
+def test_dense_text_list_without_digit_markers_is_not_a_matrix(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Name", "State", "Owner"])
+    sheet.append(["Alpha", "Open", "East"])
+    sheet.append(["Beta", "Closed", "West"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R8"
+
+
+def test_dense_numeric_record_list_is_not_a_matrix(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Count", "Owner"])
+    sheet.append(["A-1", 1, "East"])
+    sheet.append(["A-2", 2, "West"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert projection["tables"][0]["matched_rule"] == "L1-07"
+
+
+def test_mixed_value_matrix_cannot_claim_a_complete_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Dimension", "Count", "Status"])
+    sheet.append(["North", 1, "High"])
+    sheet.append(["South", 2, "Low"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R3"
+
+
+def test_sparse_matrix_cannot_claim_a_complete_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Dimension", "First", "Second"])
+    sheet.append(["North", 1, None])
+    sheet.append(["South", None, 2])
+    sheet.append(["West", 3, 4])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R3"
+
+
+def test_matrix_decision_considers_the_complete_candidate_region(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Name", "Count", "Score"])
+    sheet.append(["Alice", 1, 10])
+    sheet.append(["Bob", 2, 20])
+    sheet.append(["Carol", 3, "Pending"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R8"
+
+
+def test_single_style_cluster_does_not_trigger_visual_only_boundary(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Value"])
+    for row in range(2, 6):
+        sheet.cell(row, 1, f"A-{row}")
+        sheet.cell(row, 2, row)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["matched_rule"] == "L1-07"
+
+
+def test_multicell_non_list_without_isomorphic_slots_reaches_r1(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Prepared by"
+    sheet["B1"] = "Reviewed by"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["matched_rule"] == "R1"
+
+
+def test_hidden_header_does_not_make_a_stable_record_total_unstable(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Value"])
+    sheet.append(["A-1", 1])
+    sheet.append(["A-2", 2])
+    sheet.row_dimensions[1].hidden = True
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert projection["tables"][0]["matched_rule"] == "L1-07"
+
+
+def test_uncached_nonaggregate_formula_reaches_total_unstable(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Value"])
+    sheet.append(["A-1", 1])
+    sheet.append(["A-2", "=B2"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R2"
 
 
 def test_table_ref_rejects_membership_identity_tampering(table_parser):
@@ -539,8 +1563,189 @@ def test_vertical_headerless_continuation_downgrades_complete_sibling(table_pars
         parser=table_parser,
     )
 
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 3
+    assert projection["tables"][0]["matched_rule"] == "L1-02"
+
+
+def test_isolated_single_row_annotation_is_not_merged_as_a_continuation(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "State"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["Prepared by", "Alice"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert projection["tables"][0]["matched_rule"] == "L1-07"
+    assert projection["tables"][1]["source_total_count"] is None
+    assert projection["tables"][1]["matched_rule"] == "R8"
+
+
+def test_same_shape_single_row_annotation_is_not_merged_as_a_continuation(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Record Name", "Status", "Owner"])
+    sheet.append(["North Unit", "Open", "Team-1"])
+    sheet.append(["South Site", "Closed", "Team-2"])
+    sheet.append([None, None, None])
+    sheet.append([None, None, None])
+    sheet.append(["Prepared by", "Alice", "Team-3"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert projection["tables"][0]["matched_rule"] == "L1-07"
+    assert projection["tables"][1]["source_total_count"] is None
+    assert projection["tables"][1]["matched_rule"] == "R8"
+
+
+def test_continuation_union_preserves_custom_context_limits(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_complete_with_headerless_continuation_bytes(),
+        table_context_entry_limit=1,
+        table_context_value_bytes=5,
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    context = json.loads(projection["rows"][0]["table_context_list"])
+    assert len(context) == 1
+    assert len(context[0]["value"].encode("utf-8")) <= 5
+
+
+def test_continuation_with_unknown_row_cannot_drop_it_and_claim_complete(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["Code", "Status"])
+    sheet.append(["B-1", "Open"])
+    sheet.append(["B-2", "Closed"])
+    sheet.append(["Code", "Status"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
     assert len(projection["tables"]) == 2
     assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert any(
+        row["row_ordinal_int"] == 9 and row["row_role_kwd"] == "unknown"
+        for row in projection["rows"]
+    )
+
+
+def test_multirow_named_continuation_without_a_proven_axis_cannot_claim_complete(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Value"])
+    sheet.append(["A-1", 1])
+    sheet.append(["A-2", 2])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["Code", "Value"])
+    sheet.append(["B-1", 3])
+    sheet.append(["Summary", "Current"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert all(table["enumeration_status"] == "not_guaranteed_explained" for table in projection["tables"])
+
+
+def test_three_equal_continuation_segments_form_one_complete_record_sequence(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["B-1", "Open"])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["C-1", "Closed"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 4
+    assert projection["tables"][0]["matched_rule"] == "L1-02"
+
+
+def test_multirow_named_superset_continuation_forms_one_complete_record_sequence(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None, None])
+    sheet.append([None, None, None])
+    sheet.append(["Code", "Status", "Owner"])
+    sheet.append(["B-1", "Open", "Team-1"])
+    sheet.append(["B-2", "Closed", "Team-2"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 4
+    assert projection["tables"][0]["matched_rule"] == "L1-02"
+
+
+def test_hidden_headerless_continuation_row_cannot_claim_complete(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    sheet.append([None, None])
+    sheet.append([None, None])
+    sheet.append(["B-1", "Open"])
+    sheet.row_dimensions[6].hidden = True
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R2"
 
 
 def test_subset_headerless_continuation_downgrades_complete_sibling(table_parser):
@@ -550,8 +1755,9 @@ def test_subset_headerless_continuation_downgrades_complete_sibling(table_parser
         parser=table_parser,
     )
 
-    assert len(projection["tables"]) == 2
-    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 3
+    assert projection["tables"][0]["matched_rule"] == "L1-02"
 
 
 def test_superset_headerless_continuation_downgrades_complete_sibling(table_parser):
@@ -561,8 +1767,30 @@ def test_superset_headerless_continuation_downgrades_complete_sibling(table_pars
         parser=table_parser,
     )
 
-    assert len(projection["tables"]) == 2
-    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "D1"
+    assert all("Column_" not in row["ordered_fields_list"] for row in projection["rows"])
+
+
+def test_unnamed_superset_still_runs_membership_closure(table_parser, monkeypatch):
+    original = tabular_structure._merge_continuation_pair
+
+    def duplicate_merged_member(**kwargs):
+        merged = original(**kwargs)
+        if merged is not None:
+            merged["emitted_member_events"].append(merged["emitted_member_events"][0])
+        return merged
+
+    monkeypatch.setattr(tabular_structure, "_merge_continuation_pair", duplicate_merged_member)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_complete_with_superset_headerless_continuation_bytes(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["matched_rule"] == "D2"
+    assert projection["tables"][0]["enumeration_reason"] == "membership_not_closed"
 
 
 def test_partially_overlapping_unknown_downgrades_complete_sibling(table_parser):
@@ -574,9 +1802,52 @@ def test_partially_overlapping_unknown_downgrades_complete_sibling(table_parser)
 
     assert len(projection["tables"]) == 2
     assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert {table["matched_rule"] for table in projection["tables"]} == {"R6"}
 
 
-def test_horizontal_headerless_record_axis_downgrades_complete_sibling(table_parser):
+def test_partial_overlap_does_not_downgrade_a_disjoint_table_on_the_same_sheet(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status", None, None, None, "Other", "Value"])
+    sheet.append(["A-1", "Open", None, None, None, "X-1", 1])
+    sheet.append(["A-2", "Closed", None, None, None, "X-2", 2])
+    sheet.cell(row=6, column=2, value="Later")
+    sheet.cell(row=6, column=3, value="Extra")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 3
+    assert [table["source_total_count"] for table in projection["tables"]] == [None, 2, None]
+    assert [table["matched_rule"] for table in projection["tables"]] == ["R6", "L1-03", "R6"]
+
+
+def test_partial_overlap_before_a_complete_table_is_not_a_continuation(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.cell(row=1, column=2, value="Earlier")
+    sheet.cell(row=1, column=3, value="Detail")
+    sheet.append([None, None, None])
+    sheet.append([None, None, None])
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert [table["source_total_count"] for table in projection["tables"]] == [None, 2]
+    assert [table["matched_rule"] for table in projection["tables"]] == ["R8", "L1-07"]
+
+
+def test_horizontal_headerless_record_axis_does_not_downgrade_disjoint_sibling(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
         _horizontal_complete_with_headerless_sibling_bytes(),
@@ -584,7 +1855,8 @@ def test_horizontal_headerless_record_axis_downgrades_complete_sibling(table_par
     )
 
     assert len(projection["tables"]) == 2
-    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
+    assert [table["matched_rule"] for table in projection["tables"]] == ["L1-07", "R8"]
 
 
 def test_projected_table_with_unknown_row_does_not_downgrade_complete_sibling(table_parser):
@@ -621,7 +1893,7 @@ def test_isolated_annotation_does_not_downgrade_complete_sibling(table_parser):
     assert projection["tables"][1]["source_total_count"] is None
 
 
-def test_g_sensitive_unknown_downgrades_complete_sibling(table_parser):
+def test_g_sensitive_unknown_does_not_downgrade_disjoint_sibling(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
         _complete_table_with_g_sensitive_sibling_bytes(),
@@ -629,7 +1901,8 @@ def test_g_sensitive_unknown_downgrades_complete_sibling(table_parser):
     )
 
     assert len(projection["tables"]) == 2
-    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
+    assert [table["matched_rule"] for table in projection["tables"]] == ["L1-07", "R8"]
     assert all(
         row["row_role_kwd"] == "unknown"
         for row in projection["rows"]
@@ -731,7 +2004,7 @@ def test_headerless_record_slots_preserve_every_row_and_cannot_claim_complete(ta
     assert all(row["row_role_kwd"] == "unknown" for row in projection["rows"])
 
 
-def test_unbound_uncached_formula_downgrades_every_table_on_the_sheet(table_parser):
+def test_unrelated_uncached_formula_does_not_downgrade_complete_sibling(table_parser):
     workbook = Workbook()
     sheet = workbook.active
     sheet.append(["Code", "Status"])
@@ -745,8 +2018,9 @@ def test_unbound_uncached_formula_downgrades_every_table_on_the_sheet(table_pars
         parser=table_parser,
     )
 
-    assert projection["tables"]
-    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert len(projection["tables"]) == 2
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
+    assert [table["matched_rule"] for table in projection["tables"]] == ["L1-07", "R1"]
 
 
 def test_multilevel_merged_header_stays_with_its_record_axis(table_parser):

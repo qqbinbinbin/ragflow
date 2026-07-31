@@ -2,7 +2,18 @@ import hashlib
 import json
 import unicodedata
 from collections import Counter
+from datetime import date
+from io import BytesIO
 from pathlib import Path
+
+import pytest
+from openpyxl import Workbook, load_workbook
+
+from test.fuxi.test_table_semantic_rows import _load_table_module
+
+import rag.app.tabular_structure as tabular_structure
+
+from rag.app.tabular_structure import build_tabular_structure_projection
 
 
 BASELINE_PATH = Path(__file__).parent / "fixtures" / "adr039-l1-regression-baseline.json"
@@ -22,6 +33,36 @@ FROZEN_L1_EXPECTATIONS = {
     "L1-SINGLE-COLUMN-CATALOGUE": (1, (2,), ("supported_complete",), ("L1-05",)),
     "L1-SPARSE-STABLE-SLOTS": (1, (3,), ("supported_complete",), ("L1-06",)),
     "L1-ADR044-XLS-EQUIVALENT": (1, (10,), ("supported_complete",), ("L1-01",)),
+}
+
+NEGATIVE_RULES = ("R1", "R2", "R3", "R4", "R5", "R6", "R7")
+
+
+def _truth_vector(*rules):
+    return {rule: rule in rules for rule in NEGATIVE_RULES}
+
+
+ORDERED_COLLISION_FIXTURES = {
+    "C12": (_truth_vector("R1", "R2"), "R1"),
+    "C16": (_truth_vector("R1", "R6"), "R1"),
+    "C17": (_truth_vector("R1", "R7"), "R1"),
+    "C23": (_truth_vector("R2", "R3"), "R2"),
+    "C24": (_truth_vector("R2", "R4"), "R2"),
+    "C25": (_truth_vector("R2", "R5"), "R2"),
+    "C26": (_truth_vector("R2", "R6"), "R2"),
+    "C27": (_truth_vector("R2", "R7"), "R2"),
+    "C34": (_truth_vector("R3", "R4"), "R3"),
+    "C35": (_truth_vector("R3", "R5"), "R3"),
+    "C36": (_truth_vector("R3", "R6"), "R3"),
+    "C37": (_truth_vector("R3", "R7"), "R3"),
+    "C45": (_truth_vector("R4", "R5"), "R4"),
+    "C46": (_truth_vector("R4", "R6"), "R4"),
+    "C47": (_truth_vector("R4", "R7"), "R4"),
+    "C56": (_truth_vector("R5", "R6"), "R5"),
+    "C57": (_truth_vector("R5", "R7"), "R5"),
+    "C67": (_truth_vector("R6", "R7"), "R6"),
+    "M01_R2_R4_R7": (_truth_vector("R2", "R4", "R7"), "R2"),
+    "M02_R3_R4_R7": (_truth_vector("R3", "R4", "R7"), "R3"),
 }
 
 
@@ -116,6 +157,159 @@ def _sample_objects(sample):
     raise AssertionError(f"unhandled builder case: {case}")
 
 
+def _save_workbook(workbook):
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def _set_row(sheet, row, columns, values):
+    assert len(columns) == len(values)
+    for column, value in zip(columns, values):
+        sheet.cell(row=row, column=column, value=value)
+
+
+def _build_anonymous_workbook(sample):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous structure"
+    shape = sample["shape"]
+    case = sample["builder_case"]
+
+    if case == "delayed_header_two_columns_three_records":
+        _set_row(sheet, shape["header_rows"][0], shape["occupied_columns"], ["Code", "State"])
+        for index, row in enumerate(shape["record_rows"], start=1):
+            _set_row(sheet, row, shape["occupied_columns"], [f"R-{index:02d}", f"S-{index:02d}"])
+    elif case in {
+        "three_merged_header_levels_two_columns_ten_records",
+        "adr044_biff8_conversion_of_three_merged_header_levels_two_columns_ten_records",
+    }:
+        labels = ["Anonymous level one", "Anonymous level two", "Anonymous level three"]
+        for merged_range, label in zip(shape["merged_ranges"], labels):
+            min_row, min_column, max_row, max_column = merged_range
+            sheet.merge_cells(
+                start_row=min_row,
+                start_column=min_column,
+                end_row=max_row,
+                end_column=max_column,
+            )
+            sheet.cell(row=min_row, column=min_column, value=label)
+        _set_row(sheet, shape["leaf_header_row"], shape["occupied_columns"], ["Code", "Date"])
+        for index, row in enumerate(shape["record_rows"], start=1):
+            _set_row(
+                sheet,
+                row,
+                shape["occupied_columns"],
+                [f"R-{index:02d}", date(2026, 1, index)],
+            )
+    elif case == "two_vertical_lists_two_blank_rows_two_records_each":
+        for object_index, (header_row, record_rows) in enumerate(
+            zip(shape["object_header_rows"], shape["object_record_rows"]),
+            start=1,
+        ):
+            _set_row(sheet, header_row, shape["occupied_columns"], ["Code", "State"])
+            for record_index, row in enumerate(record_rows, start=1):
+                _set_row(
+                    sheet,
+                    row,
+                    shape["occupied_columns"],
+                    [f"R-{object_index}-{record_index}", f"S-{record_index}"],
+                )
+    elif case in {
+        "equal_columns_headerless_single_row_continuation",
+        "subset_columns_headerless_single_row_continuation",
+        "superset_columns_named_header_and_single_record",
+    }:
+        main_columns = shape["main_columns"]
+        field_names = ["Code", "State", "Owner", "Revision", "Date"]
+        _set_row(
+            sheet,
+            shape["main_header_row"],
+            main_columns,
+            field_names[: len(main_columns)],
+        )
+        for record_index, row in enumerate(shape["main_record_rows"], start=1):
+            record_values = [
+                f"A-{record_index}",
+                "Open" if record_index % 2 else "Closed",
+                f"Team-{record_index}",
+                f"R{record_index}",
+                f"2026-01-0{record_index}",
+            ]
+            _set_row(
+                sheet,
+                row,
+                main_columns,
+                record_values[: len(main_columns)],
+            )
+        continuation_columns = shape["continuation_columns"]
+        if "continuation_header_row" in shape:
+            _set_row(
+                sheet,
+                shape["continuation_header_row"],
+                continuation_columns,
+                field_names[: len(continuation_columns)],
+            )
+        for record_index, row in enumerate(shape["continuation_record_rows"], start=3):
+            record_values = [
+                f"B-{record_index}",
+                "Open",
+                f"Team-{record_index}",
+                f"R{record_index}",
+                f"2026-01-0{record_index}",
+            ]
+            _set_row(
+                sheet,
+                row,
+                continuation_columns,
+                record_values[: len(continuation_columns)],
+            )
+    elif case == "single_header_one_column_two_records":
+        _set_row(sheet, shape["header_rows"][0], shape["occupied_columns"], ["Code"])
+        for index, row in enumerate(shape["record_rows"], start=1):
+            _set_row(sheet, row, shape["occupied_columns"], [f"R-{index:02d}"])
+    elif case == "three_columns_anchor_first_three_sparse_records":
+        _set_row(sheet, shape["header_rows"][0], shape["occupied_columns"], ["Code", "State", "Note"])
+        empty_cells = {tuple(cell) for cell in shape["empty_cells"]}
+        for index, row in enumerate(shape["record_rows"], start=1):
+            for column in shape["occupied_columns"]:
+                if (row, column) not in empty_cells:
+                    sheet.cell(row=row, column=column, value=index * 100 + column)
+    else:
+        raise AssertionError(f"unhandled builder case: {case}")
+
+    return _save_workbook(workbook)
+
+
+def _logical_workbook_members(binary):
+    workbook = load_workbook(BytesIO(binary), data_only=False, read_only=False)
+    sheet = workbook.active
+    members = {
+        (cell.row, cell.column)
+        for cell in sheet._cells.values()
+        if cell.value is not None and str(cell.value).strip()
+    }
+    for merged in sheet.merged_cells.ranges:
+        anchor = sheet.cell(merged.min_row, merged.min_col).value
+        if anchor is None or not str(anchor).strip():
+            continue
+        members.update(
+            (row, column)
+            for row in range(merged.min_row, merged.max_row + 1)
+            for column in range(merged.min_col, merged.max_col + 1)
+        )
+    return members
+
+
+def _table_membership_sha256(table):
+    return table["table_ref"].split("_")[2]
+
+
+@pytest.fixture
+def table_parser(monkeypatch):
+    return _load_table_module(monkeypatch).Excel()
+
+
 def test_l1_baseline_freezes_reviewed_object_counts_totals_statuses_and_rules():
     baseline = _load_baseline()
 
@@ -180,3 +374,89 @@ def test_l1_baseline_binds_duplicate_ingest_and_adr044_content_equivalence():
     assert _merge_map_digest(original_merges) == equivalence["expected_original_merge_map_sha256"]
     assert _merge_map_digest(converted_merges) == equivalence["expected_converted_merge_map_sha256"]
     assert original_merges == converted_merges == adr044["shape"]["merged_ranges"]
+
+
+def test_anonymous_builder_recreates_every_reviewed_member_coordinate():
+    baseline = _load_baseline()
+
+    for sample in baseline["samples"]:
+        binary = _build_anonymous_workbook(sample)
+        expected_members = set().union(*_sample_objects(sample))
+        assert _logical_workbook_members(binary) == expected_members, sample["sample_code"]
+
+
+@pytest.mark.parametrize("sample", _load_baseline()["samples"], ids=lambda sample: sample["sample_code"])
+def test_anonymous_l1_baseline_runs_through_the_real_producer(sample, table_parser):
+    binary = _build_anonymous_workbook(sample)
+    kwargs = {}
+    if sample["sample_code"] == "L1-ADR044-XLS-EQUIVALENT":
+        kwargs["adr044_conversion_receipt"] = {
+            "original_source_sha256": "1" * 64,
+            "converted_source_sha256": hashlib.sha256(binary).hexdigest(),
+            "converter_version": "anonymous-converter/v1",
+        }
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        binary,
+        parser=table_parser,
+        **kwargs,
+    )
+    tables = projection["tables"]
+
+    assert len(tables) == sample["expected_object_count"]
+    assert [table["source_total_count"] for table in tables] == sample["expected_source_totals"]
+    assert [table["enumeration_status"] for table in tables] == sample["expected_statuses"]
+    assert [table["matched_rule"] for table in tables] == sample["expected_rules"]
+    assert [_table_membership_sha256(table) for table in tables] == sample["expected_membership_sha256"]
+
+    rows_by_table = {
+        table["table_ref"]: [
+            row for row in projection["rows"] if row["table_ref_kwd"] == table["table_ref"]
+        ]
+        for table in tables
+    }
+    for table in tables:
+        data_rows = [row for row in rows_by_table[table["table_ref"]] if row["row_role_kwd"] == "data"]
+        assert [row["data_row_index_int"] for row in data_rows] == list(
+            range(1, table["source_total_count"] + 1)
+        )
+        assert all(row["source_total_count_int"] == table["source_total_count"] for row in data_rows)
+
+
+def test_adr044_rule_requires_a_receipt_bound_to_the_converted_bytes(table_parser):
+    sample = next(
+        sample
+        for sample in _load_baseline()["samples"]
+        if sample["sample_code"] == "L1-ADR044-XLS-EQUIVALENT"
+    )
+    binary = _build_anonymous_workbook(sample)
+
+    with pytest.raises(ValueError, match="converted source SHA-256"):
+        build_tabular_structure_projection(
+            "anonymous.xlsx",
+            binary,
+            parser=table_parser,
+            adr044_conversion_receipt={
+                "original_source_sha256": "1" * 64,
+                "converted_source_sha256": "2" * 64,
+                "converter_version": "anonymous-converter/v1",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("fixture_id", "truth_vector", "expected_rule"),
+    [
+        (fixture_id, truth_vector, expected_rule)
+        for fixture_id, (truth_vector, expected_rule) in ORDERED_COLLISION_FIXTURES.items()
+    ],
+    ids=list(ORDERED_COLLISION_FIXTURES),
+)
+def test_ordered_collision_truth_vectors_stop_at_the_first_matching_rule(
+    fixture_id,
+    truth_vector,
+    expected_rule,
+):
+    assert set(truth_vector) == set(NEGATIVE_RULES), fixture_id
+    assert tabular_structure._ordered_enumeration_rule(truth_vector, None) == expected_rule
