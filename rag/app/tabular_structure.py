@@ -750,6 +750,12 @@ def _parse_region_structure(parser, worksheet, rows):
     max_scan_rows = min(20, len(rows))
     candidates = []
     merged_ranges = list(worksheet.merged_cells.ranges)
+    merge_signature_counts = Counter(
+        signature
+        for row_ordinal in range(1, len(rows) + 1)
+        for signature in [_row_merge_signature(row_ordinal, merged_ranges)]
+        if signature
+    )
     for start in range(max_scan_rows):
         if parser._is_empty_row([cell.value for cell in rows[start]]):
             continue
@@ -776,6 +782,9 @@ def _parse_region_structure(parser, worksheet, rows):
                     continue
                 if _is_full_width_merge(row_index, len(headers), merged_ranges):
                     continue
+                merge_signature = _row_merge_signature(row_index, merged_ranges)
+                if merge_signature and merge_signature_counts[merge_signature] < 3:
+                    continue
                 values = [
                     _cell_value(parser, worksheet, row_index, column_index, merged_ranges)
                     for column_index in range(1, len(headers) + 1)
@@ -800,14 +809,7 @@ def _parse_region_structure(parser, worksheet, rows):
                 common_offsets = set.intersection(*offset_sets)
                 record_offsets = tuple(sorted(set.union(*offset_sets)))
                 optional_offsets = set(record_offsets) - common_offsets
-                if (
-                    not common_offsets
-                    or not optional_offsets
-                    or any(
-                        sum(offset in offsets for offsets in offset_sets) < 2
-                        for offset in optional_offsets
-                    )
-                ):
+                if not common_offsets or not optional_offsets:
                     continue
                 record_count = len(following_offsets)
             if any(
@@ -963,10 +965,49 @@ def _sparse_record_axis_proven(
         for offset in occupied_offsets
     ):
         return False
-    return all(
-        sum(offset in offsets for offsets in offset_sets) >= 2
-        for offset in optional_offsets
+    return True
+
+
+def _g1_disagreement_is_outside_record_axis(
+    region: dict[str, Any],
+    record_row_ordinals: set[int],
+) -> bool:
+    if not record_row_ordinals:
+        return False
+    record_members = {
+        coordinate
+        for coordinate in region["members"]
+        if coordinate[0] in record_row_ordinals
+    }
+    record_children = [
+        child for child in region["g1_children"] if child & record_members
+    ]
+    non_record_children = [
+        child for child in region["g1_children"] if not child & record_members
+    ]
+    return (
+        bool(record_members)
+        and len(record_children) == 1
+        and record_members.issubset(record_children[0])
+        and not any(
+            _members_prove_repeated_axis(child)
+            for child in non_record_children
+        )
+        and all(
+            row_ordinal < min(record_row_ordinals)
+            for child in non_record_children
+            for row_ordinal, _column_ordinal in child
+        )
     )
+
+
+def _g1_child_region(region: dict[str, Any], members: set[tuple[int, int]]) -> dict[str, Any]:
+    return {
+        "members": members,
+        "unresolved_members": region["unresolved_members"] & members,
+        "bbox": _region_bbox(members),
+        "g1_children": [members],
+    }
 
 
 def _context_with_headers(
@@ -1283,9 +1324,14 @@ def _new_projected_item(
     table: dict[str, Any],
     rows: list[dict[str, Any]],
     positive_rule: str | None,
+    structure_region: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     members = set(region["members"])
-    structure_evidence = _region_structure_evidence(parser, worksheet, region)
+    structure_evidence = _region_structure_evidence(
+        parser,
+        worksheet,
+        structure_region or region,
+    )
     emitted_row_ordinals = {row["row_ordinal_int"] for row in rows}
     body_row_ordinals = (
         set(structure_evidence["body_row_ordinals"])
@@ -2762,16 +2808,16 @@ def _build_tabular_structure_projection_with_audit(
             if len(children) <= 1:
                 candidates.append((region, False))
                 continue
-            # G1/G2 disagreement makes the object boundary unresolved. Keep
-            # the exact G2 member set as one unknown candidate until a governed
-            # adjudicator can decide whether it contains one object or several.
+            # Preserve the exact G2 candidate; proven record slots below decide
+            # whether the finer G1 split affects the record axis.
             candidates.append((region, True))
         source_regions = {
             (sheet_ordinal, region_index): region
-            for region_index, (region, _force_unknown_total) in enumerate(candidates, start=1)
+            for region_index, (region, _g1_disagreement) in enumerate(candidates, start=1)
         }
 
-        for region_index, (region, force_unknown_total) in enumerate(candidates, start=1):
+        for region_index, (region, g1_disagreement) in enumerate(candidates, start=1):
+            structure_region = region
             region_worksheet, row_offset = _copy_structure_region(parser, worksheet, region)
             result = _project_structure_region(
                 parser=parser,
@@ -2785,12 +2831,69 @@ def _build_tabular_structure_projection_with_audit(
                 row_offset=row_offset,
                 table_context_entry_limit=table_context_entry_limit,
                 table_context_value_bytes=table_context_value_bytes,
-                force_unknown_total=(
-                    force_unknown_total
-                    or not formula_inventory_proven
-                ),
+                force_unknown_total=not formula_inventory_proven,
             )
-            if force_unknown_total and result is not None:
+            if g1_disagreement and result is not None:
+                table, table_rows = result
+                record_rows = {
+                    row["row_ordinal_int"]
+                    for row in table_rows
+                    if row["row_role_kwd"] == "data"
+                }
+                g1_disagreement_is_safe = (
+                    table["source_total_count"] is not None
+                    and _g1_disagreement_is_outside_record_axis(
+                        region,
+                        record_rows,
+                    )
+                )
+            else:
+                g1_disagreement_is_safe = not g1_disagreement
+
+            if g1_disagreement and not g1_disagreement_is_safe:
+                child_results = []
+                for child_members in region["g1_children"]:
+                    child_region = _g1_child_region(region, child_members)
+                    child_worksheet, child_row_offset = _copy_structure_region(
+                        parser,
+                        worksheet,
+                        child_region,
+                    )
+                    child_result = _project_structure_region(
+                        parser=parser,
+                        worksheet=child_worksheet,
+                        sheet_name=sheet_name,
+                        sheet_ordinal=sheet_ordinal,
+                        table_ordinal=region_index,
+                        membership_sha256=region["membership_sha256"],
+                        source_sha256=source_sha256,
+                        producer_generation_ref=producer_generation_ref,
+                        row_offset=child_row_offset,
+                        table_context_entry_limit=table_context_entry_limit,
+                        table_context_value_bytes=table_context_value_bytes,
+                        force_unknown_total=not formula_inventory_proven,
+                    )
+                    if child_result is None:
+                        continue
+                    child_table, child_rows = child_result
+                    child_record_rows = {
+                        row["row_ordinal_int"]
+                        for row in child_rows
+                        if row["row_role_kwd"] == "data"
+                    }
+                    if (
+                        child_table["source_total_count"] is not None
+                        and _g1_disagreement_is_outside_record_axis(
+                            region,
+                            child_record_rows,
+                        )
+                    ):
+                        child_results.append((child_result, child_region))
+                if len(child_results) == 1:
+                    result, structure_region = child_results[0]
+                    g1_disagreement_is_safe = True
+
+            if g1_disagreement and result is not None and not g1_disagreement_is_safe:
                 result = _unknown_structure_region(
                     parser=parser,
                     worksheet=worksheet,
@@ -2819,6 +2922,7 @@ def _build_tabular_structure_projection_with_audit(
                         if table["source_total_count"] is not None
                         else None
                     ),
+                    structure_region=structure_region,
                 )
             )
 

@@ -1410,6 +1410,60 @@ def _merged_header_workbook_bytes():
     return _save_workbook(workbook)
 
 
+def _multilevel_sparse_table_with_context_child_bytes(*, context_row_count=1):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.merge_cells("A2:H3")
+    sheet["A2"] = "Anonymous catalogue"
+    sheet.merge_cells("A4:B4")
+    sheet["A4"] = "Identity"
+    sheet.merge_cells("C4:D4")
+    sheet["C4"] = "Classification"
+    sheet.merge_cells("E4:G4")
+    sheet["E4"] = "Attributes"
+    for row in range(4, 4 + context_row_count):
+        sheet.cell(row=row, column=10, value=f"Anonymous context {row}")
+    sheet.merge_cells("A5:B5")
+    sheet["A5"] = "Reference"
+    sheet.merge_cells("C5:D5")
+    sheet["C5"] = "Grouping"
+    sheet.merge_cells("E5:G5")
+    sheet["E5"] = "Details"
+    sheet.merge_cells("A6:H6")
+    sheet["A6"] = "Record fields"
+    sheet.merge_cells("A7:A8")
+    sheet["A7"] = "Number"
+    sheet.merge_cells("B7:B8")
+    sheet["B7"] = "Code"
+    sheet.merge_cells("C7:D7")
+    sheet["C7"] = "Group"
+    sheet["C8"] = "Type"
+    sheet["D8"] = "State"
+    sheet.merge_cells("E7:E8")
+    sheet["E7"] = "Owner"
+    sheet.merge_cells("F7:G7")
+    sheet["F7"] = "Limits"
+    sheet["F8"] = "Lower"
+    sheet["G8"] = "Upper"
+    sheet.merge_cells("H7:H8")
+    sheet["H7"] = "Optional"
+    for index, row in enumerate(range(9, 19), start=1):
+        values = [
+            index,
+            f"R-{index:02d}",
+            "A",
+            "Open",
+            "Team",
+            "0",
+            "1",
+            "present" if index == 8 else None,
+        ]
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row=row, column=column, value=value)
+    return _save_workbook(workbook)
+
+
 def _sparse_region_workbook_bytes():
     workbook = Workbook()
     sheet = workbook.active
@@ -2033,6 +2087,35 @@ def test_multilevel_merged_header_stays_with_its_record_axis(table_parser):
     assert len(projection["tables"]) == 1
     assert projection["tables"][0]["source_total_count"] == 2
     assert [row["row_ordinal_int"] for row in projection["rows"]] == [3, 4]
+
+
+def test_multilevel_sparse_table_ignores_context_only_g1_disagreement(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _multilevel_sparse_table_with_context_child_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    table = projection["tables"][0]
+    assert table["matched_rule"] == "L1-04"
+    assert table["source_total_count"] == 10
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == list(
+        range(9, 19)
+    )
+    assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
+
+
+def test_repeated_axis_g1_child_before_records_is_not_swallowed_as_context(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _multilevel_sparse_table_with_context_child_bytes(context_row_count=2),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] is None
+    assert projection["tables"][0]["matched_rule"] == "R8"
 
 
 def test_g_sensitive_sparse_table_remains_one_unknown_projection(table_parser):
