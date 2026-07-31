@@ -40,6 +40,7 @@ PROJECTION_FIELDS = frozenset(
         "version",
         "producer_schema_version",
         "producer_generation_ref",
+        "structure_algorithm_version",
         "enumeration_rule_version",
         "source_sha256",
         "tables",
@@ -3146,6 +3147,7 @@ def _build_tabular_structure_projection_with_audit(
         "version": PROJECTION_VERSION,
         "producer_schema_version": PRODUCER_SCHEMA_VERSION,
         "producer_generation_ref": producer_generation_ref,
+        "structure_algorithm_version": STRUCTURE_PRODUCER_ALGORITHM_VERSION,
         "enumeration_rule_version": ENUMERATION_RULE_VERSION,
         "source_sha256": source_sha256,
         "tables": tables,
@@ -3194,6 +3196,8 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         raise ValueError("unsupported tabular structure projection version")
     if projection.get("producer_schema_version") != PRODUCER_SCHEMA_VERSION:
         raise ValueError("unsupported table producer schema version")
+    if projection.get("structure_algorithm_version") != STRUCTURE_PRODUCER_ALGORITHM_VERSION:
+        raise ValueError("unsupported structure algorithm version")
     if projection.get("enumeration_rule_version") != ENUMERATION_RULE_VERSION:
         raise ValueError("unsupported enumeration rule version")
     generation_ref = projection.get("producer_generation_ref")
@@ -3477,6 +3481,7 @@ def store_tabular_structure_projection(
         "version": PROJECTION_VERSION,
         "producer_schema_version": projection["producer_schema_version"],
         "producer_generation_ref": generation_ref,
+        "structure_algorithm_version": projection["structure_algorithm_version"],
         "enumeration_rule_version": projection["enumeration_rule_version"],
         "source_sha256": projection["source_sha256"],
         "row_count": len(projection["rows"]),
@@ -3545,6 +3550,7 @@ def load_tabular_structure_projection(
         "version",
         "producer_schema_version",
         "producer_generation_ref",
+        "structure_algorithm_version",
         "enumeration_rule_version",
         "source_sha256",
         "row_count",
@@ -3556,6 +3562,7 @@ def load_tabular_structure_projection(
     if (
         manifest["version"] != PROJECTION_VERSION
         or manifest["producer_schema_version"] != PRODUCER_SCHEMA_VERSION
+        or manifest["structure_algorithm_version"] != STRUCTURE_PRODUCER_ALGORITHM_VERSION
         or manifest["enumeration_rule_version"] != ENUMERATION_RULE_VERSION
     ):
         raise StructureSnapshotChanged("manifest version changed")
@@ -3616,6 +3623,7 @@ def load_tabular_structure_projection(
         "version": manifest["version"],
         "producer_schema_version": manifest["producer_schema_version"],
         "producer_generation_ref": producer_generation_ref,
+        "structure_algorithm_version": manifest["structure_algorithm_version"],
         "enumeration_rule_version": manifest["enumeration_rule_version"],
         "source_sha256": manifest["source_sha256"],
         "tables": manifest["tables"],
@@ -3662,6 +3670,10 @@ def page_tabular_structure_rows(
     return {
         "producer_generation_ref": projection["producer_generation_ref"],
         "table_ref": table_ref,
+        "producer_schema_version": projection["producer_schema_version"],
+        "projection_version": projection["version"],
+        "structure_algorithm_version": projection["structure_algorithm_version"],
+        "enumeration_rule_version": projection["enumeration_rule_version"],
         "rows": page_rows,
         "total": len(rows),
         "source_total_count": table["source_total_count"],

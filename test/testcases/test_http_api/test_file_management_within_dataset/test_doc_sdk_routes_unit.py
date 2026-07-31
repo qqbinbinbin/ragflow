@@ -942,15 +942,28 @@ class TestDocRoutesUnit:
         class _Service:
             @staticmethod
             def get_active_generation(**kwargs):
-                calls.append(kwargs)
+                calls.append(("generation", kwargs))
                 return {
                     "producer_generation_ref": "generation-1",
-                    "projection_version": "tabular-structure-projection/v1",
-                    "producer_schema_version": "table-producer/v1",
+                    "projection_version": "tabular-structure-projection/v2",
+                    "producer_schema_version": "table-producer/v4",
                     "row_count": 3,
                     "status": "active",
                     "manifest_object_name": "private/object/name",
                     "source_sha256": "a" * 64,
+                }
+
+            @staticmethod
+            def read_active_manifest(storage, **kwargs):
+                calls.append(("manifest", storage, kwargs))
+                return {
+                    "producer_generation_ref": kwargs["producer_generation_ref"],
+                    "projection_version": "tabular-structure-projection/v2",
+                    "producer_schema_version": "table-producer/v4",
+                    "structure_algorithm_version": "region-producer/v7",
+                    "enumeration_rule_version": "enumeration-rules/v1",
+                    "row_count": 3,
+                    "tables": [],
                 }
 
         monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
@@ -964,19 +977,24 @@ class TestDocRoutesUnit:
             "code": 0,
             "data": {
                 "producer_generation_ref": "generation-1",
-                "projection_version": "tabular-structure-projection/v1",
-                "producer_schema_version": "table-producer/v1",
+                "projection_version": "tabular-structure-projection/v2",
+                "producer_schema_version": "table-producer/v4",
+                "structure_algorithm_version": "region-producer/v7",
+                "enumeration_rule_version": "enumeration-rules/v1",
                 "row_count": 3,
                 "status": "active",
             },
         }
-        assert calls == [
+        assert calls[0] == (
+            "generation",
             {
                 "tenant_id": "owner-tenant",
                 "dataset_id": "ds-1",
                 "document_id": "doc-1",
-            }
-        ]
+            },
+        )
+        assert calls[1][0] == "manifest"
+        assert calls[1][2]["producer_generation_ref"] == "generation-1"
 
     def test_structure_only_build_authorizes_and_never_reparses_ordinary_chunks(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
@@ -1011,9 +1029,19 @@ class TestDocRoutesUnit:
             "_get_tabular_structure_service",
             lambda: SimpleNamespace(
                 get_active_generation=lambda **_kwargs: {
-                    "projection_version": "tabular-structure-projection/v1",
-                    "producer_schema_version": "table-producer/v1",
-                }
+                    "producer_generation_ref": "generation-1",
+                    "projection_version": "tabular-structure-projection/v2",
+                    "producer_schema_version": "table-producer/v4",
+                },
+                read_active_manifest=lambda _storage, **_kwargs: {
+                    "producer_generation_ref": "generation-1",
+                    "projection_version": "tabular-structure-projection/v2",
+                    "producer_schema_version": "table-producer/v4",
+                    "structure_algorithm_version": "region-producer/v7",
+                    "enumeration_rule_version": "enumeration-rules/v1",
+                    "row_count": 3,
+                    "tables": [],
+                },
             ),
         )
         monkeypatch.setattr(
@@ -1030,8 +1058,10 @@ class TestDocRoutesUnit:
                 "status": "active",
                 "producer_generation_ref": "generation-1",
                 "row_count": 3,
-                "projection_version": "tabular-structure-projection/v1",
-                "producer_schema_version": "table-producer/v1",
+                "projection_version": "tabular-structure-projection/v2",
+                "producer_schema_version": "table-producer/v4",
+                "structure_algorithm_version": "region-producer/v7",
+                "enumeration_rule_version": "enumeration-rules/v1",
             },
         }
         assert len(calls) == 2
@@ -1061,10 +1091,20 @@ class TestDocRoutesUnit:
                 calls.append(("manifest", storage, kwargs))
                 return {
                     "producer_generation_ref": kwargs["producer_generation_ref"],
-                    "projection_version": "tabular-structure-projection/v1",
-                    "producer_schema_version": "table-producer/v1",
+                    "projection_version": "tabular-structure-projection/v2",
+                    "producer_schema_version": "table-producer/v4",
+                    "structure_algorithm_version": "region-producer/v7",
+                    "enumeration_rule_version": "enumeration-rules/v1",
                     "row_count": 3,
-                    "tables": [{"table_ref": "table-1", "source_total_count": 3}],
+                    "tables": [
+                        {
+                            "table_ref": "table-1",
+                            "source_total_count": 3,
+                            "enumeration_status": "supported_complete",
+                            "enumeration_reason": "record_axis_proven",
+                            "matched_rule": "L1-01",
+                        }
+                    ],
                 }
 
             @staticmethod
@@ -1073,6 +1113,10 @@ class TestDocRoutesUnit:
                 return {
                     "producer_generation_ref": kwargs["producer_generation_ref"],
                     "table_ref": kwargs["table_ref"],
+                    "producer_schema_version": "table-producer/v4",
+                    "projection_version": "tabular-structure-projection/v2",
+                    "structure_algorithm_version": "region-producer/v7",
+                    "enumeration_rule_version": "enumeration-rules/v1",
                     "rows": [{"row_ref_kwd": "row-1"}],
                     "total": 3,
                     "source_total_count": 3,
@@ -1094,6 +1138,20 @@ class TestDocRoutesUnit:
         manifest = _run(_route_core(module.get_tabular_structure_manifest)("tenant-1", "ds-1", "doc-1"))
         assert manifest["code"] == 0
         assert "manifest_object_name" not in manifest["data"]
+        assert {
+            key: manifest["data"][key]
+            for key in (
+                "producer_schema_version",
+                "projection_version",
+                "structure_algorithm_version",
+                "enumeration_rule_version",
+            )
+        } == {
+            "producer_schema_version": "table-producer/v4",
+            "projection_version": "tabular-structure-projection/v2",
+            "structure_algorithm_version": "region-producer/v7",
+            "enumeration_rule_version": "enumeration-rules/v1",
+        }
 
         monkeypatch.setattr(
             module,
@@ -1103,6 +1161,20 @@ class TestDocRoutesUnit:
         rows = _run(_route_core(module.list_tabular_structure_rows)("tenant-1", "ds-1", "doc-1", "table-1"))
         assert rows["code"] == 0
         assert rows["data"]["has_more"] is False
+        assert {
+            key: rows["data"][key]
+            for key in (
+                "producer_schema_version",
+                "projection_version",
+                "structure_algorithm_version",
+                "enumeration_rule_version",
+            )
+        } == {
+            "producer_schema_version": "table-producer/v4",
+            "projection_version": "tabular-structure-projection/v2",
+            "structure_algorithm_version": "region-producer/v7",
+            "enumeration_rule_version": "enumeration-rules/v1",
+        }
         assert calls[0][2] == {
             "tenant_id": "owner-tenant",
             "dataset_id": "ds-1",

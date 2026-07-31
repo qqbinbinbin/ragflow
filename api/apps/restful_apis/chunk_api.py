@@ -122,12 +122,21 @@ async def get_active_tabular_structure_generation(tenant_id, dataset_id, documen
             dataset_id=dataset_id,
             document_id=document_id,
         )
+        manifest = _get_tabular_structure_service().read_active_manifest(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=generation["producer_generation_ref"],
+        )
         data = {
-            key: generation[key]
+            key: (manifest[key] if key in manifest else generation[key])
             for key in (
                 "producer_generation_ref",
                 "projection_version",
                 "producer_schema_version",
+                "structure_algorithm_version",
+                "enumeration_rule_version",
                 "row_count",
                 "status",
             )
@@ -171,9 +180,18 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
                 dataset_id=dataset_id,
                 document_id=document_id,
             )
+            manifest = _get_tabular_structure_service().read_active_manifest(
+                settings.STORAGE_IMPL,
+                tenant_id=owner_tenant_id,
+                dataset_id=dataset_id,
+                document_id=document_id,
+                producer_generation_ref=active["producer_generation_ref"],
+            )
             safe_result.update({
-                "projection_version": active["projection_version"],
-                "producer_schema_version": active["producer_schema_version"],
+                "projection_version": manifest["projection_version"],
+                "producer_schema_version": manifest["producer_schema_version"],
+                "structure_algorithm_version": manifest["structure_algorithm_version"],
+                "enumeration_rule_version": manifest["enumeration_rule_version"],
             })
         return get_result(data=safe_result)
     except Exception as error:
