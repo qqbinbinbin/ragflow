@@ -29,10 +29,10 @@ from io import BytesIO
 from typing import Any
 
 
-TABULAR_STRUCTURE_VERSION = "tabular-row/v1"
-PRODUCER_SCHEMA_VERSION = "table-producer/v4"
-PROJECTION_VERSION = "tabular-structure-projection/v2"
-PROJECTION_PART_VERSION = "tabular-structure-part/v1"
+TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
+PRODUCER_SCHEMA_VERSION = "table-producer/v5"
+PROJECTION_VERSION = "tabular-structure-projection/v3"
+PROJECTION_PART_VERSION = "tabular-structure-part/v2"
 STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v7"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v1"
 PROJECTION_FIELDS = frozenset(
@@ -269,9 +269,18 @@ def _complete_worksheet_rows(worksheet):
     return header_rows, populated_rows, unresolved_rows
 
 
-def _ordered_fields(headers: list[str], values: list[object], *, note: bool) -> list[dict[str, str]]:
+def _ordered_fields(
+    headers: list[str],
+    values: list[object],
+    *,
+    note: bool,
+    sheet_ordinal: int | None = None,
+    header_paths: list[list[str]] | None = None,
+    column_ordinals: list[int] | None = None,
+    absolute_column_ordinals: list[int] | None = None,
+) -> list[dict[str, Any]]:
     fields = []
-    for name, value in zip(headers, values):
+    for index, (name, value) in enumerate(zip(headers, values)):
         if value is None or (isinstance(value, str) and not value.strip()):
             continue
         rendered = (
@@ -281,7 +290,25 @@ def _ordered_fields(headers: list[str], values: list[object], *, note: bool) -> 
         )
         if not rendered:
             continue
-        fields.append({"name": str(name), "value": rendered})
+        field = {"name": str(name), "value": rendered}
+        if sheet_ordinal is not None:
+            column_ordinal = (
+                column_ordinals[index]
+                if column_ordinals is not None
+                else index + 1
+            )
+            absolute_column_ordinal = (
+                absolute_column_ordinals[index]
+                if absolute_column_ordinals is not None
+                else column_ordinal
+            )
+            field = {
+                "column_id": f"col_v1:{sheet_ordinal}:{absolute_column_ordinal}",
+                "column_ordinal": column_ordinal,
+                "header_path": list(header_paths[index]) if header_paths is not None else [],
+                **field,
+            }
+        fields.append(field)
         if note:
             break
     return fields
@@ -743,6 +770,7 @@ def _copy_structure_region(parser, worksheet, region: dict[str, Any]):
         (row_ordinal - min_row + 1, column_ordinal - min_column + 1)
         for row_ordinal, column_ordinal in region["unresolved_members"]
     }
+    target._fuxi_source_column_offset = min_column - 1
     return target, min_row - 1
 
 
@@ -844,6 +872,19 @@ def _parse_region_structure(parser, worksheet, rows):
         ) = max(candidates)
         return headers, header_start, data_start
     return fallback
+
+
+def _header_paths_for_region(parser, worksheet, rows, header_start: int, data_start: int):
+    paths = parser._build_header_paths_for_region(
+        worksheet,
+        rows,
+        header_start,
+        data_start,
+    )
+    return [
+        [str(segment).strip() for segment in path if str(segment).strip()]
+        for path in paths
+    ]
 
 
 def _record_field_offsets(values: list[object]) -> tuple[int, ...]:
@@ -1052,6 +1093,16 @@ def _project_structure_region(
     headers, header_start, data_start = _parse_region_structure(parser, worksheet, header_rows)
     if not headers:
         return None
+    header_paths = _header_paths_for_region(
+        parser,
+        worksheet,
+        header_rows,
+        header_start,
+        data_start,
+    )
+    if len(header_paths) != len(headers):
+        return None
+    source_column_offset = getattr(worksheet, "_fuxi_source_column_offset", 0)
 
     body_ordinals = {ordinal for ordinal in populated_row_ordinals if ordinal > data_start}
     unresolved_body_ordinals = {ordinal for ordinal in unresolved_row_ordinals if ordinal > data_start}
@@ -1184,7 +1235,20 @@ def _project_structure_region(
                 "row_role_kwd": row_role,
                 "source_total_count_int": None,
                 "ordered_fields_list": json.dumps(
-                    _ordered_fields(headers, values, note=row_role == "note"),
+                    _ordered_fields(
+                        headers,
+                        values,
+                        note=row_role == "note",
+                        sheet_ordinal=sheet_ordinal,
+                        header_paths=header_paths,
+                        column_ordinals=list(range(1, len(headers) + 1)),
+                        absolute_column_ordinals=list(
+                            range(
+                                source_column_offset + 1,
+                                source_column_offset + len(headers) + 1,
+                            )
+                        ),
+                    ),
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
@@ -1307,9 +1371,21 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
     if not headers or not body_rows:
         return None
     min_column = region["bbox"][1]
+    header_paths = _header_paths_for_region(
+        parser,
+        region_worksheet,
+        header_rows,
+        header_start,
+        data_start,
+    )
+    if len(header_paths) != len(headers):
+        return None
     return {
         "headers_by_column": {
             min_column + offset: header for offset, header in enumerate(headers)
+        },
+        "header_paths_by_column": {
+            min_column + offset: path for offset, path in enumerate(header_paths)
         },
         "body_row_ordinals": [row + row_offset for row in body_rows],
         "header_depth": data_start - header_start,
@@ -1864,6 +1940,7 @@ def _merge_continuation_pair(
     if not main_evidence:
         return None
     headers_by_column = dict(main_evidence["headers_by_column"])
+    header_paths_by_column = dict(main_evidence["header_paths_by_column"])
     continuation_evidence = continuation.get("structure_evidence")
     if continuation["table"]["data_row_count"] == 0 and continuation_evidence is not None:
         return None
@@ -1881,13 +1958,19 @@ def _merge_continuation_pair(
         return None
     if named_continuation:
         continuation_headers = continuation_evidence["headers_by_column"]
+        continuation_header_paths = continuation_evidence["header_paths_by_column"]
         if any(
             column in headers_by_column
-            and headers_by_column[column] != continuation_headers.get(column)
+            and (
+                headers_by_column[column] != continuation_headers.get(column)
+                or header_paths_by_column[column]
+                != continuation_header_paths.get(column)
+            )
             for column in main_columns & continuation_columns
         ):
             return None
         headers_by_column.update(continuation_headers)
+        header_paths_by_column.update(continuation_header_paths)
     elif not _continuation_rows_match_proven_axis(
         parser=parser,
         worksheet=worksheet,
@@ -1946,7 +2029,15 @@ def _merge_continuation_pair(
                 list(worksheet.merged_cells.ranges),
             )
             row_fields.extend(
-                _ordered_fields([headers_by_column[column]], [value], note=False)
+                _ordered_fields(
+                    [headers_by_column[column]],
+                    [value],
+                    note=False,
+                    sheet_ordinal=main["table"]["sheet_ordinal"],
+                    header_paths=[header_paths_by_column[column]],
+                    column_ordinals=[column - min(headers_by_column) + 1],
+                    absolute_column_ordinals=[column],
+                )
             )
         row["ordered_fields_list"] = json.dumps(
             row_fields,
@@ -1991,6 +2082,7 @@ def _merge_continuation_pair(
     members = main["members"] | continuation["members"]
     structure_evidence = {
         "headers_by_column": headers_by_column,
+        "header_paths_by_column": header_paths_by_column,
         "body_row_ordinals": sorted(
             set(main_evidence["body_row_ordinals"])
             | {row["row_ordinal_int"] for row in continuation_rows}
@@ -2688,6 +2780,7 @@ def _unknown_structure_region(
     rows = []
     for row_ordinal in sorted({row for row, _column in region["members"]}):
         columns = sorted(column for row, column in region["members"] if row == row_ordinal)
+        first_column = min(columns)
         fields = []
         for column_ordinal in columns:
             value = _cell_value(parser, worksheet, row_ordinal, column_ordinal, merged_ranges)
@@ -2698,6 +2791,10 @@ def _unknown_structure_region(
                     [f"Column_{column_ordinal}"],
                     [value],
                     note=False,
+                    sheet_ordinal=sheet_ordinal,
+                    header_paths=[[]],
+                    column_ordinals=[column_ordinal - first_column + 1],
+                    absolute_column_ordinals=[column_ordinal],
                 )
             )
         row_ref = f"{table_ref}:{row_ordinal}"
@@ -3269,14 +3366,44 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
                 values = json.loads(row[field_name])
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError(f"{label} must be valid JSON") from exc
-            if not isinstance(values, list) or any(
-                not isinstance(item, dict)
-                or set(item) != {"name", "value"}
-                or not isinstance(item["name"], str)
-                or not isinstance(item["value"], str)
-                for item in values
-            ):
-                raise ValueError(f"{label} must use the fixed name/value schema")
+            if not isinstance(values, list):
+                raise ValueError(f"{label} must use the fixed field schema")
+            if field_name == "table_context_list":
+                invalid = any(
+                    not isinstance(item, dict)
+                    or set(item) != {"name", "value"}
+                    or not isinstance(item["name"], str)
+                    or not isinstance(item["value"], str)
+                    for item in values
+                )
+            else:
+                invalid = any(
+                    not isinstance(item, dict)
+                    or set(item)
+                    != {
+                        "column_id",
+                        "column_ordinal",
+                        "header_path",
+                        "name",
+                        "value",
+                    }
+                    or not isinstance(item["column_id"], str)
+                    or re.fullmatch(r"col_v1:[1-9][0-9]*:[1-9][0-9]*", item["column_id"])
+                    is None
+                    or not isinstance(item["column_ordinal"], int)
+                    or isinstance(item["column_ordinal"], bool)
+                    or item["column_ordinal"] < 1
+                    or not isinstance(item["header_path"], list)
+                    or any(
+                        not isinstance(segment, str) or not segment.strip()
+                        for segment in item["header_path"]
+                    )
+                    or not isinstance(item["name"], str)
+                    or not isinstance(item["value"], str)
+                    for item in values
+                )
+            if invalid:
+                raise ValueError(f"{label} must use the fixed field schema")
             parsed_lists[field_name] = values
         context = parsed_lists["table_context_list"]
         if len(context) > DEFAULT_CONTEXT_ENTRY_LIMIT:

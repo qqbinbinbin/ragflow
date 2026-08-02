@@ -25,8 +25,15 @@ from rag.app.tabular_structure import (
 
 
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v4"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v2"
+    assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v5"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v3"
+    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v7"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v5"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v3"
+    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
     assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v7"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
 
@@ -48,7 +55,7 @@ def test_table_ref_identity_binds_all_versions_and_exact_membership(monkeypatch)
     monkeypatch.setattr(
         tabular_structure,
         "PROJECTION_VERSION",
-        "tabular-structure-projection/v2",
+        "tabular-structure-projection/v3",
     )
     monkeypatch.setattr(
         tabular_structure,
@@ -1601,12 +1608,72 @@ def test_horizontal_tables_use_exact_columns_without_duplicate_ingestion(table_p
         for table in projection["tables"]
     }
     assert rows_by_table[projection["tables"][0]["table_ref"]] == [
-        [{"name": "Left code", "value": "L-1"}, {"name": "Left status", "value": "Open"}],
-        [{"name": "Left code", "value": "L-2"}, {"name": "Left status", "value": "Closed"}],
+        [
+            {
+                "column_id": "col_v1:1:1",
+                "column_ordinal": 1,
+                "header_path": ["Left code"],
+                "name": "Left code",
+                "value": "L-1",
+            },
+            {
+                "column_id": "col_v1:1:2",
+                "column_ordinal": 2,
+                "header_path": ["Left status"],
+                "name": "Left status",
+                "value": "Open",
+            },
+        ],
+        [
+            {
+                "column_id": "col_v1:1:1",
+                "column_ordinal": 1,
+                "header_path": ["Left code"],
+                "name": "Left code",
+                "value": "L-2",
+            },
+            {
+                "column_id": "col_v1:1:2",
+                "column_ordinal": 2,
+                "header_path": ["Left status"],
+                "name": "Left status",
+                "value": "Closed",
+            },
+        ],
     ]
     assert rows_by_table[projection["tables"][1]["table_ref"]] == [
-        [{"name": "Right code", "value": "R-1"}, {"name": "Right status", "value": "Closed"}],
-        [{"name": "Right code", "value": "R-2"}, {"name": "Right status", "value": "Open"}],
+        [
+            {
+                "column_id": "col_v1:1:5",
+                "column_ordinal": 1,
+                "header_path": ["Right code"],
+                "name": "Right code",
+                "value": "R-1",
+            },
+            {
+                "column_id": "col_v1:1:6",
+                "column_ordinal": 2,
+                "header_path": ["Right status"],
+                "name": "Right status",
+                "value": "Closed",
+            },
+        ],
+        [
+            {
+                "column_id": "col_v1:1:5",
+                "column_ordinal": 1,
+                "header_path": ["Right code"],
+                "name": "Right code",
+                "value": "R-2",
+            },
+            {
+                "column_id": "col_v1:1:6",
+                "column_ordinal": 2,
+                "header_path": ["Right status"],
+                "name": "Right status",
+                "value": "Open",
+            },
+        ],
     ]
 
 
@@ -1990,8 +2057,24 @@ def test_single_column_record_axis_gets_a_complete_projection(table_parser):
         for row in projection["rows"]
         if row["row_role_kwd"] == "data"
     ] == [
-        [{"name": "Code", "value": "S-1"}],
-        [{"name": "Code", "value": "S-2"}],
+        [
+            {
+                "column_id": "col_v1:1:1",
+                "column_ordinal": 1,
+                "header_path": ["Code"],
+                "name": "Code",
+                "value": "S-1",
+            }
+        ],
+        [
+            {
+                "column_id": "col_v1:1:1",
+                "column_ordinal": 1,
+                "header_path": ["Code"],
+                "name": "Code",
+                "value": "S-2",
+            }
+        ],
     ]
     expected_membership = tabular_structure._region_membership_sha256(
         1,
@@ -2203,9 +2286,27 @@ def test_duplicate_values_remain_distinct_and_rows_use_only_fixed_fields(table_p
     assert uncertain_rows[0]["data_row_index_int"] is None
     assert all(set(row) == PROJECTION_ROW_FIELDS for row in projection["rows"])
     assert json.loads(data_rows[0]["ordered_fields_list"]) == [
-        {"name": "Code", "value": "R-DUP"},
-        {"name": "Description", "value": "Repeated"},
-        {"name": "Force", "value": "7.5"},
+        {
+            "column_id": "col_v1:1:1",
+            "column_ordinal": 1,
+            "header_path": ["Code"],
+            "name": "Code",
+            "value": "R-DUP",
+        },
+        {
+            "column_id": "col_v1:1:2",
+            "column_ordinal": 2,
+            "header_path": ["Description"],
+            "name": "Description",
+            "value": "Repeated",
+        },
+        {
+            "column_id": "col_v1:1:3",
+            "column_ordinal": 3,
+            "header_path": ["Force"],
+            "name": "Force",
+            "value": "7.5",
+        },
     ]
     assert all("Code" not in set(row) for row in projection["rows"])
 
@@ -2314,7 +2415,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v2"
+    assert projection["version"] == "tabular-structure-projection/v3"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 
@@ -2505,6 +2606,19 @@ def test_malformed_json_evidence_fields_fail_validation(table_parser):
     projection["rows"][0]["ordered_fields_list"] = "not-json"
 
     with pytest.raises(ValueError, match="ordered fields"):
+        validate_tabular_structure_projection(projection)
+
+
+@pytest.mark.parametrize("payload", [5, None, True, {"unexpected": "value"}])
+def test_fixed_field_schema_rejects_non_list_json_payloads(table_parser, payload):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _workbook_bytes(),
+        parser=table_parser,
+    )
+    projection["rows"][0]["ordered_fields_list"] = json.dumps(payload)
+
+    with pytest.raises(ValueError, match="ordered fields must use the fixed field schema"):
         validate_tabular_structure_projection(projection)
 
 

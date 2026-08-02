@@ -315,6 +315,50 @@ class Excel(ExcelParser):
             headers.append("-".join(parts) if parts else f"Column_{col_idx + 1}")
         return headers
 
+    def _build_header_paths_for_region(self, ws, rows, start, end):
+        """Return source-backed header segments without parsing their text."""
+        paths = []
+        max_col = max((len(row) for row in rows[start:end]), default=0)
+        merged_ranges = list(ws.merged_cells.ranges)
+        for col_idx in range(max_col):
+            parts = []
+            seen_sources = set()
+            for row_idx in range(start, end):
+                row_ordinal = row_idx + 1
+                column_ordinal = col_idx + 1
+                merged = next(
+                    (
+                        candidate
+                        for candidate in merged_ranges
+                        if candidate.min_row <= row_ordinal <= candidate.max_row
+                        and candidate.min_col <= column_ordinal <= candidate.max_col
+                    ),
+                    None,
+                )
+                if merged is not None:
+                    source = (
+                        "merge",
+                        merged.min_row,
+                        merged.min_col,
+                        merged.max_row,
+                        merged.max_col,
+                    )
+                    value = ws.cell(merged.min_row, merged.min_col).value
+                else:
+                    if col_idx >= len(rows[row_idx]):
+                        continue
+                    source = ("cell", row_ordinal, column_ordinal)
+                    value = rows[row_idx][col_idx].value
+                if source in seen_sources or self._is_empty_value(value):
+                    continue
+                rendered = str(value).strip()
+                is_child_header = row_idx > start and bool(parts)
+                if self._is_valid_header_part(rendered) or is_child_header:
+                    parts.append(rendered)
+                    seen_sources.add(source)
+            paths.append(parts)
+        return paths
+
     def _build_sheet_context(self, ws, rows):
         context_lines = []
         merged_ranges = list(ws.merged_cells.ranges)
