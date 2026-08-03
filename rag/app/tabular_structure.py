@@ -31,9 +31,9 @@ from typing import Any
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v5"
-PROJECTION_VERSION = "tabular-structure-projection/v3"
+PROJECTION_VERSION = "tabular-structure-projection/v4"
 PROJECTION_PART_VERSION = "tabular-structure-part/v2"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v7"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v8"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v1"
 PROJECTION_FIELDS = frozenset(
     {
@@ -238,6 +238,22 @@ def _cell_value(parser, worksheet, row_ordinal: int, column_ordinal: int, merged
     return parser._get_merged_cell_value(worksheet, row_ordinal, column_ordinal, merged_ranges)
 
 
+def _source_cell_anchor(row_ordinal: int, column_ordinal: int, merged_ranges):
+    for merged in merged_ranges:
+        if (
+            merged.min_row <= row_ordinal <= merged.max_row
+            and merged.min_col <= column_ordinal <= merged.max_col
+        ):
+            return (
+                "merge",
+                merged.min_row,
+                merged.min_col,
+                merged.max_row,
+                merged.max_col,
+            )
+    return ("cell", row_ordinal, column_ordinal)
+
+
 def _complete_worksheet_rows(worksheet):
     """Return a bounded header probe plus all physically populated row ordinals."""
 
@@ -278,8 +294,10 @@ def _ordered_fields(
     header_paths: list[list[str]] | None = None,
     column_ordinals: list[int] | None = None,
     absolute_column_ordinals: list[int] | None = None,
+    source_anchors: list[tuple] | None = None,
 ) -> list[dict[str, Any]]:
     fields = []
+    emitted_anchors = set()
     for index, (name, value) in enumerate(zip(headers, values)):
         if value is None or (isinstance(value, str) and not value.strip()):
             continue
@@ -290,6 +308,11 @@ def _ordered_fields(
         )
         if not rendered:
             continue
+        source_anchor = source_anchors[index] if source_anchors is not None else None
+        if source_anchor is not None:
+            if source_anchor in emitted_anchors:
+                continue
+            emitted_anchors.add(source_anchor)
         field = {"name": str(name), "value": rendered}
         if sheet_ordinal is not None:
             column_ordinal = (
@@ -1248,6 +1271,14 @@ def _project_structure_region(
                                 source_column_offset + len(headers) + 1,
                             )
                         ),
+                        source_anchors=[
+                            _source_cell_anchor(
+                                local_row_ordinal,
+                                column_ordinal,
+                                merged_ranges,
+                            )
+                            for column_ordinal in range(1, len(headers) + 1)
+                        ],
                     ),
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -2013,32 +2044,40 @@ def _merge_continuation_pair(
     rows = [dict(row) for row in main["rows"]]
     for source_row in continuation_rows:
         row = dict(source_row)
-        row_fields = []
-        for column in sorted(
+        columns = sorted(
             column
             for member_row, column in continuation["members"]
             if member_row == row["row_ordinal_int"]
-        ):
-            if column not in headers_by_column:
-                continue
-            value = _cell_value(
+            and column in headers_by_column
+        )
+        merged_ranges = list(worksheet.merged_cells.ranges)
+        values = [
+            _cell_value(
                 parser,
                 worksheet,
                 row["row_ordinal_int"],
                 column,
-                list(worksheet.merged_cells.ranges),
+                merged_ranges,
             )
-            row_fields.extend(
-                _ordered_fields(
-                    [headers_by_column[column]],
-                    [value],
-                    note=False,
-                    sheet_ordinal=main["table"]["sheet_ordinal"],
-                    header_paths=[header_paths_by_column[column]],
-                    column_ordinals=[column - min(headers_by_column) + 1],
-                    absolute_column_ordinals=[column],
+            for column in columns
+        ]
+        row_fields = _ordered_fields(
+            [headers_by_column[column] for column in columns],
+            values,
+            note=False,
+            sheet_ordinal=main["table"]["sheet_ordinal"],
+            header_paths=[header_paths_by_column[column] for column in columns],
+            column_ordinals=[column - min(headers_by_column) + 1 for column in columns],
+            absolute_column_ordinals=columns,
+            source_anchors=[
+                _source_cell_anchor(
+                    row["row_ordinal_int"],
+                    column,
+                    merged_ranges,
                 )
-            )
+                for column in columns
+            ],
+        )
         row["ordered_fields_list"] = json.dumps(
             row_fields,
             ensure_ascii=False,
@@ -2781,22 +2820,30 @@ def _unknown_structure_region(
     for row_ordinal in sorted({row for row, _column in region["members"]}):
         columns = sorted(column for row, column in region["members"] if row == row_ordinal)
         first_column = min(columns)
-        fields = []
-        for column_ordinal in columns:
-            value = _cell_value(parser, worksheet, row_ordinal, column_ordinal, merged_ranges)
-            if value is None or str(value).strip() == "":
-                continue
-            fields.extend(
-                _ordered_fields(
-                    [f"Column_{column_ordinal}"],
-                    [value],
-                    note=False,
-                    sheet_ordinal=sheet_ordinal,
-                    header_paths=[[]],
-                    column_ordinals=[column_ordinal - first_column + 1],
-                    absolute_column_ordinals=[column_ordinal],
+        fields = _ordered_fields(
+            [f"Column_{column_ordinal}" for column_ordinal in columns],
+            [
+                _cell_value(
+                    parser,
+                    worksheet,
+                    row_ordinal,
+                    column_ordinal,
+                    merged_ranges,
                 )
-            )
+                for column_ordinal in columns
+            ],
+            note=False,
+            sheet_ordinal=sheet_ordinal,
+            header_paths=[[] for _column_ordinal in columns],
+            column_ordinals=[
+                column_ordinal - first_column + 1 for column_ordinal in columns
+            ],
+            absolute_column_ordinals=columns,
+            source_anchors=[
+                _source_cell_anchor(row_ordinal, column_ordinal, merged_ranges)
+                for column_ordinal in columns
+            ],
+        )
         row_ref = f"{table_ref}:{row_ordinal}"
         rows.append(
             {

@@ -27,14 +27,14 @@ from rag.app.tabular_structure import (
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v5"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v3"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v4"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v7"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v8"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v5"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v3"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v4"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v7"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v8"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
 
 
@@ -55,7 +55,7 @@ def test_table_ref_identity_binds_all_versions_and_exact_membership(monkeypatch)
     monkeypatch.setattr(
         tabular_structure,
         "PROJECTION_VERSION",
-        "tabular-structure-projection/v3",
+        "tabular-structure-projection/v4",
     )
     monkeypatch.setattr(
         tabular_structure,
@@ -2415,7 +2415,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v3"
+    assert projection["version"] == "tabular-structure-projection/v4"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 

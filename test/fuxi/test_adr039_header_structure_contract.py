@@ -86,6 +86,29 @@ def _unnamed_superset_workbook() -> bytes:
     return _save_workbook(workbook)
 
 
+def _horizontally_merged_data_anchor_workbook() -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous structure"
+    sheet.append(["Code", "Criteria", None, "Note"])
+    sheet.merge_cells("B1:C1")
+    for row_ordinal, code, criteria, note in (
+        (2, "A-1", "Within limit", "Reviewed"),
+        (3, "A-2", "At limit", "Pending"),
+        (4, "A-3", "Above limit", "Escalated"),
+    ):
+        sheet.cell(row=row_ordinal, column=1, value=code)
+        sheet.cell(row=row_ordinal, column=2, value=criteria)
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=2,
+            end_row=row_ordinal,
+            end_column=3,
+        )
+        sheet.cell(row=row_ordinal, column=4, value=note)
+    return _save_workbook(workbook)
+
+
 @pytest.fixture
 def table_parser(monkeypatch):
     return _load_table_module(monkeypatch).Excel()
@@ -116,9 +139,9 @@ class _MemoryStorage:
 def test_header_structure_contract_uses_the_reviewed_strict_versions():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
     assert tabular_structure.PRODUCER_SCHEMA_VERSION == "table-producer/v5"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v3"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v4"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v7"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v8"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
 
 
@@ -248,6 +271,33 @@ def test_header_path_deduplicates_merge_identity_not_equal_text(table_parser):
         "Same text",
         "Code / type: A|B\nC",
     ]
+
+
+def test_horizontal_merged_data_anchor_is_emitted_once_per_record(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _horizontally_merged_data_anchor_workbook(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["enumeration_status"] == "supported_complete"
+    assert projection["tables"][0]["source_total_count"] == 3
+    for fields in _data_fields(projection):
+        assert [field["column_id"] for field in fields] == [
+            "col_v1:1:1",
+            "col_v1:1:2",
+            "col_v1:1:4",
+        ]
+        assert [field["column_ordinal"] for field in fields] == [1, 2, 4]
+        assert [field["header_path"] for field in fields] == [
+            ["Code"],
+            ["Criteria"],
+            ["Note"],
+        ]
+        assert sum(
+            field["value"] in {"Within limit", "At limit", "Above limit"}
+            for field in fields
+        ) == 1
 
 
 def test_single_level_header_remains_one_atomic_path_segment(table_parser):
