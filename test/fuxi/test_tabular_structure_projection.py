@@ -26,16 +26,117 @@ from rag.app.tabular_structure import (
 
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v5"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v4"
-    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v8"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v5"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v4"
-    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v8"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v5"
+    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v9"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v2"
+
+
+def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous empty register"
+    sheet.merge_cells("A1:F1")
+    sheet["A1"] = "Anonymous register"
+    sheet.append(
+        [
+            "Sequence",
+            "Reference",
+            "Received",
+            "Issuer",
+            "Issued",
+            "Reason",
+        ]
+    )
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["rows"] == []
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0] == {
+        "table_ref": projection["tables"][0]["table_ref"],
+        "sheet_ordinal": 1,
+        "table_ordinal": 1,
+        "row_count": 0,
+        "data_row_count": 0,
+        "source_total_count": 0,
+        "table_label": "Anonymous empty register",
+        "table_context": [
+            {"name": "context", "value": "Anonymous register"},
+            *(
+                {"name": "field", "value": name}
+                for name in (
+                    "Sequence",
+                    "Reference",
+                    "Received",
+                    "Issuer",
+                    "Issued",
+                    "Reason",
+                )
+            ),
+        ],
+        "ordered_columns": [
+            {
+                "column_id": f"col_v1:1:{ordinal}",
+                "column_ordinal": ordinal,
+                "header_path": [name],
+                "name": name,
+            }
+            for ordinal, name in enumerate(
+                (
+                    "Sequence",
+                    "Reference",
+                    "Received",
+                    "Issuer",
+                    "Issued",
+                    "Reason",
+                ),
+                start=1,
+            )
+        ],
+        "enumeration_status": "supported_complete",
+        "enumeration_reason": "empty_record_axis_proven",
+        "matched_rule": "L1-08",
+    }
+
+
+def test_two_cell_signoff_row_is_not_promoted_to_an_empty_list(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Prepared by", "Approved by"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["matched_rule"] != "L1-08" for table in projection["tables"])
+
+
+def test_header_with_unresolved_body_content_is_not_promoted_to_an_empty_list(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:C1")
+    sheet["A1"] = "Anonymous register"
+    sheet.append(["Sequence", "Reference", "Reason"])
+    sheet.merge_cells("A3:C3")
+    sheet["A3"] = "Pending note"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["matched_rule"] != "L1-08" for table in projection["tables"])
 
 
 def test_table_ref_identity_binds_all_versions_and_exact_membership(monkeypatch):
@@ -91,7 +192,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v1"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v2"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
@@ -2415,7 +2516,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v4"
+    assert projection["version"] == "tabular-structure-projection/v5"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 

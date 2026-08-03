@@ -30,11 +30,11 @@ from typing import Any
 
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
-PRODUCER_SCHEMA_VERSION = "table-producer/v5"
-PROJECTION_VERSION = "tabular-structure-projection/v4"
-PROJECTION_PART_VERSION = "tabular-structure-part/v2"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v8"
-ENUMERATION_RULE_VERSION = "enumeration-rules/v1"
+PRODUCER_SCHEMA_VERSION = "table-producer/v6"
+PROJECTION_VERSION = "tabular-structure-projection/v5"
+PROJECTION_PART_VERSION = "tabular-structure-part/v3"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v9"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v2"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -61,6 +61,7 @@ ENUMERATION_DECISIONS = {
     "L1-05": ("supported_complete", "record_axis_proven"),
     "L1-06": ("supported_complete", "record_axis_proven"),
     "L1-07": ("supported_complete", "record_axis_proven"),
+    "L1-08": ("supported_complete", "empty_record_axis_proven"),
     "R1": ("not_guaranteed_explained", "not_a_list"),
     "R2": ("not_guaranteed_explained", "total_unstable"),
     "R3": ("not_guaranteed_explained", "matrix_layout"),
@@ -910,6 +911,71 @@ def _header_paths_for_region(parser, worksheet, rows, header_start: int, data_st
     ]
 
 
+def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unresolved_rows):
+    """Prove a titled, source-backed header whose record axis is exactly empty."""
+
+    if unresolved_rows or len(populated_rows) < 2:
+        return None
+    header_row = populated_rows[-1]
+    title_row = populated_rows[-2]
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    physical_columns = sorted(
+        {
+            cell.column
+            for cell in getattr(worksheet, "_cells", {}).values()
+            if cell.row == header_row
+            and cell.value is not None
+            and str(cell.value).strip()
+        }
+    )
+    if not physical_columns or physical_columns != list(range(1, physical_columns[-1] + 1)):
+        return None
+    width = physical_columns[-1]
+    title_merge = next(
+        (
+            merged
+            for merged in merged_ranges
+            if merged.min_row <= title_row <= merged.max_row
+            and merged.min_col == 1
+            and merged.max_col == width
+            and merged.max_row < header_row
+            and worksheet.cell(merged.min_row, merged.min_col).value is not None
+            and str(worksheet.cell(merged.min_row, merged.min_col).value).strip()
+        ),
+        None,
+    )
+    if title_merge is None:
+        return None
+    values = [
+        _cell_value(parser, worksheet, header_row, column, merged_ranges)
+        for column in range(1, width + 1)
+    ]
+    if any(
+        value is None
+        or not str(value).strip()
+        or _source_cell_anchor(header_row, column, merged_ranges)[0] != "cell"
+        for column, value in enumerate(values, start=1)
+    ):
+        return None
+    headers = [_sanitize_untrusted_text(value).strip() for value in values]
+    if (
+        any(not header or header.startswith("Column_") for header in headers)
+        or len({header for header in headers}) != len(headers)
+    ):
+        return None
+    header_start = header_row - 1
+    header_paths = _header_paths_for_region(
+        parser,
+        worksheet,
+        rows,
+        header_start,
+        header_row,
+    )
+    if len(header_paths) != len(headers) or any(path != [header] for path, header in zip(header_paths, headers)):
+        return None
+    return headers, header_paths, header_start, header_row
+
+
 def _record_field_offsets(values: list[object]) -> tuple[int, ...]:
     return tuple(
         index
@@ -1113,16 +1179,30 @@ def _project_structure_region(
     header_rows, populated_row_ordinals, unresolved_row_ordinals = _complete_worksheet_rows(worksheet)
     if not header_rows or not populated_row_ordinals:
         return None
-    headers, header_start, data_start = _parse_region_structure(parser, worksheet, header_rows)
+    empty_structure = (
+        None
+        if force_unknown_total
+        else _empty_record_axis_structure(
+            parser,
+            worksheet,
+            header_rows,
+            populated_row_ordinals,
+            unresolved_row_ordinals,
+        )
+    )
+    if empty_structure is not None:
+        headers, header_paths, header_start, data_start = empty_structure
+    else:
+        headers, header_start, data_start = _parse_region_structure(parser, worksheet, header_rows)
+        header_paths = _header_paths_for_region(
+            parser,
+            worksheet,
+            header_rows,
+            header_start,
+            data_start,
+        )
     if not headers:
         return None
-    header_paths = _header_paths_for_region(
-        parser,
-        worksheet,
-        header_rows,
-        header_start,
-        data_start,
-    )
     if len(header_paths) != len(headers):
         return None
     source_column_offset = getattr(worksheet, "_fuxi_source_column_offset", 0)
@@ -1131,7 +1211,33 @@ def _project_structure_region(
     unresolved_body_ordinals = {ordinal for ordinal in unresolved_row_ordinals if ordinal > data_start}
     body_ordinals.update(unresolved_body_ordinals)
     if not body_ordinals:
-        return None
+        if empty_structure is None:
+            return None
+        table_ref = _table_ref(source_sha256, sheet_ordinal, table_ordinal, membership_sha256)
+        table = {
+            "table_ref": table_ref,
+            "sheet_ordinal": sheet_ordinal,
+            "table_ordinal": table_ordinal,
+            "row_count": 0,
+            "data_row_count": 0,
+            "source_total_count": 0,
+            "table_label": _sanitize_untrusted_text(sheet_name),
+            "table_context": _context_with_headers(
+                _table_context(
+                    parser,
+                    worksheet,
+                    header_rows,
+                    header_start,
+                    entry_limit=table_context_entry_limit,
+                    value_bytes=table_context_value_bytes,
+                ),
+                headers,
+                entry_limit=table_context_entry_limit,
+                value_bytes=table_context_value_bytes,
+            ),
+        }
+        _apply_enumeration_decision(table, "L1-08")
+        return table, []
 
     table_ref = _table_ref(source_sha256, sheet_ordinal, table_ordinal, membership_sha256)
     context = _context_with_headers(
@@ -1393,22 +1499,32 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
     header_rows, populated_rows, _unresolved_rows = _complete_worksheet_rows(region_worksheet)
     if not header_rows or not populated_rows:
         return None
-    headers, header_start, data_start = _parse_region_structure(
+    empty_structure = _empty_record_axis_structure(
         parser,
         region_worksheet,
         header_rows,
+        populated_rows,
+        _unresolved_rows,
     )
+    if empty_structure is not None:
+        headers, header_paths, header_start, data_start = empty_structure
+    else:
+        headers, header_start, data_start = _parse_region_structure(
+            parser,
+            region_worksheet,
+            header_rows,
+        )
+        header_paths = _header_paths_for_region(
+            parser,
+            region_worksheet,
+            header_rows,
+            header_start,
+            data_start,
+        )
     body_rows = [row for row in populated_rows if row > data_start]
-    if not headers or not body_rows:
+    if not headers or (not body_rows and empty_structure is None):
         return None
     min_column = region["bbox"][1]
-    header_paths = _header_paths_for_region(
-        parser,
-        region_worksheet,
-        header_rows,
-        header_start,
-        data_start,
-    )
     if len(header_paths) != len(headers):
         return None
     return {
@@ -1460,6 +1576,7 @@ def _new_projected_item(
     return {
         "table": table,
         "rows": rows,
+        "worksheet_name": worksheet.title,
         "bbox": region["bbox"],
         "members": members,
         "member_columns": {column for _row, column in members},
@@ -1862,6 +1979,51 @@ def _rekey_projected_item(
         )
 
 
+def _finalize_table_manifest_evidence(item: dict[str, Any]) -> None:
+    table = item["table"]
+    rows = item["rows"]
+    if rows:
+        table["table_label"] = rows[0]["table_label_kwd"]
+        table["table_context"] = json.loads(rows[0]["table_context_list"])
+    else:
+        table.setdefault("table_label", _sanitize_untrusted_text(item["worksheet_name"]))
+        table.setdefault("table_context", [])
+
+    evidence = item.get("structure_evidence")
+    if evidence is None:
+        table["ordered_columns"] = []
+        return
+    ordered_columns = []
+    for column_ordinal, absolute_column in enumerate(sorted(evidence["headers_by_column"]), start=1):
+        ordered_columns.append(
+            {
+                "column_id": f"col_v1:{table['sheet_ordinal']}:{absolute_column}",
+                "column_ordinal": column_ordinal,
+                "header_path": list(evidence["header_paths_by_column"][absolute_column]),
+                "name": evidence["headers_by_column"][absolute_column],
+            }
+        )
+    columns_by_id = {column["column_id"]: column for column in ordered_columns}
+    row_evidence_matches = all(
+        all(
+            field.get("header_path")
+            and (column := columns_by_id.get(field.get("column_id"))) is not None
+            and all(
+                field.get(key) == column[key]
+                for key in ("column_id", "column_ordinal", "header_path", "name")
+            )
+            for field in json.loads(row["ordered_fields_list"])
+        )
+        for row in rows
+    )
+    has_complete_paths = bool(ordered_columns) and all(
+        column["header_path"] for column in ordered_columns
+    )
+    table["ordered_columns"] = (
+        ordered_columns if has_complete_paths and row_evidence_matches else []
+    )
+
+
 def _continuation_record_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
     data_rows = [row for row in item["rows"] if row["row_role_kwd"] == "data"]
     if data_rows:
@@ -2135,6 +2297,7 @@ def _merge_continuation_pair(
     return {
         "table": table,
         "rows": rows,
+        "worksheet_name": main["worksheet_name"],
         "bbox": (
             min(main["bbox"][0], continuation["bbox"][0]),
             min(main["bbox"][1], continuation["bbox"][1]),
@@ -3137,6 +3300,8 @@ def _build_tabular_structure_projection_with_audit(
         ]
         if len(complete_items) > 1:
             for item in complete_items:
+                if item["table"]["matched_rule"] == "L1-08":
+                    continue
                 _apply_enumeration_decision(item["table"], "L1-03")
                 item["positive_rule"] = "L1-03"
 
@@ -3227,10 +3392,15 @@ def _build_tabular_structure_projection_with_audit(
                 source_sha256=source_sha256,
                 producer_generation_ref=producer_generation_ref,
             )
-            if has_adr044_receipt and item["table"]["source_total_count"] is not None:
+            if (
+                has_adr044_receipt
+                and item["table"]["source_total_count"] is not None
+                and item["table"]["matched_rule"] != "L1-08"
+            ):
                 _apply_enumeration_decision(item["table"], "L1-01")
             item["rows"].sort(key=lambda row: row["row_ordinal_int"])
             item["table"]["row_count"] = len(item["rows"])
+            _finalize_table_manifest_evidence(item)
             tables.append(item["table"])
             records.extend(item["rows"])
 
@@ -3356,6 +3526,7 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
     ids = set()
     row_refs = set()
     by_table: dict[str, list[dict[str, Any]]] = {}
+    ordered_fields_by_row_ref: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if not isinstance(row, dict) or set(row) != PROJECTION_ROW_FIELDS:
             raise ValueError("structure projection row fields do not match the fixed schema")
@@ -3452,6 +3623,7 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             if invalid:
                 raise ValueError(f"{label} must use the fixed field schema")
             parsed_lists[field_name] = values
+        ordered_fields_by_row_ref[row["row_ref_kwd"]] = parsed_lists["ordered_fields_list"]
         context = parsed_lists["table_context_list"]
         if len(context) > DEFAULT_CONTEXT_ENTRY_LIMIT:
             raise ValueError("table context exceeds the entry limit")
@@ -3505,6 +3677,9 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             "enumeration_status",
             "enumeration_reason",
             "matched_rule",
+            "table_label",
+            "table_context",
+            "ordered_columns",
         }
         if not isinstance(table, dict) or set(table) != expected_keys:
             raise ValueError("table manifest does not match the fixed schema")
@@ -3529,6 +3704,58 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             raise ValueError("table manifest enumeration decision is invalid")
         if (table["enumeration_status"] == "supported_complete") != (source_total is not None):
             raise ValueError("table manifest enumeration decision conflicts with source total")
+        table_label = table["table_label"]
+        if (
+            not isinstance(table_label, str)
+            or not table_label
+            or len(table_label.encode("utf-8")) > DEFAULT_TABLE_LABEL_BYTES
+            or _sanitize_untrusted_text(table_label) != table_label
+        ):
+            raise ValueError("table manifest label is invalid")
+        table_context = table["table_context"]
+        if not isinstance(table_context, list) or len(table_context) > DEFAULT_CONTEXT_ENTRY_LIMIT:
+            raise ValueError("table manifest context is invalid")
+        if any(
+            not isinstance(item, dict)
+            or set(item) != {"name", "value"}
+            or any(
+                not isinstance(item[field], str)
+                or not item[field]
+                or len(item[field].encode("utf-8")) > DEFAULT_CONTEXT_VALUE_BYTES
+                or _sanitize_untrusted_text(item[field]) != item[field]
+                for field in ("name", "value")
+            )
+            for item in table_context
+        ):
+            raise ValueError("table manifest context is invalid")
+        ordered_columns = table["ordered_columns"]
+        if not isinstance(ordered_columns, list):
+            raise ValueError("table manifest ordered columns are invalid")
+        column_ids = set()
+        column_ordinals = []
+        columns_by_id = {}
+        for column in ordered_columns:
+            if (
+                not isinstance(column, dict)
+                or set(column) != {"column_id", "column_ordinal", "header_path", "name"}
+                or not isinstance(column["column_id"], str)
+                or re.fullmatch(r"col_v1:[1-9][0-9]*:[1-9][0-9]*", column["column_id"]) is None
+                or not isinstance(column["column_ordinal"], int)
+                or isinstance(column["column_ordinal"], bool)
+                or column["column_ordinal"] < 1
+                or not isinstance(column["header_path"], list)
+                or not column["header_path"]
+                or any(not isinstance(segment, str) or not segment.strip() for segment in column["header_path"])
+                or not isinstance(column["name"], str)
+                or not column["name"]
+                or column["column_id"] in column_ids
+            ):
+                raise ValueError("table manifest ordered columns are invalid")
+            column_ids.add(column["column_id"])
+            column_ordinals.append(column["column_ordinal"])
+            columns_by_id[column["column_id"]] = column
+        if column_ordinals != list(range(1, len(column_ordinals) + 1)):
+            raise ValueError("table manifest ordered columns are invalid")
         table_ref = table["table_ref"]
         table_ref_match = re.fullmatch(r"tbl_v2_([0-9a-f]{64})_[0-9a-f]{64}", table_ref)
         expected_table_ref = (
@@ -3543,20 +3770,42 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         )
         if table_ref != expected_table_ref:
             raise ValueError("table reference does not match source and physical table identity")
-        if table_ref in manifest_refs or table_ref not in by_table:
+        if table_ref in manifest_refs:
             raise ValueError("table manifest does not match projected records")
         manifest_refs.add(table_ref)
         manifest_coordinates.append((table["sheet_ordinal"], table["table_ordinal"]))
-        table_rows = by_table[table_ref]
+        table_rows = by_table.get(table_ref, [])
         data_row_count = sum(row["row_role_kwd"] == "data" for row in table_rows)
         source_totals = {row["source_total_count_int"] for row in table_rows}
+        manifest_only_empty = (
+            not table_rows
+            and table["matched_rule"] == "L1-08"
+            and table["enumeration_reason"] == "empty_record_axis_proven"
+            and table["row_count"] == 0
+            and table["data_row_count"] == 0
+            and table["source_total_count"] == 0
+            and bool(ordered_columns)
+        )
+        if not table_rows and not manifest_only_empty:
+            raise ValueError("table manifest does not match projected records")
+        for row in table_rows:
+            row_fields = ordered_fields_by_row_ref[row["row_ref_kwd"]]
+            if not ordered_columns:
+                continue
+            for field in row_fields:
+                column = columns_by_id.get(field["column_id"])
+                if column is None or any(
+                    field[key] != column[key]
+                    for key in ("column_id", "column_ordinal", "header_path", "name")
+                ):
+                    raise ValueError("table manifest ordered columns do not match projected records")
         if (
             table["row_count"] != len(table_rows)
             or table["data_row_count"] != data_row_count
-            or source_totals != {table["source_total_count"]}
+            or (table_rows and source_totals != {table["source_total_count"]})
         ):
             raise ValueError("table manifest counts do not match projected records")
-    if manifest_refs != set(by_table):
+    if not set(by_table).issubset(manifest_refs):
         raise ValueError("table manifest is missing projected tables")
     if manifest_coordinates != sorted(manifest_coordinates):
         raise ValueError("table manifest is not in deterministic physical order")

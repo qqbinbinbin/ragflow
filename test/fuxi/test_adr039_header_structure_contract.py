@@ -138,11 +138,11 @@ class _MemoryStorage:
 
 def test_header_structure_contract_uses_the_reviewed_strict_versions():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
-    assert tabular_structure.PRODUCER_SCHEMA_VERSION == "table-producer/v5"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v4"
-    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v2"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v8"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v1"
+    assert tabular_structure.PRODUCER_SCHEMA_VERSION == "table-producer/v6"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v5"
+    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v9"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v2"
 
 
 def test_table_identity_remains_bound_to_every_reviewed_source_version(monkeypatch):
@@ -184,7 +184,7 @@ def test_projection_part_version_is_strictly_enforced_inside_ragflow_storage(
     monkeypatch.setattr(
         tabular_structure,
         "PROJECTION_PART_VERSION",
-        "tabular-structure-part/v1",
+        "tabular-structure-part/v2",
     )
     receipt = store_tabular_structure_projection(
         storage,
@@ -196,7 +196,7 @@ def test_projection_part_version_is_strictly_enforced_inside_ragflow_storage(
     monkeypatch.setattr(
         tabular_structure,
         "PROJECTION_PART_VERSION",
-        "tabular-structure-part/v2",
+        "tabular-structure-part/v3",
     )
     with pytest.raises(StructureSnapshotChanged, match="part generation changed"):
         load_tabular_structure_projection(

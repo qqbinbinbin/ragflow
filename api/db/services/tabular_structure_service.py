@@ -417,19 +417,7 @@ class TabularStructureService:
     @classmethod
     def read_active_manifest(cls, storage, **kwargs) -> dict[str, Any]:
         record, projection = cls._read_projection(storage, **kwargs)
-        first_row_by_table = {}
-        for row in projection["rows"]:
-            first_row_by_table.setdefault(row["table_ref_kwd"], row)
-        tables = []
-        for table in projection["tables"]:
-            row = first_row_by_table[table["table_ref"]]
-            tables.append(
-                {
-                    **deepcopy(table),
-                    "table_label": row["table_label_kwd"],
-                    "table_context": deepcopy(json.loads(row["table_context_list"])),
-                }
-            )
+        tables = deepcopy(projection["tables"])
         return {
             "producer_generation_ref": projection["producer_generation_ref"],
             "projection_version": projection["version"],
