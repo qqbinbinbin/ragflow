@@ -27,10 +27,10 @@ from rag.app.tabular_structure import (
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v5"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v9"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v2"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v10"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v3"
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -103,6 +103,89 @@ def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table
         "enumeration_reason": "empty_record_axis_proven",
         "matched_rule": "L1-08",
     }
+
+
+def test_empty_record_axis_ignores_a_disjoint_sidecar_outside_the_table_columns(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous empty register"
+    sheet.merge_cells("A1:G1")
+    sheet["A1"] = "Anonymous register"
+    headers = [
+        "Sequence",
+        "Reference",
+        "Received",
+        "Issuer",
+        "Issued",
+        "Reason",
+        "Category",
+    ]
+    for column, header in enumerate(headers, start=1):
+        sheet.cell(row=2, column=column, value=header)
+    sheet["H2"] = "Resource type"
+    sheet["I2"] = "Related resource"
+    sheet["I2"].hyperlink = "https://example.invalid/resource"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert complete[0]["source_total_count"] == 0
+    assert [
+        column["column_id"] for column in complete[0]["ordered_columns"]
+    ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 8)]
+    assert all(
+        column["name"] != "Related resource"
+        for column in complete[0]["ordered_columns"]
+    )
+    expected_membership = tabular_structure._region_membership_sha256(
+        1,
+        {
+            (row, column)
+            for row in (1, 2)
+            for column in range(1, 8)
+        },
+    )
+    assert complete[0]["table_ref"].startswith(
+        f"tbl_v2_{expected_membership}_"
+    )
+    assert all(
+        row["table_ref_kwd"] != complete[0]["table_ref"]
+        for row in projection["rows"]
+    )
+
+
+def test_empty_record_axis_does_not_ignore_content_below_its_table_columns(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:G1")
+    sheet["A1"] = "Anonymous register"
+    for column, header in enumerate(
+        ("Sequence", "Reference", "Received", "Issuer", "Issued", "Reason", "Category"),
+        start=1,
+    ):
+        sheet.cell(row=2, column=column, value=header)
+    sheet["H2"] = "Resource type"
+    sheet["I2"] = "Related resource"
+    sheet["I2"].hyperlink = "https://example.invalid/resource"
+    sheet["C4"] = "Unresolved content"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["matched_rule"] != "L1-08" for table in projection["tables"])
 
 
 def test_two_cell_signoff_row_is_not_promoted_to_an_empty_list(table_parser):
@@ -192,7 +275,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v2"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v3"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
@@ -1948,6 +2031,84 @@ def test_multirow_named_superset_continuation_forms_one_complete_record_sequence
     assert projection["tables"][0]["matched_rule"] == "L1-02"
 
 
+def test_named_continuation_left_expansion_rekeys_every_row_to_the_union_manifest(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.cell(row=1, column=2, value="Code")
+    sheet.cell(row=1, column=3, value="Status")
+    sheet.cell(row=2, column=2, value="A-1")
+    sheet.cell(row=2, column=3, value="Open")
+    sheet.cell(row=3, column=2, value="A-2")
+    sheet.cell(row=3, column=3, value="Closed")
+    sheet.cell(row=6, column=1, value="Owner")
+    sheet.cell(row=6, column=2, value="Code")
+    sheet.cell(row=6, column=3, value="Status")
+    sheet.cell(row=7, column=1, value="Team-1")
+    sheet.cell(row=7, column=2, value="B-1")
+    sheet.cell(row=7, column=3, value="Open")
+    sheet.cell(row=8, column=1, value="Team-2")
+    sheet.cell(row=8, column=2, value="B-2")
+    sheet.cell(row=8, column=3, value="Closed")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    table = projection["tables"][0]
+    assert table["source_total_count"] == 4
+    assert table["matched_rule"] == "L1-02"
+    assert table["ordered_columns"] == [
+        {
+            "column_id": "col_v1:1:1",
+            "column_ordinal": 1,
+            "header_path": ["Owner"],
+            "name": "Owner",
+        },
+        {
+            "column_id": "col_v1:1:2",
+            "column_ordinal": 2,
+            "header_path": ["Code"],
+            "name": "Code",
+        },
+        {
+            "column_id": "col_v1:1:3",
+            "column_ordinal": 3,
+            "header_path": ["Status"],
+            "name": "Status",
+        },
+    ]
+    fields_by_row = {
+        row["row_ordinal_int"]: json.loads(row["ordered_fields_list"])
+        for row in projection["rows"]
+    }
+    assert [field["column_ordinal"] for field in fields_by_row[2]] == [2, 3]
+    assert [field["column_ordinal"] for field in fields_by_row[3]] == [2, 3]
+    assert [field["column_ordinal"] for field in fields_by_row[7]] == [1, 2, 3]
+    assert [field["column_ordinal"] for field in fields_by_row[8]] == [1, 2, 3]
+    validate_tabular_structure_projection(projection)
+
+
+def test_supported_complete_table_requires_nonempty_ordered_columns(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Status"])
+    sheet.append(["A-1", "Open"])
+    sheet.append(["A-2", "Closed"])
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    assert projection["tables"][0]["enumeration_status"] == "supported_complete"
+    projection["tables"][0]["ordered_columns"] = []
+
+    with pytest.raises(ValueError, match="supported complete table requires ordered columns"):
+        validate_tabular_structure_projection(projection)
+
+
 def test_hidden_headerless_continuation_row_cannot_claim_complete(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -2288,6 +2449,9 @@ def test_multilevel_sparse_table_ignores_context_only_g1_disagreement(table_pars
         range(9, 19)
     )
     assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
+    assert [
+        column["column_id"] for column in table["ordered_columns"]
+    ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 9)]
 
 
 def test_repeated_axis_g1_child_before_records_is_not_swallowed_as_context(table_parser):
@@ -2516,7 +2680,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v5"
+    assert projection["version"] == "tabular-structure-projection/v6"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 

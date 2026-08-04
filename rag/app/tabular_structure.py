@@ -31,10 +31,10 @@ from typing import Any
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
-PROJECTION_VERSION = "tabular-structure-projection/v5"
+PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v9"
-ENUMERATION_RULE_VERSION = "enumeration-rules/v2"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v10"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v3"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -546,6 +546,66 @@ def _cell_distance_to_members(
     )
 
 
+def _split_closed_empty_axis_region(
+    parser,
+    worksheet,
+    members: set[tuple[int, int]],
+) -> list[set[tuple[int, int]]] | None:
+    candidates = []
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    for title_merge in merged_ranges:
+        if title_merge.max_col <= title_merge.min_col:
+            continue
+        title = worksheet.cell(title_merge.min_row, title_merge.min_col).value
+        if title is None or not str(title).strip():
+            continue
+        header_row = title_merge.max_row + 1
+        table_columns = range(title_merge.min_col, title_merge.max_col + 1)
+        if any(
+            (header_row, column) not in members
+            or worksheet.cell(header_row, column).value is None
+            or not str(worksheet.cell(header_row, column).value).strip()
+            or _source_cell_anchor(header_row, column, merged_ranges)[0] != "cell"
+            for column in table_columns
+        ):
+            continue
+        headers = [
+            _sanitize_untrusted_text(worksheet.cell(header_row, column).value).strip()
+            for column in table_columns
+        ]
+        if (
+            any(not header or header.startswith("Column_") for header in headers)
+            or len(set(headers)) != len(headers)
+        ):
+            continue
+        if any(
+            row > header_row
+            and title_merge.min_col <= column <= title_merge.max_col
+            for row, column in members
+        ):
+            continue
+        table_members = {
+            coordinate
+            for coordinate in members
+            if title_merge.min_row <= coordinate[0] <= header_row
+            and title_merge.min_col <= coordinate[1] <= title_merge.max_col
+        }
+        outside_members = members - table_members
+        if not outside_members or any(
+            title_merge.min_col <= column <= title_merge.max_col
+            for _row, column in outside_members
+        ):
+            continue
+        candidates.append((table_members, outside_members))
+    if len(candidates) != 1:
+        return None
+    table_members, outside_members = candidates[0]
+    return [
+        table_members,
+        *_connected_cell_regions(outside_members, tolerance=2),
+    ]
+
+
 def _worksheet_structure_regions(
     parser,
     worksheet,
@@ -557,6 +617,13 @@ def _worksheet_structure_regions(
         return []
     g1_regions = _connected_cell_regions(occupied, tolerance=1)
     g2_regions = _connected_cell_regions(occupied, tolerance=2)
+    split_regions = []
+    for members in g2_regions:
+        split_regions.extend(
+            _split_closed_empty_axis_region(parser, worksheet, members)
+            or [members]
+        )
+    g2_regions = split_regions
     bboxes = [_region_bbox(members) for members in g2_regions]
     unresolved = set(unresolved_formula_coordinates or set())
     unresolved_by_region = [set() for _region in g2_regions]
@@ -916,64 +983,43 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
 
     if unresolved_rows or len(populated_rows) < 2:
         return None
-    header_row = populated_rows[-1]
-    title_row = populated_rows[-2]
     merged_ranges = list(worksheet.merged_cells.ranges)
-    physical_columns = sorted(
-        {
-            cell.column
-            for cell in getattr(worksheet, "_cells", {}).values()
-            if cell.row == header_row
-            and cell.value is not None
-            and str(cell.value).strip()
-        }
-    )
-    if not physical_columns or physical_columns != list(range(1, physical_columns[-1] + 1)):
+    occupied = _logical_occupied_cells(parser, worksheet)
+    candidates = []
+    for title_merge in merged_ranges:
+        if title_merge.min_col != 1 or title_merge.max_col <= 1:
+            continue
+        title = worksheet.cell(title_merge.min_row, title_merge.min_col).value
+        if title is None or not str(title).strip():
+            continue
+        header_row = title_merge.max_row + 1
+        width = title_merge.max_col
+        values = [
+            _cell_value(parser, worksheet, header_row, column, merged_ranges)
+            for column in range(1, width + 1)
+        ]
+        if any(
+            value is None
+            or not str(value).strip()
+            or _source_cell_anchor(header_row, column, merged_ranges)[0] != "cell"
+            for column, value in enumerate(values, start=1)
+        ):
+            continue
+        if any(
+            row > header_row and column <= width
+            for row, column in occupied
+        ):
+            continue
+        headers = [_sanitize_untrusted_text(value).strip() for value in values]
+        if (
+            any(not header or header.startswith("Column_") for header in headers)
+            or len(set(headers)) != len(headers)
+        ):
+            continue
+        candidates.append((headers, [[header] for header in headers], header_row - 1, header_row))
+    if len(candidates) != 1:
         return None
-    width = physical_columns[-1]
-    title_merge = next(
-        (
-            merged
-            for merged in merged_ranges
-            if merged.min_row <= title_row <= merged.max_row
-            and merged.min_col == 1
-            and merged.max_col == width
-            and merged.max_row < header_row
-            and worksheet.cell(merged.min_row, merged.min_col).value is not None
-            and str(worksheet.cell(merged.min_row, merged.min_col).value).strip()
-        ),
-        None,
-    )
-    if title_merge is None:
-        return None
-    values = [
-        _cell_value(parser, worksheet, header_row, column, merged_ranges)
-        for column in range(1, width + 1)
-    ]
-    if any(
-        value is None
-        or not str(value).strip()
-        or _source_cell_anchor(header_row, column, merged_ranges)[0] != "cell"
-        for column, value in enumerate(values, start=1)
-    ):
-        return None
-    headers = [_sanitize_untrusted_text(value).strip() for value in values]
-    if (
-        any(not header or header.startswith("Column_") for header in headers)
-        or len({header for header in headers}) != len(headers)
-    ):
-        return None
-    header_start = header_row - 1
-    header_paths = _header_paths_for_region(
-        parser,
-        worksheet,
-        rows,
-        header_start,
-        header_row,
-    )
-    if len(header_paths) != len(headers) or any(path != [header] for path, header in zip(header_paths, headers)):
-        return None
-    return headers, header_paths, header_start, header_row
+    return candidates[0]
 
 
 def _record_field_offsets(values: list[object]) -> tuple[int, ...]:
@@ -1993,8 +2039,19 @@ def _finalize_table_manifest_evidence(item: dict[str, Any]) -> None:
     if evidence is None:
         table["ordered_columns"] = []
         return
+    record_axis_columns = {
+        column
+        for row, column in item["members"]
+        if row in set(item["proven_record_slots"])
+    }
+    evidence_columns = [
+        absolute_column
+        for absolute_column in sorted(evidence["headers_by_column"])
+        if not rows
+        or absolute_column in record_axis_columns
+    ]
     ordered_columns = []
-    for column_ordinal, absolute_column in enumerate(sorted(evidence["headers_by_column"]), start=1):
+    for column_ordinal, absolute_column in enumerate(evidence_columns, start=1):
         ordered_columns.append(
             {
                 "column_id": f"col_v1:{table['sheet_ordinal']}:{absolute_column}",
@@ -2206,13 +2263,23 @@ def _merge_continuation_pair(
     rows = [dict(row) for row in main["rows"]]
     for source_row in continuation_rows:
         row = dict(source_row)
-        columns = sorted(
+        if not is_unnamed_superset:
+            row["row_role_kwd"] = "data"
+        rows.append(row)
+
+    members = main["members"] | continuation["members"]
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    union_columns = sorted(headers_by_column)
+    ordinal_by_column = {
+        column: column_ordinal
+        for column_ordinal, column in enumerate(union_columns, start=1)
+    }
+    for row in rows:
+        columns = [
             column
-            for member_row, column in continuation["members"]
-            if member_row == row["row_ordinal_int"]
-            and column in headers_by_column
-        )
-        merged_ranges = list(worksheet.merged_cells.ranges)
+            for column in union_columns
+            if (row["row_ordinal_int"], column) in members
+        ]
         values = [
             _cell_value(
                 parser,
@@ -2223,31 +2290,27 @@ def _merge_continuation_pair(
             )
             for column in columns
         ]
-        row_fields = _ordered_fields(
-            [headers_by_column[column] for column in columns],
-            values,
-            note=False,
-            sheet_ordinal=main["table"]["sheet_ordinal"],
-            header_paths=[header_paths_by_column[column] for column in columns],
-            column_ordinals=[column - min(headers_by_column) + 1 for column in columns],
-            absolute_column_ordinals=columns,
-            source_anchors=[
-                _source_cell_anchor(
-                    row["row_ordinal_int"],
-                    column,
-                    merged_ranges,
-                )
-                for column in columns
-            ],
-        )
         row["ordered_fields_list"] = json.dumps(
-            row_fields,
+            _ordered_fields(
+                [headers_by_column[column] for column in columns],
+                values,
+                note=row["row_role_kwd"] == "note",
+                sheet_ordinal=main["table"]["sheet_ordinal"],
+                header_paths=[header_paths_by_column[column] for column in columns],
+                column_ordinals=[ordinal_by_column[column] for column in columns],
+                absolute_column_ordinals=columns,
+                source_anchors=[
+                    _source_cell_anchor(
+                        row["row_ordinal_int"],
+                        column,
+                        merged_ranges,
+                    )
+                    for column in columns
+                ],
+            ),
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        if not is_unnamed_superset:
-            row["row_role_kwd"] = "data"
-        rows.append(row)
 
     rows.sort(key=lambda row: row["row_ordinal_int"])
     data_index = 0
@@ -2280,7 +2343,6 @@ def _merge_continuation_pair(
             row_ref,
         )
 
-    members = main["members"] | continuation["members"]
     structure_evidence = {
         "headers_by_column": headers_by_column,
         "header_paths_by_column": header_paths_by_column,
@@ -3731,6 +3793,8 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         ordered_columns = table["ordered_columns"]
         if not isinstance(ordered_columns, list):
             raise ValueError("table manifest ordered columns are invalid")
+        if table["enumeration_status"] == "supported_complete" and not ordered_columns:
+            raise ValueError("supported complete table requires ordered columns")
         column_ids = set()
         column_ordinals = []
         columns_by_id = {}

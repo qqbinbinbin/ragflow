@@ -214,7 +214,7 @@ def test_stored_projection_preserves_and_validates_enumeration_rule_version(
     manifest_key = ("dataset-1", receipt["manifest_object_name"])
     manifest = json.loads(storage.objects[manifest_key])
 
-    assert manifest["enumeration_rule_version"] == "enumeration-rules/v2"
+    assert manifest["enumeration_rule_version"] == "enumeration-rules/v3"
     loaded = tabular_structure.load_tabular_structure_projection(
         storage,
         bucket="dataset-1",
@@ -485,7 +485,7 @@ def test_active_reads_require_exact_generation_and_never_fallback(service_module
         repository=generation_repository,
     )
     assert manifest["producer_generation_ref"] == projection["producer_generation_ref"]
-    assert manifest["enumeration_rule_version"] == "enumeration-rules/v2"
+    assert manifest["enumeration_rule_version"] == "enumeration-rules/v3"
     assert manifest["tables"]
     assert manifest["tables"][0]["table_label"] == "Inspection"
     assert isinstance(manifest["tables"][0]["table_context"], list)

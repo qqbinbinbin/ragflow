@@ -139,10 +139,10 @@ class _MemoryStorage:
 def test_header_structure_contract_uses_the_reviewed_strict_versions():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
     assert tabular_structure.PRODUCER_SCHEMA_VERSION == "table-producer/v6"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v5"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v9"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v2"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v10"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v3"
 
 
 def test_table_identity_remains_bound_to_every_reviewed_source_version(monkeypatch):
