@@ -164,6 +164,100 @@ def test_empty_record_axis_ignores_a_disjoint_sidecar_outside_the_table_columns(
     )
 
 
+def test_merged_title_with_trailing_blank_header_and_link_sidecar_proves_empty_record_axis(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous header-only register"
+    sheet.merge_cells("A1:H1")
+    sheet["A1"] = "Anonymous register"
+    for column, header in enumerate(
+        (
+            "Sequence",
+            "Reference",
+            "Received",
+            "Issuer",
+            "Issued",
+            "Reason",
+            "Category",
+        ),
+        start=1,
+    ):
+        sheet.cell(row=2, column=column, value=header)
+    sheet["I2"] = "Related resource"
+    sheet["I2"].hyperlink = "https://example.invalid/resource"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert complete[0]["source_total_count"] == 0
+    assert [column["name"] for column in complete[0]["ordered_columns"]] == [
+        "Sequence",
+        "Reference",
+        "Received",
+        "Issuer",
+        "Issued",
+        "Reason",
+        "Category",
+    ]
+
+
+def test_unmerged_wide_single_row_is_not_promoted_to_an_empty_list(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(
+        [
+            "Prepared by",
+            "Approved by",
+            "Reviewed by",
+            "Issued on",
+            "Status",
+            "Revision",
+            "Comment",
+        ]
+    )
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["matched_rule"] != "L1-08" for table in projection["tables"])
+
+
+def test_trailing_blank_does_not_hide_content_inside_the_title_span(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:I1")
+    sheet["A1"] = "Anonymous register"
+    for column, header in enumerate(
+        ("Sequence", "Reference", "Received", "Issuer", "Issued", "Reason", "Category"),
+        start=1,
+    ):
+        sheet.cell(row=2, column=column, value=header)
+    sheet["I2"] = "Ambiguous content"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["matched_rule"] != "L1-08" for table in projection["tables"])
+
+
 def test_empty_record_axis_does_not_ignore_content_below_its_table_columns(table_parser):
     workbook = Workbook()
     sheet = workbook.active

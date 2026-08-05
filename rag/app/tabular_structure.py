@@ -993,24 +993,37 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
         if title is None or not str(title).strip():
             continue
         header_row = title_merge.max_row + 1
-        width = title_merge.max_col
-        values = [
-            _cell_value(parser, worksheet, header_row, column, merged_ranges)
-            for column in range(1, width + 1)
-        ]
+        header_columns = []
+        for column in range(title_merge.min_col, title_merge.max_col + 1):
+            value = _cell_value(parser, worksheet, header_row, column, merged_ranges)
+            if (
+                value is None
+                or not str(value).strip()
+                or _source_cell_anchor(header_row, column, merged_ranges)[0] != "cell"
+            ):
+                break
+            header_columns.append(column)
+        if len(header_columns) < 2:
+            continue
+        first_blank_column = header_columns[-1] + 1
         if any(
-            value is None
-            or not str(value).strip()
-            or _source_cell_anchor(header_row, column, merged_ranges)[0] != "cell"
-            for column, value in enumerate(values, start=1)
+            _cell_value(parser, worksheet, header_row, column, merged_ranges) is not None
+            and str(_cell_value(parser, worksheet, header_row, column, merged_ranges)).strip()
+            for column in range(first_blank_column, title_merge.max_col + 1)
         ):
             continue
+        width = header_columns[-1]
         if any(
             row > header_row and column <= width
             for row, column in occupied
         ):
             continue
-        headers = [_sanitize_untrusted_text(value).strip() for value in values]
+        headers = [
+            _sanitize_untrusted_text(
+                _cell_value(parser, worksheet, header_row, column, merged_ranges)
+            ).strip()
+            for column in header_columns
+        ]
         if (
             any(not header or header.startswith("Column_") for header in headers)
             or len(set(headers)) != len(headers)
