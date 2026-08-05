@@ -1567,6 +1567,87 @@ def _horizontal_multi_region_workbook_bytes():
     return _save_workbook(workbook)
 
 
+def _horizontal_varying_merge_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous horizontal merges"
+    sheet.append(["Field A", "Field B", "Field C", "Field D"])
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "A-1"
+    sheet["C2"] = "C-1"
+    sheet["D2"] = "D-1"
+    sheet.merge_cells("B3:C3")
+    sheet["A3"] = "A-2"
+    sheet["B3"] = "B-2"
+    sheet["D3"] = "D-2"
+    sheet.merge_cells("C4:D4")
+    sheet["A4"] = "A-3"
+    sheet["B4"] = "B-3"
+    sheet["C4"] = "C-3"
+    return _save_workbook(workbook)
+
+
+def _vertical_varying_merge_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous vertical merges"
+    sheet.append(["Field A", "Field B", "Field C", "Field D"])
+    sheet.merge_cells("A2:A3")
+    sheet["A2"] = "A-group-1"
+    sheet["B2"] = "B-1"
+    sheet["C2"] = "C-1"
+    sheet["D2"] = "D-1"
+    sheet["B3"] = "B-2"
+    sheet["C3"] = "C-2"
+    sheet["D3"] = "D-2"
+    sheet.merge_cells("B4:B5")
+    sheet["A4"] = "A-3"
+    sheet["B4"] = "B-group-2"
+    sheet["C4"] = "C-3"
+    sheet["D4"] = "D-3"
+    sheet["A5"] = "A-4"
+    sheet["C5"] = "C-4"
+    sheet["D5"] = "D-4"
+    return _save_workbook(workbook)
+
+
+def _mixed_row_merge_supplier_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous mixed merges"
+    sheet.append(["Group", "Material", "Supplier", "Evidence", "Note"])
+
+    # Each record remains physically present, but each row has a different
+    # combination of vertical and horizontal source merges.
+    sheet.merge_cells("A2:A3")
+    sheet["A2"] = "G-1"
+    sheet.merge_cells("B2:C2")
+    sheet["B2"] = "M-1"
+    sheet["D2"] = "S-1"
+    sheet["E2"] = "Verified"
+
+    sheet.merge_cells("B3:D3")
+    sheet["B3"] = "M-2 / S-2"
+    sheet["E3"] = "Pending"
+
+    sheet.merge_cells("A4:A5")
+    sheet["A4"] = "G-2"
+    sheet.merge_cells("C4:E4")
+    sheet["C4"] = "S-3"
+    sheet["B4"] = "M-3"
+
+    sheet.merge_cells("B5:C5")
+    sheet["B5"] = "M-4"
+    sheet["D5"] = "S-4"
+    sheet["E5"] = "Approved"
+
+    # These columns are a disjoint link sidecar, not table columns.
+    sheet["H1"] = "Sidecar label"
+    sheet["I1"] = "https://example.invalid/material"
+    sheet["I1"].hyperlink = "https://example.invalid/material"
+    return _save_workbook(workbook)
+
+
 def _vertical_complete_with_headerless_continuation_bytes():
     workbook = Workbook()
     sheet = workbook.active
@@ -2742,6 +2823,65 @@ def test_repeated_partial_merge_rows_are_data_when_the_shape_is_stable(table_par
 
     assert [row["row_role_kwd"] for row in target] == ["data", "data", "data"]
     assert {row["source_total_count_int"] for row in target} == {3}
+
+
+@pytest.mark.parametrize(
+    ("workbook_factory", "sheet_name", "column_count", "expected_row_count"),
+    [
+        (_horizontal_varying_merge_workbook_bytes, "Anonymous horizontal merges", 4, 3),
+        (_vertical_varying_merge_workbook_bytes, "Anonymous vertical merges", 4, 4),
+        (_mixed_row_merge_supplier_workbook_bytes, "Anonymous mixed merges", 5, 4),
+    ],
+)
+def test_varying_record_merge_shapes_preserve_the_record_axis(
+    table_parser,
+    monkeypatch,
+    workbook_factory,
+    sheet_name,
+    column_count,
+    expected_row_count,
+):
+    monkeypatch.setattr(
+        table_parser,
+        "_parse_sheet_structure",
+        lambda _worksheet, _rows: (
+            [f"Field {chr(65 + index)}" for index in range(column_count)],
+            0,
+            1,
+        ),
+    )
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        workbook_factory(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["table_label"] == sheet_name
+        and table["row_count"] == expected_row_count
+    )
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == table["table_ref"]
+    ]
+
+    assert [row["row_ordinal_int"] for row in rows] == list(
+        range(2, expected_row_count + 2)
+    )
+    assert all(
+        "Sidecar label" not in row["ordered_fields_list"]
+        and "example.invalid" not in row["ordered_fields_list"]
+        for row in rows
+    )
+    assert [row["row_role_kwd"] for row in rows] == ["data"] * expected_row_count
+    assert [row["data_row_index_int"] for row in rows] == list(
+        range(1, expected_row_count + 1)
+    )
+    assert table["source_total_count"] == expected_row_count
 
 
 def test_repeated_header_inside_a_table_still_invalidates_completeness(table_parser):
