@@ -33,7 +33,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v10"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v11"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v3"
 PROJECTION_FIELDS = frozenset(
     {
