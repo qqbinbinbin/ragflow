@@ -103,6 +103,68 @@ def _active_generation_ref(service, *, tenant_id: str, dataset_id: str, document
         raise
 
 
+def build_tabular_structure_shadow_from_source(
+    *,
+    tenant_id: str,
+    dataset_id: str,
+    document_id: str,
+    filename: str,
+    binary: bytes,
+    adr044_conversion_receipt: dict[str, str] | None = None,
+    storage=None,
+    service=None,
+    projection_builder: Callable[..., dict[str, Any]] | None = None,
+    projection_store: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build and register an immutable generation without changing active state."""
+
+    generation_ref = structure_generation_ref(
+        document_id,
+        binary,
+        adr044_conversion_receipt=adr044_conversion_receipt,
+    )
+    if service is None:
+        from api.db.services.tabular_structure_service import TabularStructureService
+
+        service = TabularStructureService
+    if storage is None:
+        from common import settings
+
+        storage = settings.STORAGE_IMPL
+    if projection_builder is None:
+        from rag.app.table import build_structure_projection
+
+        projection_builder = build_structure_projection
+    if projection_store is None:
+        from rag.app.tabular_structure import store_tabular_structure_projection
+
+        projection_store = store_tabular_structure_projection
+
+    builder_kwargs = {"producer_generation_ref": generation_ref}
+    if adr044_conversion_receipt is not None:
+        builder_kwargs["adr044_conversion_receipt"] = adr044_conversion_receipt
+    projection = projection_builder(filename, binary, **builder_kwargs)
+    receipt = projection_store(
+        storage,
+        bucket=dataset_id,
+        document_id=document_id,
+        projection=projection,
+        tenant_id=tenant_id,
+    )
+    service.register_shadow_generation(
+        storage,
+        tenant_id=tenant_id,
+        dataset_id=dataset_id,
+        document_id=document_id,
+        receipt=receipt,
+    )
+    return {
+        "status": "shadow",
+        "producer_generation_ref": generation_ref,
+        "row_count": len(projection["rows"]),
+    }
+
+
 def publish_tabular_structure_from_source(
     *,
     tenant_id: str,
@@ -152,36 +214,17 @@ def publish_tabular_structure_from_source(
             if isinstance(existing.get("row_count"), int):
                 result["row_count"] = existing["row_count"]
             return result
-        if storage is None:
-            from common import settings
-
-            storage = settings.STORAGE_IMPL
-        if projection_builder is None:
-            from rag.app.table import build_structure_projection
-
-            projection_builder = build_structure_projection
-        if projection_store is None:
-            from rag.app.tabular_structure import store_tabular_structure_projection
-
-            projection_store = store_tabular_structure_projection
-
-        builder_kwargs = {"producer_generation_ref": generation_ref}
-        if adr044_conversion_receipt is not None:
-            builder_kwargs["adr044_conversion_receipt"] = adr044_conversion_receipt
-        projection = projection_builder(filename, binary, **builder_kwargs)
-        receipt = projection_store(
-            storage,
-            bucket=dataset_id,
-            document_id=document_id,
-            projection=projection,
-            tenant_id=tenant_id,
-        )
-        service.register_shadow_generation(
-            storage,
+        shadow = build_tabular_structure_shadow_from_source(
             tenant_id=tenant_id,
             dataset_id=dataset_id,
             document_id=document_id,
-            receipt=receipt,
+            filename=filename,
+            binary=binary,
+            adr044_conversion_receipt=adr044_conversion_receipt,
+            storage=storage,
+            service=service,
+            projection_builder=projection_builder,
+            projection_store=projection_store,
         )
         expected_active = _active_generation_ref(
             service,
@@ -209,7 +252,7 @@ def publish_tabular_structure_from_source(
         return {
             "status": "active",
             "producer_generation_ref": generation_ref,
-            "row_count": len(projection["rows"]),
+            "row_count": shadow["row_count"],
         }
     except Exception as error:
         if generation_ref is not None:
@@ -277,6 +320,7 @@ def publish_tabular_structure_generation(
 
 
 __all__ = [
+    "build_tabular_structure_shadow_from_source",
     "is_complete_tabular_parse",
     "publish_tabular_structure_from_source",
     "publish_tabular_structure_generation",

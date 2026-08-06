@@ -493,6 +493,153 @@ def test_active_reads_require_exact_generation_and_never_fallback(service_module
     assert "source_sha256" not in manifest
 
 
+def test_exact_generation_reads_support_shadow_active_and_retained_with_scope_binding(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    first_storage, first_projection, first_receipt = _stored_generation(table_parser)
+    second_storage, second_projection, second_receipt = _stored_generation(table_parser)
+    for storage, receipt in (
+        (first_storage, first_receipt),
+        (second_storage, second_receipt),
+    ):
+        service_module.TabularStructureService.register_shadow_generation(
+            storage,
+            tenant_id="tenant-owner",
+            dataset_id="dataset-1",
+            document_id="document-1",
+            receipt=receipt,
+            repository=generation_repository,
+        )
+
+    shadow = service_module.TabularStructureService.read_generation_manifest(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=first_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+    assert shadow["producer_generation_ref"] == first_projection["producer_generation_ref"]
+    assert shadow["row_count"] == len(first_projection["rows"])
+
+    service_module.TabularStructureService.activate_generation(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=first_projection["producer_generation_ref"],
+        expected_active_generation_ref=None,
+        repository=generation_repository,
+    )
+    active = service_module.TabularStructureService.read_generation_manifest(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=first_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+    assert active == shadow
+
+    service_module.TabularStructureService.activate_generation(
+        second_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=second_projection["producer_generation_ref"],
+        expected_active_generation_ref=first_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+    retained = service_module.TabularStructureService.read_generation_manifest(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=first_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+    assert retained == shadow
+
+    first_storage.get_calls.clear()
+    with pytest.raises(service_module.StructureSnapshotMissing):
+        service_module.TabularStructureService.read_generation_manifest(
+            first_storage,
+            tenant_id="tenant-owner",
+            dataset_id="dataset-1",
+            document_id="other-document",
+            producer_generation_ref=first_projection["producer_generation_ref"],
+            repository=generation_repository,
+        )
+    assert first_storage.get_calls == []
+
+
+def test_retained_restore_atomically_switches_expected_active_generation(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    first_storage, first_projection, first_receipt = _stored_generation(table_parser)
+    second_storage, second_projection, second_receipt = _stored_generation(table_parser)
+    for storage, receipt in (
+        (first_storage, first_receipt),
+        (second_storage, second_receipt),
+    ):
+        service_module.TabularStructureService.register_shadow_generation(
+            storage,
+            tenant_id="tenant-owner",
+            dataset_id="dataset-1",
+            document_id="document-1",
+            receipt=receipt,
+            repository=generation_repository,
+        )
+    service_module.TabularStructureService.activate_generation(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=first_projection["producer_generation_ref"],
+        expected_active_generation_ref=None,
+        repository=generation_repository,
+    )
+    service_module.TabularStructureService.activate_generation(
+        second_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=second_projection["producer_generation_ref"],
+        expected_active_generation_ref=first_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+
+    with pytest.raises(service_module.StructureSnapshotChanged, match="active generation changed"):
+        service_module.TabularStructureService.restore_retained_generation(
+            first_storage,
+            tenant_id="tenant-owner",
+            dataset_id="dataset-1",
+            document_id="document-1",
+            retained_generation_ref=first_projection["producer_generation_ref"],
+            expected_active_generation_ref=str(uuid.uuid4()),
+            repository=generation_repository,
+        )
+    assert generation_repository.get(second_projection["producer_generation_ref"])["status"] == "active"
+    assert generation_repository.get(first_projection["producer_generation_ref"])["status"] == "retained"
+
+    restored = service_module.TabularStructureService.restore_retained_generation(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        retained_generation_ref=first_projection["producer_generation_ref"],
+        expected_active_generation_ref=second_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+    assert restored["status"] == "active"
+    assert restored["producer_generation_ref"] == first_projection["producer_generation_ref"]
+    assert generation_repository.get(second_projection["producer_generation_ref"])["status"] == "retained"
+
+
 def test_multiple_active_rows_fail_closed_instead_of_picking_one(service_module, generation_repository):
     for generation_ref in (str(uuid.uuid4()), str(uuid.uuid4())):
         generation_repository.inject(

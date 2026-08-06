@@ -153,6 +153,36 @@ class InMemoryTabularStructureRepository:
             target["retained_at"] = None
             return deepcopy(target)
 
+    def restore(
+        self,
+        tenant_id: str,
+        dataset_id: str,
+        document_id: str,
+        retained_generation_ref: str,
+        expected_active_generation_ref: str,
+    ) -> dict[str, Any]:
+        scope = _scope(tenant_id, dataset_id, document_id)
+        with self._lock:
+            active = self.list_active(*scope)
+            if len(active) > 1:
+                raise StructureGenerationConflict("multiple active structure generations")
+            active_ref = active[0]["producer_generation_ref"] if active else None
+            if active_ref != expected_active_generation_ref:
+                raise StructureSnapshotChanged("active generation changed")
+            target = self._records.get(retained_generation_ref)
+            if target is None or (target["tenant_id"], target["kb_id"], target["document_id"]) != scope:
+                raise StructureSnapshotMissing("retained structure generation is missing")
+            if target["status"] != "retained":
+                raise StructureGenerationConflict("only a retained generation can be restored")
+            now = datetime.now(timezone.utc)
+            if active_ref:
+                self._records[active_ref]["status"] = "retained"
+                self._records[active_ref]["retained_at"] = now
+            target["status"] = "active"
+            target["activated_at"] = now
+            target["retained_at"] = None
+            return deepcopy(target)
+
 
 class PeeweeTabularStructureRepository:
     """RAGFlow database repository with document-scoped activation CAS."""
@@ -275,6 +305,65 @@ class PeeweeTabularStructureRepository:
                 raise StructureSnapshotChanged("shadow generation compare-and-swap failed")
             return Generation.get_by_id(producer_generation_ref).to_dict()
 
+    def restore(
+        self,
+        tenant_id: str,
+        dataset_id: str,
+        document_id: str,
+        retained_generation_ref: str,
+        expected_active_generation_ref: str,
+    ) -> dict[str, Any]:
+        DB, Document, _Knowledgebase, Generation = self._models()
+        with DB.atomic():
+            document = (
+                Document.select()
+                .where(Document.id == document_id, Document.kb_id == dataset_id)
+                .for_update()
+                .get()
+            )
+            if document.kb_id != dataset_id or not self.is_authorized(tenant_id, dataset_id, document_id):
+                raise PermissionError("authorization scope rejected")
+            active_rows = list(
+                Generation.select().where(
+                    Generation.tenant_id == tenant_id,
+                    Generation.kb_id == dataset_id,
+                    Generation.document_id == document_id,
+                    Generation.status == "active",
+                )
+            )
+            if len(active_rows) > 1:
+                raise StructureGenerationConflict("multiple active structure generations")
+            active_ref = active_rows[0].producer_generation_ref if active_rows else None
+            if active_ref != expected_active_generation_ref:
+                raise StructureSnapshotChanged("active generation changed")
+            target = Generation.get_or_none(
+                Generation.producer_generation_ref == retained_generation_ref,
+                Generation.tenant_id == tenant_id,
+                Generation.kb_id == dataset_id,
+                Generation.document_id == document_id,
+            )
+            if target is None:
+                raise StructureSnapshotMissing("retained structure generation is missing")
+            if target.status != "retained":
+                raise StructureGenerationConflict("only a retained generation can be restored")
+            now = datetime.now(timezone.utc)
+            if active_ref:
+                retained_count = (
+                    Generation.update(status="retained", retained_at=now)
+                    .where(Generation.producer_generation_ref == active_ref, Generation.status == "active")
+                    .execute()
+                )
+                if retained_count != 1:
+                    raise StructureSnapshotChanged("active generation compare-and-swap failed")
+            activated_count = (
+                Generation.update(status="active", activated_at=now, retained_at=None)
+                .where(Generation.producer_generation_ref == retained_generation_ref, Generation.status == "retained")
+                .execute()
+            )
+            if activated_count != 1:
+                raise StructureSnapshotChanged("retained generation compare-and-swap failed")
+            return Generation.get_by_id(retained_generation_ref).to_dict()
+
 
 class TabularStructureService:
     @staticmethod
@@ -382,6 +471,46 @@ class TabularStructureService:
         return _public_generation(activated)
 
     @classmethod
+    def restore_retained_generation(
+        cls,
+        storage,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        document_id: str,
+        retained_generation_ref: str,
+        expected_active_generation_ref: str,
+        repository=None,
+    ) -> dict[str, Any]:
+        repository = cls._repository(repository)
+        cls._authorize(repository, tenant_id, dataset_id, document_id)
+        target = repository.get(retained_generation_ref)
+        if target is None or (
+            target["tenant_id"],
+            target["kb_id"],
+            target["document_id"],
+        ) != (tenant_id, dataset_id, document_id):
+            raise StructureSnapshotMissing("retained structure generation is missing")
+        load_tabular_structure_projection(
+            storage,
+            bucket=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=retained_generation_ref,
+            manifest_object_name=target["manifest_object_name"],
+            manifest_sha256=target["manifest_sha256"],
+            expected_part_count=target["part_count"],
+            tenant_id=tenant_id,
+        )
+        restored = repository.restore(
+            tenant_id,
+            dataset_id,
+            document_id,
+            retained_generation_ref,
+            expected_active_generation_ref,
+        )
+        return _public_generation(restored)
+
+    @classmethod
     def _read_projection(
         cls,
         storage,
@@ -413,6 +542,79 @@ class TabularStructureService:
             tenant_id=tenant_id,
         )
         return record, projection
+
+    @classmethod
+    def _read_generation_projection(
+        cls,
+        storage,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        document_id: str,
+        producer_generation_ref: str,
+        repository=None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        repository = cls._repository(repository)
+        record = repository.get(producer_generation_ref)
+        if record is None or (
+            record["tenant_id"],
+            record["kb_id"],
+            record["document_id"],
+        ) != (tenant_id, dataset_id, document_id):
+            raise StructureSnapshotMissing("structure generation is missing")
+        cls._authorize(repository, tenant_id, dataset_id, document_id)
+        if record["status"] not in {"shadow", "active", "retained"}:
+            raise StructureSnapshotMissing("structure generation is unavailable")
+        projection = load_tabular_structure_projection(
+            storage,
+            bucket=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=producer_generation_ref,
+            manifest_object_name=record["manifest_object_name"],
+            manifest_sha256=record["manifest_sha256"],
+            expected_part_count=record["part_count"],
+            tenant_id=tenant_id,
+        )
+        return record, projection
+
+    @classmethod
+    def read_generation_manifest(cls, storage, **kwargs) -> dict[str, Any]:
+        record, projection = cls._read_generation_projection(storage, **kwargs)
+        return {
+            "producer_generation_ref": projection["producer_generation_ref"],
+            "projection_version": projection["version"],
+            "producer_schema_version": projection["producer_schema_version"],
+            "structure_algorithm_version": projection["structure_algorithm_version"],
+            "enumeration_rule_version": projection["enumeration_rule_version"],
+            "row_count": record["row_count"],
+            "tables": deepcopy(projection["tables"]),
+        }
+
+    @classmethod
+    def read_generation(cls, storage, **kwargs) -> dict[str, Any]:
+        record, projection = cls._read_generation_projection(storage, **kwargs)
+        return {
+            "status": record["status"],
+            "producer_generation_ref": projection["producer_generation_ref"],
+            "projection_version": projection["version"],
+            "producer_schema_version": projection["producer_schema_version"],
+            "structure_algorithm_version": projection["structure_algorithm_version"],
+            "enumeration_rule_version": projection["enumeration_rule_version"],
+            "row_count": record["row_count"],
+        }
+
+    @classmethod
+    def read_generation_rows(
+        cls,
+        storage,
+        *,
+        table_ref: str,
+        cursor: int = 0,
+        page_size: int = 30,
+        **kwargs,
+    ) -> dict[str, Any]:
+        _record, projection = cls._read_generation_projection(storage, **kwargs)
+        return page_tabular_structure_rows(projection, table_ref=table_ref, cursor=cursor, page_size=page_size)
 
     @classmethod
     def read_active_manifest(cls, storage, **kwargs) -> dict[str, Any]:

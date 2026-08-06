@@ -1017,9 +1017,9 @@ class TestDocRoutesUnit:
         monkeypatch.setattr(module, "thread_pool_exec", _thread_pool)
         monkeypatch.setattr(
             module,
-            "_publish_tabular_structure_from_source",
+            "_build_tabular_structure_shadow_from_source",
             lambda **_kwargs: {
-                "status": "active",
+                "status": "shadow",
                 "producer_generation_ref": "generation-1",
                 "row_count": 3,
             },
@@ -1028,12 +1028,7 @@ class TestDocRoutesUnit:
             module,
             "_get_tabular_structure_service",
             lambda: SimpleNamespace(
-                get_active_generation=lambda **_kwargs: {
-                    "producer_generation_ref": "generation-1",
-                    "projection_version": "tabular-structure-projection/v2",
-                    "producer_schema_version": "table-producer/v4",
-                },
-                read_active_manifest=lambda _storage, **_kwargs: {
+                read_generation_manifest=lambda _storage, **_kwargs: {
                     "producer_generation_ref": "generation-1",
                     "projection_version": "tabular-structure-projection/v2",
                     "producer_schema_version": "table-producer/v4",
@@ -1055,7 +1050,7 @@ class TestDocRoutesUnit:
         assert result == {
             "code": 0,
             "data": {
-                "status": "active",
+                "status": "shadow",
                 "producer_generation_ref": "generation-1",
                 "row_count": 3,
                 "projection_version": "tabular-structure-projection/v2",
@@ -1065,6 +1060,176 @@ class TestDocRoutesUnit:
             },
         }
         assert len(calls) == 2
+
+    def test_structure_generation_activate_and_restore_require_compare_and_swap_refs(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        calls = []
+
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+
+        class _Service:
+            @staticmethod
+            def activate_generation(storage, **kwargs):
+                calls.append(("activate", storage, kwargs))
+                return {
+                    "status": "active",
+                    "producer_generation_ref": kwargs["producer_generation_ref"],
+                    "row_count": 3,
+                }
+
+            @staticmethod
+            def restore_retained_generation(storage, **kwargs):
+                calls.append(("restore", storage, kwargs))
+                return {
+                    "status": "active",
+                    "producer_generation_ref": kwargs["retained_generation_ref"],
+                    "row_count": 3,
+                }
+
+        monkeypatch.setattr(module, "_get_tabular_structure_service", lambda: _Service)
+        monkeypatch.setattr(
+            module,
+            "get_request_json",
+            lambda: _AwaitableValue({
+                "expected_active_generation_ref": "generation-1",
+            }),
+        )
+        activated = _run(
+            _route_core(module.activate_tabular_structure_generation)(
+                "tenant-1",
+                "ds-1",
+                "doc-1",
+                "generation-2",
+            )
+        )
+        assert activated["data"] == {
+            "status": "active",
+            "producer_generation_ref": "generation-2",
+            "row_count": 3,
+        }
+        assert calls[-1][2] == {
+            "tenant_id": "owner-tenant",
+            "dataset_id": "ds-1",
+            "document_id": "doc-1",
+            "producer_generation_ref": "generation-2",
+            "expected_active_generation_ref": "generation-1",
+        }
+
+        monkeypatch.setattr(
+            module,
+            "get_request_json",
+            lambda: _AwaitableValue({"expected_active_generation_ref": None}),
+        )
+        first_activation = _run(
+            _route_core(module.activate_tabular_structure_generation)(
+                "tenant-1",
+                "ds-1",
+                "doc-1",
+                "generation-first",
+            )
+        )
+        assert first_activation["data"]["producer_generation_ref"] == "generation-first"
+        assert calls[-1][2]["expected_active_generation_ref"] is None
+
+        monkeypatch.setattr(
+            module,
+            "get_request_json",
+            lambda: _AwaitableValue({
+                "expected_active_generation_ref": "generation-2",
+            }),
+        )
+        restored = _run(
+            _route_core(module.restore_tabular_structure_generation)(
+                "tenant-1",
+                "ds-1",
+                "doc-1",
+                "generation-1",
+            )
+        )
+        assert restored["data"] == {
+            "status": "active",
+            "producer_generation_ref": "generation-1",
+            "row_count": 3,
+        }
+        assert calls[-1][2] == {
+            "tenant_id": "owner-tenant",
+            "dataset_id": "ds-1",
+            "document_id": "doc-1",
+            "retained_generation_ref": "generation-1",
+            "expected_active_generation_ref": "generation-2",
+        }
+
+        monkeypatch.setattr(
+            module,
+            "get_request_json",
+            lambda: _AwaitableValue({}),
+        )
+        invalid = _run(
+            _route_core(module.activate_tabular_structure_generation)(
+                "tenant-1",
+                "ds-1",
+                "doc-1",
+                "generation-3",
+            )
+        )
+        assert invalid["data"] == {"reason": "invalid_structure_request"}
+        assert len(calls) == 3
+
+    def test_structure_generation_by_ref_reads_the_exact_snapshot_status(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        calls = []
+
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+
+        class _Service:
+            @staticmethod
+            def read_generation(storage, **kwargs):
+                calls.append((storage, kwargs))
+                return {
+                    "status": "shadow",
+                    "producer_generation_ref": kwargs["producer_generation_ref"],
+                    "row_count": 3,
+                    "projection_version": "tabular-structure-projection/v2",
+                    "producer_schema_version": "table-producer/v4",
+                    "structure_algorithm_version": "region-producer/v7",
+                    "enumeration_rule_version": "enumeration-rules/v1",
+                }
+
+        monkeypatch.setattr(module, "_get_tabular_structure_service", lambda: _Service)
+
+        result = _run(
+            _route_core(module.get_tabular_structure_generation)(
+                "tenant-1",
+                "ds-1",
+                "doc-1",
+                "generation-2",
+            )
+        )
+
+        assert result["data"] == {
+            "status": "shadow",
+            "producer_generation_ref": "generation-2",
+            "row_count": 3,
+            "projection_version": "tabular-structure-projection/v2",
+            "producer_schema_version": "table-producer/v4",
+            "structure_algorithm_version": "region-producer/v7",
+            "enumeration_rule_version": "enumeration-rules/v1",
+        }
+        assert calls == [
+            (
+                module.settings.STORAGE_IMPL,
+                {
+                    "tenant_id": "owner-tenant",
+                    "dataset_id": "ds-1",
+                    "document_id": "doc-1",
+                    "producer_generation_ref": "generation-2",
+                },
+            )
+        ]
 
     def test_structure_only_build_rejects_non_table_document_before_storage_read(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
@@ -1087,7 +1252,7 @@ class TestDocRoutesUnit:
 
         class _Service:
             @staticmethod
-            def read_active_manifest(storage, **kwargs):
+            def read_generation_manifest(storage, **kwargs):
                 calls.append(("manifest", storage, kwargs))
                 return {
                     "producer_generation_ref": kwargs["producer_generation_ref"],
@@ -1108,7 +1273,7 @@ class TestDocRoutesUnit:
                 }
 
             @staticmethod
-            def read_active_rows(storage, **kwargs):
+            def read_generation_rows(storage, **kwargs):
                 calls.append(("rows", storage, kwargs))
                 return {
                     "producer_generation_ref": kwargs["producer_generation_ref"],

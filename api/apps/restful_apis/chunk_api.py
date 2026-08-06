@@ -82,6 +82,30 @@ def _publish_tabular_structure_from_source(**kwargs):
     return publish_tabular_structure_from_source(**kwargs)
 
 
+def _build_tabular_structure_shadow_from_source(**kwargs):
+    from rag.app.tabular_structure_runtime import build_tabular_structure_shadow_from_source
+
+    return build_tabular_structure_shadow_from_source(**kwargs)
+
+
+async def _expected_active_generation_ref(*, required: bool):
+    payload = await get_request_json()
+    if not isinstance(payload, dict):
+        return False, None
+    if "expected_active_generation_ref" not in payload:
+        return False, None
+    expected_ref = payload.get("expected_active_generation_ref")
+    if required and not isinstance(expected_ref, str):
+        return False, None
+    if isinstance(expected_ref, str):
+        expected_ref = expected_ref.strip()
+        if not expected_ref:
+            return False, None
+    elif expected_ref is not None:
+        return False, None
+    return True, expected_ref
+
+
 def _tabular_structure_error_response(error):
     from rag.app.tabular_structure import StructureGenerationConflict, StructureSnapshotChanged, StructureSnapshotMissing
 
@@ -162,7 +186,7 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
         source_bucket, source_object = File2DocumentService.get_storage_address(doc_id=document_id)
         binary = await thread_pool_exec(settings.STORAGE_IMPL.get, source_bucket, source_object)
         result = await thread_pool_exec(
-            _publish_tabular_structure_from_source,
+            _build_tabular_structure_shadow_from_source,
             tenant_id=owner_tenant_id,
             dataset_id=dataset_id,
             document_id=document_id,
@@ -174,18 +198,13 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
             for key in ("status", "producer_generation_ref", "row_count")
             if key in result
         }
-        if result.get("status") == "active":
-            active = _get_tabular_structure_service().get_active_generation(
-                tenant_id=owner_tenant_id,
-                dataset_id=dataset_id,
-                document_id=document_id,
-            )
-            manifest = _get_tabular_structure_service().read_active_manifest(
+        if result.get("status") == "shadow":
+            manifest = _get_tabular_structure_service().read_generation_manifest(
                 settings.STORAGE_IMPL,
                 tenant_id=owner_tenant_id,
                 dataset_id=dataset_id,
                 document_id=document_id,
-                producer_generation_ref=active["producer_generation_ref"],
+                producer_generation_ref=result["producer_generation_ref"],
             )
             safe_result.update({
                 "projection_version": manifest["projection_version"],
@@ -194,6 +213,76 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
                 "enumeration_rule_version": manifest["enumeration_rule_version"],
             })
         return get_result(data=safe_result)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations/<producer_generation_ref>", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def get_tabular_structure_generation(tenant_id, dataset_id, document_id, producer_generation_ref):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    try:
+        result = _get_tabular_structure_service().read_generation(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=producer_generation_ref,
+        )
+        return get_result(data=result)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations/<producer_generation_ref>/activate", methods=["POST"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def activate_tabular_structure_generation(tenant_id, dataset_id, document_id, producer_generation_ref):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    valid, expected_active_generation_ref = await _expected_active_generation_ref(required=False)
+    if not valid:
+        reason = "invalid_structure_request"
+        return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+    try:
+        result = _get_tabular_structure_service().activate_generation(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=producer_generation_ref,
+            expected_active_generation_ref=expected_active_generation_ref,
+        )
+        return get_result(data=result)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations/<retained_generation_ref>/restore", methods=["POST"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def restore_tabular_structure_generation(tenant_id, dataset_id, document_id, retained_generation_ref):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    valid, expected_active_generation_ref = await _expected_active_generation_ref(required=True)
+    if not valid:
+        reason = "invalid_structure_request"
+        return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+    try:
+        result = _get_tabular_structure_service().restore_retained_generation(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            retained_generation_ref=retained_generation_ref,
+            expected_active_generation_ref=expected_active_generation_ref,
+        )
+        return get_result(data=result)
     except Exception as error:
         return _tabular_structure_error_response(error)
 
@@ -290,7 +379,7 @@ async def get_tabular_structure_manifest(tenant_id, dataset_id, document_id):
     if not generation_ref:
         return get_error_data_result(message="`generation_ref` is required")
     try:
-        data = _get_tabular_structure_service().read_active_manifest(
+        data = _get_tabular_structure_service().read_generation_manifest(
             settings.STORAGE_IMPL,
             tenant_id=owner_tenant_id,
             dataset_id=dataset_id,
@@ -317,7 +406,7 @@ async def list_tabular_structure_rows(tenant_id, dataset_id, document_id, table_
         page_size = int(request.args.get("page_size", 30))
         if cursor < 0 or page_size < 1 or page_size > TABULAR_STRUCTURE_PAGE_SIZE_MAX:
             raise ValueError("invalid structure pagination")
-        data = _get_tabular_structure_service().read_active_rows(
+        data = _get_tabular_structure_service().read_generation_rows(
             settings.STORAGE_IMPL,
             tenant_id=owner_tenant_id,
             dataset_id=dataset_id,
