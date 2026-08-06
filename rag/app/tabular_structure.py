@@ -33,8 +33,8 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v11"
-ENUMERATION_RULE_VERSION = "enumeration-rules/v3"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v12"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v4"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -370,18 +370,30 @@ def _classify_body_row(
     values: list[object],
     merged_ranges,
     *,
-    repeated_merge_signatures: set[tuple[tuple[int, int], ...]] | None = None,
+    record_axis_evidence: dict[str, Any] | None = None,
 ) -> str:
     width = len(values)
-    populated = sum(value is not None and str(value).strip() != "" for value in values)
     if _is_full_width_merge(row_ordinal, width, merged_ranges):
         return "unknown"
-    merge_signature = _row_merge_signature(row_ordinal, merged_ranges)
-    if (
-        _has_partial_row_merge(row_ordinal, width, merged_ranges)
-        and merge_signature not in (repeated_merge_signatures or set())
-    ):
+    if record_axis_evidence is not None:
+        if _has_partial_row_merge(row_ordinal, width, merged_ranges) and not _row_merge_signature(
+            row_ordinal, merged_ranges
+        ):
+            return "unknown"
+        row_offsets = set(
+            _record_field_offsets(
+                values,
+                row_ordinal=row_ordinal,
+                merged_ranges=merged_ranges,
+            )
+        )
+        required_offsets = set(record_axis_evidence["required_offsets"])
+        if required_offsets and required_offsets.issubset(row_offsets) and (
+            len(values) == 1 or len(row_offsets) >= 2
+        ):
+            return "data"
         return "unknown"
+    populated = sum(value is not None and str(value).strip() != "" for value in values)
     if populated >= min(2, width):
         return "data"
     return "unknown"
@@ -870,14 +882,16 @@ def _parse_region_structure(parser, worksheet, rows):
     max_scan_rows = min(20, len(rows))
     candidates = []
     merged_ranges = list(worksheet.merged_cells.ranges)
-    merge_signature_counts = Counter(
-        signature
-        for row_ordinal in range(1, len(rows) + 1)
-        for signature in [_row_merge_signature(row_ordinal, merged_ranges)]
-        if signature
-    )
     for start in range(max_scan_rows):
         if parser._is_empty_row([cell.value for cell in rows[start]]):
+            continue
+        if (
+            start > 0
+            and not merged_ranges
+            and not parser._is_empty_row([cell.value for cell in rows[start - 1]])
+        ):
+            # A contiguous text block has no structural evidence of a new
+            # table boundary. Keep the earlier candidate or parser fallback.
             continue
         for depth in range(1, max_scan_rows - start + 1):
             end = start + depth
@@ -895,57 +909,177 @@ def _parse_region_structure(parser, worksheet, rows):
             headers = parser._build_headers_for_region(worksheet, rows, start, end)
             if not headers:
                 continue
-            following_offset_counts: dict[tuple[int, ...], int] = {}
-            following_offsets = []
+            if start > 0 and any(
+                merged.min_row <= start + 1 <= merged.max_row
+                and merged.min_col == 1
+                and merged.max_col >= len(headers)
+                for merged in merged_ranges
+            ):
+                previous_nonempty_row = next(
+                    (
+                        row_index
+                        for row_index in range(start, 0, -1)
+                        if not parser._is_empty_row(
+                            [cell.value for cell in rows[row_index - 1]]
+                        )
+                    ),
+                    None,
+                )
+                if previous_nonempty_row is not None and not any(
+                    merged.min_row <= previous_nonempty_row <= merged.max_row
+                    and merged.min_col == 1
+                    and merged.max_col >= len(headers)
+                    for merged in merged_ranges
+                ):
+                    continue
+            if any(
+                merged.min_row <= end
+                and merged.max_row >= end + 1
+                and merged.max_row > merged.min_row
+                for merged in merged_ranges
+            ):
+                # A candidate boundary may not cut through a vertically
+                # spanning source merge. The following row is still part of
+                # the structural header in that case.
+                continue
+            structural_width = max(
+                (
+                    merged.max_col
+                    for merged in merged_ranges
+                    if merged.min_row <= end
+                    and merged.max_row >= start + 1
+                    and worksheet.cell(merged.min_row, merged.min_col).value is not None
+                    and str(worksheet.cell(merged.min_row, merged.min_col).value).strip()
+                ),
+                default=0,
+            )
+            if structural_width:
+                structural_width = min(structural_width, len(headers))
+            else:
+                structural_width = len(headers)
+            if structural_width < 1:
+                continue
+            candidate_headers = headers[:structural_width]
+            if any(
+                merged.min_row <= end < merged.max_row
+                and merged.min_col <= structural_width
+                and merged.max_col >= 1
+                for merged in merged_ranges
+            ):
+                continue
+            if _is_full_width_merge(end, structural_width, merged_ranges) and any(
+                merged.min_row > end
+                and merged.min_col <= structural_width
+                and merged.max_col >= 1
+                for merged in merged_ranges
+            ):
+                continue
+            if depth > 1 and not _row_merge_signature(end, merged_ranges):
+                if any(
+                    merged.min_row <= end - 1 <= merged.max_row
+                    and merged.max_row > merged.min_row
+                    for merged in merged_ranges
+                ):
+                    continue
+            first_following_row = next(
+                (
+                    row_index
+                    for row_index, row in enumerate(rows[end:], start=end + 1)
+                    if not parser._is_empty_row([cell.value for cell in row])
+                ),
+                None,
+            )
+            if first_following_row is not None:
+                first_values = [
+                    _cell_value(parser, worksheet, first_following_row, column_index, merged_ranges)
+                    for column_index in range(1, structural_width + 1)
+                ]
+                inherited_merge_columns = {
+                    column_index
+                    for column_index in range(1, structural_width + 1)
+                    if any(
+                        merged.min_row <= end
+                        and merged.max_row >= first_following_row
+                        and merged.min_col <= column_index <= merged.max_col
+                        for merged in merged_ranges
+                    )
+                }
+                first_row_spanning_columns = {
+                    column_index
+                    for column_index in range(1, structural_width + 1)
+                    if any(
+                        merged.min_row == first_following_row
+                        and merged.max_row > first_following_row
+                        and merged.min_col <= column_index <= merged.max_col
+                        for merged in merged_ranges
+                    )
+                }
+                if (
+                    all(value is not None and str(value).strip() for value in first_values)
+                    and (
+                        inherited_merge_columns == set(range(1, structural_width + 1))
+                        or first_row_spanning_columns == set(range(1, structural_width + 1))
+                    )
+                ):
+                    # Every value is a continuation of a merge that began in
+                    # the candidate header. The boundary is still inside a
+                    # multi-row header, not at the record axis.
+                    continue
+            following_rows = []
+            full_width_before_axis = False
             for row_index, row in enumerate(rows[end:], start=end + 1):
                 if parser._is_empty_row([cell.value for cell in row]):
                     continue
-                if _is_full_width_merge(row_index, len(headers), merged_ranges):
-                    continue
-                merge_signature = _row_merge_signature(row_index, merged_ranges)
-                if merge_signature and merge_signature_counts[merge_signature] < 3:
+                if _is_full_width_merge(row_index, structural_width, merged_ranges):
+                    if not following_rows:
+                        full_width_before_axis = True
+                    else:
+                        values = [
+                            _cell_value(parser, worksheet, row_index, column_index, merged_ranges)
+                            for column_index in range(1, structural_width + 1)
+                        ]
+                        following_rows.append((row_index, values, False))
                     continue
                 values = [
                     _cell_value(parser, worksheet, row_index, column_index, merged_ranges)
-                    for column_index in range(1, len(headers) + 1)
+                    for column_index in range(1, structural_width + 1)
                 ]
-                offsets = _record_field_offsets(values)
-                if offsets:
-                    following_offsets.append(offsets)
-                    following_offset_counts[offsets] = following_offset_counts.get(offsets, 0) + 1
-            proven_offsets = [
-                offsets for offsets, count in following_offset_counts.items() if count >= 2
-            ]
-            if proven_offsets:
-                record_offsets = max(
-                    proven_offsets,
-                    key=lambda offsets: (following_offset_counts[offsets], len(offsets), offsets),
-                )
-                record_count = following_offset_counts[record_offsets]
-            else:
-                offset_sets = [set(offsets) for offsets in following_offsets]
-                if len(offset_sets) < 3:
-                    continue
-                common_offsets = set.intersection(*offset_sets)
-                record_offsets = tuple(sorted(set.union(*offset_sets)))
-                optional_offsets = set(record_offsets) - common_offsets
-                if not common_offsets or not optional_offsets:
-                    continue
-                record_count = len(following_offsets)
+                following_rows.append((row_index, values, False))
+            if full_width_before_axis:
+                continue
+            evidence = _record_axis_evidence(candidate_headers, following_rows, merged_ranges)
+            if evidence is None:
+                continue
+            record_offsets = evidence["occupied_offsets"]
+            record_count = len(following_rows)
             if any(
-                offset >= len(headers) or headers[offset].startswith("Column_")
+                offset >= len(candidate_headers) or candidate_headers[offset].startswith("Column_")
                 for offset in record_offsets
             ):
                 continue
-            distinct_headers = {headers[offset] for offset in record_offsets}
+            distinct_headers = {candidate_headers[offset] for offset in record_offsets}
             if len(distinct_headers) < min(2, len(record_offsets)):
+                continue
+            if not (
+                len(candidate_headers) == 1
+                and _single_column_axis_proven(candidate_headers, following_rows)
+            ) and not _header_boundary_proven(
+                parser,
+                worksheet,
+                header_start=start,
+                data_start=end,
+                headers=headers,
+                body_rows=following_rows,
+                merged_ranges=merged_ranges,
+                record_axis_evidence=evidence,
+            ):
                 continue
             candidates.append(
                 (
                     len(record_offsets),
+                    depth,
                     record_count,
                     -start,
-                    depth,
                     headers,
                     start,
                     end,
@@ -954,9 +1088,9 @@ def _parse_region_structure(parser, worksheet, rows):
     if candidates:
         (
             _field_count,
+            _depth,
             _record_count,
             _negative_start,
-            _depth,
             headers,
             header_start,
             data_start,
@@ -1035,12 +1169,83 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
     return candidates[0]
 
 
-def _record_field_offsets(values: list[object]) -> tuple[int, ...]:
-    return tuple(
+def _record_field_offsets(
+    values: list[object],
+    *,
+    row_ordinal: int | None = None,
+    merged_ranges=None,
+) -> tuple[int, ...]:
+    occupied = {
         index
         for index, value in enumerate(values)
         if value is not None and str(value).strip() != ""
-    )
+    }
+    if row_ordinal is None or merged_ranges is None:
+        return tuple(sorted(occupied))
+    width = len(values)
+    for merged in merged_ranges:
+        if not (merged.min_row <= row_ordinal <= merged.max_row):
+            continue
+        if merged.min_col > width or merged.max_col < 1:
+            continue
+        if any(
+            values[index] is not None and str(values[index]).strip() != ""
+            for index in range(max(0, merged.min_col - 1), min(width, merged.max_col))
+        ):
+            occupied.update(
+                range(max(0, merged.min_col - 1), min(width, merged.max_col))
+            )
+    return tuple(sorted(occupied))
+
+
+def _record_axis_evidence(
+    headers: list[str],
+    body_rows: list[tuple[int, list[object], bool]],
+    merged_ranges,
+) -> dict[str, Any] | None:
+    """Prove one physical record axis from geometry and source-backed values."""
+
+    if len(body_rows) < 2:
+        return None
+    row_ordinals = [row_ordinal for row_ordinal, _values, _gap in body_rows]
+    if any(right != left + 1 for left, right in zip(row_ordinals, row_ordinals[1:])):
+        return None
+    row_offsets = [
+        _record_field_offsets(
+            values,
+            row_ordinal=row_ordinal,
+            merged_ranges=merged_ranges,
+        )
+        for row_ordinal, values, _gap in body_rows
+    ]
+    if any(not offsets for offsets in row_offsets):
+        return None
+    common_offsets = set(row_offsets[0]).intersection(*(set(offsets) for offsets in row_offsets[1:]))
+    occupied_offsets = set().union(*(set(offsets) for offsets in row_offsets))
+    if not common_offsets:
+        return None
+    if (
+        len(headers) > 1
+        and not merged_ranges
+        and len(body_rows) == 2
+        and len({tuple(offsets) for offsets in row_offsets}) > 1
+    ):
+        return None
+    if any(
+        offset >= len(headers) or headers[offset].startswith("Column_")
+        for offset in occupied_offsets
+    ):
+        return None
+    distinct_headers = {headers[offset] for offset in common_offsets}
+    if len(distinct_headers) < min(2, len(common_offsets)):
+        return None
+    return {
+        "row_ordinals": row_ordinals,
+        "row_offsets": tuple(row_offsets),
+        "required_offsets": tuple(sorted(common_offsets)),
+        "optional_offsets": tuple(sorted(occupied_offsets - common_offsets)),
+        "occupied_offsets": tuple(sorted(occupied_offsets)),
+    }
 
 
 def _header_boundary_proven(
@@ -1052,13 +1257,13 @@ def _header_boundary_proven(
     headers: list[str],
     body_rows: list[tuple[int, list[object], bool]],
     merged_ranges,
-    repeated_merge_signatures: set[tuple[tuple[int, int], ...]],
+    record_axis_evidence: dict[str, Any] | None = None,
 ) -> bool:
     first_header_row = header_start + 1
     if any(
-        merged.min_row <= data_start
+        merged.min_row < data_start
         and merged.max_row >= first_header_row
-        and (merged.max_col > merged.min_col or merged.max_row > merged.min_row)
+        and merged.max_row > merged.min_row
         for merged in merged_ranges
     ):
         return True
@@ -1074,7 +1279,7 @@ def _header_boundary_proven(
             row_ordinal,
             values,
             merged_ranges,
-            repeated_merge_signatures=repeated_merge_signatures,
+            record_axis_evidence=record_axis_evidence,
         ) == "data"
         and not _is_repeated_header_row(headers, values)
     ]
@@ -1148,7 +1353,7 @@ def _sparse_record_axis_proven(
     common_offsets = set.intersection(*offset_sets)
     occupied_offsets = set.union(*offset_sets)
     optional_offsets = occupied_offsets - common_offsets
-    if not common_offsets or not optional_offsets or len(set(data_field_offsets)) < 2:
+    if not optional_offsets or len(set(data_field_offsets)) < 2:
         return False
     if any(
         offset >= len(headers) or headers[offset].startswith("Column_")
@@ -1326,14 +1531,7 @@ def _project_structure_region(
         body_rows.append((row_ordinal, values, body_gap_seen))
         previous_body_ordinal = row_ordinal
 
-    merge_signature_counts = {}
-    for row_ordinal, _values, _follows_body_gap in body_rows:
-        signature = _row_merge_signature(row_ordinal, merged_ranges)
-        if signature:
-            merge_signature_counts[signature] = merge_signature_counts.get(signature, 0) + 1
-    repeated_merge_signatures = {
-        signature for signature, count in merge_signature_counts.items() if count >= 3
-    }
+    record_axis_evidence = _record_axis_evidence(headers, body_rows, merged_ranges)
     if not _header_boundary_proven(
         parser,
         worksheet,
@@ -1342,7 +1540,7 @@ def _project_structure_region(
         headers=headers,
         body_rows=body_rows,
         merged_ranges=merged_ranges,
-        repeated_merge_signatures=repeated_merge_signatures,
+        record_axis_evidence=record_axis_evidence,
     ):
         return None
     distinguish_text_digits = not any(
@@ -1371,7 +1569,7 @@ def _project_structure_region(
                 local_row_ordinal,
                 values,
                 merged_ranges,
-                repeated_merge_signatures=repeated_merge_signatures,
+                record_axis_evidence=record_axis_evidence,
             )
             current_shape = _row_shape(values, distinguish_text_digits=distinguish_text_digits)
             next_shape = (
@@ -1458,7 +1656,7 @@ def _project_structure_region(
             _row_ordinal,
             values,
             merged_ranges,
-            repeated_merge_signatures=repeated_merge_signatures,
+            record_axis_evidence=record_axis_evidence,
         ) == "data"
         and not _is_repeated_header_row(headers, values)
     ]
@@ -1481,7 +1679,7 @@ def _project_structure_region(
             _row_ordinal,
             values,
             merged_ranges,
-            repeated_merge_signatures=repeated_merge_signatures,
+            record_axis_evidence=record_axis_evidence,
         ) == "data"
         and not _is_repeated_header_row(headers, values)
     ]

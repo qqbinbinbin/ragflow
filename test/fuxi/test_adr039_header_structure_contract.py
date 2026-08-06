@@ -2,7 +2,7 @@ import json
 from io import BytesIO
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 import rag.app.tabular_structure as tabular_structure
 from rag.app.tabular_structure import build_tabular_structure_projection
@@ -141,8 +141,8 @@ def test_header_structure_contract_uses_the_reviewed_strict_versions():
     assert tabular_structure.PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v11"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v3"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v12"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v4"
 
 
 def test_table_identity_remains_bound_to_every_reviewed_source_version(monkeypatch):
@@ -212,9 +212,29 @@ def test_projection_part_version_is_strictly_enforced_inside_ragflow_storage(
 def test_multilevel_header_projection_exposes_source_structural_column_evidence(
     table_parser,
 ):
+    source = _multilevel_header_workbook()
+    workbook = load_workbook(BytesIO(source), data_only=False)
+    headers, header_start, data_start = tabular_structure._parse_region_structure(
+        table_parser,
+        workbook.active,
+        list(workbook.active.iter_rows()),
+    )
+
+    assert header_start == 0
+    assert data_start == 3
+    assert headers == [
+        "Shared context-Code",
+        "Shared context-Product-Status",
+        "Shared context-Product-Measure",
+        "Shared context-Process-Status",
+        "Shared context-Process-Measure",
+        "Shared context-Evidence-Status",
+        "Shared context-Evidence-Measure",
+    ]
+
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
-        _multilevel_header_workbook(),
+        source,
         parser=table_parser,
     )
 

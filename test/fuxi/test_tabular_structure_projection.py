@@ -29,8 +29,8 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v11"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v3"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v12"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v4"
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -369,7 +369,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v3"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v4"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
@@ -2882,6 +2882,69 @@ def test_varying_record_merge_shapes_preserve_the_record_axis(
         range(1, expected_row_count + 1)
     )
     assert table["source_total_count"] == expected_row_count
+
+
+def test_varying_record_merge_shapes_are_proven_by_the_real_candidate_stage(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _mixed_row_merge_supplier_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["table_label"] == "Anonymous mixed merges"
+    )
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == table["table_ref"]
+    ]
+
+    assert [row["row_ordinal_int"] for row in rows] == [2, 3, 4, 5]
+    assert [row["row_role_kwd"] for row in rows] == ["data"] * 4
+    assert [row["data_row_index_int"] for row in rows] == [1, 2, 3, 4]
+    assert table["source_total_count"] == 4
+
+
+def test_vertical_merge_parent_values_are_inherited_and_emitted_once(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertical_varying_merge_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["table_label"] == "Anonymous vertical merges"
+    )
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == table["table_ref"]
+    ]
+    expected_parent_values = {
+        2: "A-group-1",
+        3: "A-group-1",
+        4: "A-3",
+        5: "A-4",
+    }
+
+    assert [row["row_role_kwd"] for row in rows] == ["data"] * 4
+    for row in rows:
+        fields = json.loads(row["ordered_fields_list"])
+        parent_fields = [field for field in fields if field["column_ordinal"] == 1]
+        assert len(parent_fields) == 1
+        assert parent_fields[0]["value"] == expected_parent_values[row["row_ordinal_int"]]
+    assert table["source_total_count"] == 4
 
 
 def test_repeated_header_inside_a_table_still_invalidates_completeness(table_parser):
