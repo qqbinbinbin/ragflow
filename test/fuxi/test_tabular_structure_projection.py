@@ -29,8 +29,8 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v12"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v4"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v13"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v5"
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -369,7 +369,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v4"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v5"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
