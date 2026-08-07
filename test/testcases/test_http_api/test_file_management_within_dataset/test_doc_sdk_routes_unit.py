@@ -1365,6 +1365,22 @@ class TestDocRoutesUnit:
         assert response["data"] == {"reason": "provider_failure"}
         assert "private-object-path" not in caplog.text
 
+    def test_snapshot_changed_error_returns_only_the_governed_active_generation_ref(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        from rag.app.tabular_structure import StructureSnapshotChanged
+
+        error = StructureSnapshotChanged(
+            "private-object-path",
+            active_generation_ref="generation-active",
+        )
+        response = module._tabular_structure_error_response(error)
+
+        assert response["message"] == "structure_snapshot_changed"
+        assert response["data"] == {
+            "reason": "structure_snapshot_changed",
+            "producer_generation_ref": "generation-active",
+        }
+
     def test_list_chunks_uses_dataset_owner_index_for_team_dataset(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
         seen = {}

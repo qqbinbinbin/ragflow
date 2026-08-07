@@ -111,6 +111,10 @@ class StructureSnapshotMissing(LookupError):
 class StructureSnapshotChanged(RuntimeError):
     """The requested immutable structure generation no longer matches its digest."""
 
+    def __init__(self, message: str, active_generation_ref: str | None = None):
+        super().__init__(message)
+        self.active_generation_ref = active_generation_ref
+
 
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")

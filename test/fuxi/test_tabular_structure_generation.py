@@ -378,7 +378,7 @@ def test_activation_atomically_retains_old_generation_and_checks_expected_pointe
     )
     assert activated_first["status"] == "active"
 
-    with pytest.raises(service_module.StructureSnapshotChanged, match="active generation changed"):
+    with pytest.raises(service_module.StructureSnapshotChanged, match="active generation changed") as changed:
         service_module.TabularStructureService.activate_generation(
             second_storage,
             tenant_id="tenant-owner",
@@ -388,6 +388,7 @@ def test_activation_atomically_retains_old_generation_and_checks_expected_pointe
             expected_active_generation_ref=None,
             repository=generation_repository,
         )
+    assert changed.value.active_generation_ref == first_projection["producer_generation_ref"]
 
     activated_second = service_module.TabularStructureService.activate_generation(
         second_storage,

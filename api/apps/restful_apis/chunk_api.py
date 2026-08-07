@@ -106,7 +106,7 @@ async def _expected_active_generation_ref(*, required: bool):
     return True, expected_ref
 
 
-def _tabular_structure_error_response(error):
+def _tabular_structure_error_response(error, *, active_generation_ref=None):
     from rag.app.tabular_structure import StructureGenerationConflict, StructureSnapshotChanged, StructureSnapshotMissing
 
     if isinstance(error, StructureSnapshotMissing):
@@ -118,7 +118,12 @@ def _tabular_structure_error_response(error):
     else:
         logging.error("Tabular structure read failed: provider_failure")
         reason = "provider_failure"
-    return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+    data = {"reason": reason}
+    if reason == "structure_snapshot_changed":
+        active_ref = active_generation_ref or getattr(error, "active_generation_ref", None)
+        if isinstance(active_ref, str) and active_ref.strip():
+            data["producer_generation_ref"] = active_ref.strip()
+    return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data=data)
 
 
 def _authorized_structure_owner(tenant_id, dataset_id, document_id):
@@ -140,6 +145,7 @@ async def get_active_tabular_structure_generation(tenant_id, dataset_id, documen
     owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
     if error:
         return error
+    generation = None
     try:
         generation = _get_tabular_structure_service().get_active_generation(
             tenant_id=owner_tenant_id,
@@ -167,7 +173,10 @@ async def get_active_tabular_structure_generation(tenant_id, dataset_id, documen
         }
         return get_result(data=data)
     except Exception as error:
-        return _tabular_structure_error_response(error)
+        return _tabular_structure_error_response(
+            error,
+            active_generation_ref=(generation or {}).get("producer_generation_ref"),
+        )
 
 
 @manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations", methods=["POST"])  # noqa: F821

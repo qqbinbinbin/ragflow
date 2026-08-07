@@ -138,7 +138,10 @@ class InMemoryTabularStructureRepository:
                 raise StructureGenerationConflict("multiple active structure generations")
             active_ref = active[0]["producer_generation_ref"] if active else None
             if active_ref != expected_active_generation_ref:
-                raise StructureSnapshotChanged("active generation changed")
+                raise StructureSnapshotChanged(
+                    "active generation changed",
+                    active_generation_ref=active_ref,
+                )
             target = self._records.get(producer_generation_ref)
             if target is None or (target["tenant_id"], target["kb_id"], target["document_id"]) != scope:
                 raise StructureSnapshotMissing("shadow structure generation is missing")
@@ -168,7 +171,10 @@ class InMemoryTabularStructureRepository:
                 raise StructureGenerationConflict("multiple active structure generations")
             active_ref = active[0]["producer_generation_ref"] if active else None
             if active_ref != expected_active_generation_ref:
-                raise StructureSnapshotChanged("active generation changed")
+                raise StructureSnapshotChanged(
+                    "active generation changed",
+                    active_generation_ref=active_ref,
+                )
             target = self._records.get(retained_generation_ref)
             if target is None or (target["tenant_id"], target["kb_id"], target["document_id"]) != scope:
                 raise StructureSnapshotMissing("retained structure generation is missing")
@@ -276,7 +282,10 @@ class PeeweeTabularStructureRepository:
                 raise StructureGenerationConflict("multiple active structure generations")
             active_ref = active_rows[0].producer_generation_ref if active_rows else None
             if active_ref != expected_active_generation_ref:
-                raise StructureSnapshotChanged("active generation changed")
+                raise StructureSnapshotChanged(
+                    "active generation changed",
+                    active_generation_ref=active_ref,
+                )
             target = Generation.get_or_none(
                 Generation.producer_generation_ref == producer_generation_ref,
                 Generation.tenant_id == tenant_id,
@@ -335,7 +344,10 @@ class PeeweeTabularStructureRepository:
                 raise StructureGenerationConflict("multiple active structure generations")
             active_ref = active_rows[0].producer_generation_ref if active_rows else None
             if active_ref != expected_active_generation_ref:
-                raise StructureSnapshotChanged("active generation changed")
+                raise StructureSnapshotChanged(
+                    "active generation changed",
+                    active_generation_ref=active_ref,
+                )
             target = Generation.get_or_none(
                 Generation.producer_generation_ref == retained_generation_ref,
                 Generation.tenant_id == tenant_id,
@@ -530,7 +542,10 @@ class TabularStructureService:
             raise StructureGenerationConflict("multiple active structure generations")
         record = active[0]
         if record["producer_generation_ref"] != producer_generation_ref:
-            raise StructureSnapshotChanged("active generation changed")
+            raise StructureSnapshotChanged(
+                "active generation changed",
+                active_generation_ref=record["producer_generation_ref"],
+            )
         projection = load_tabular_structure_projection(
             storage,
             bucket=dataset_id,
