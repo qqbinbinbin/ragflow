@@ -1743,6 +1743,17 @@ def _complete_table_with_axis_aligned_unknown_bytes():
     return _save_workbook(workbook)
 
 
+def _complete_table_with_context_only_unknown_overlap_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous regions"
+    sheet.append(["Context", "Code", "State"])
+    sheet.append([None, "A-1", "Open"])
+    sheet.append([None, "A-2", "Closed"])
+    sheet.cell(row=10, column=1, value="Annotation")
+    return _save_workbook(workbook)
+
+
 def _complete_table_with_g_sensitive_sibling_bytes():
     workbook = Workbook()
     sheet = workbook.active
@@ -1773,6 +1784,108 @@ def _merged_header_workbook_bytes():
     sheet["B2"] = "Status"
     sheet.append(["M-1", "Open"])
     sheet.append(["M-2", "Closed"])
+    return _save_workbook(workbook)
+
+
+def _nested_sparse_header_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous nested header"
+    sheet.merge_cells("A1:H2")
+    sheet["A1"] = "Anonymous report"
+    sheet.merge_cells("A3:B3")
+    sheet["A3"] = "Identity"
+    sheet.merge_cells("C3:H3")
+    sheet["C3"] = "Details"
+    sheet["A4"] = "No"
+    sheet["B4"] = "Code"
+    sheet.merge_cells("C4:D4")
+    sheet["C4"] = "Material"
+    sheet.merge_cells("E4:F4")
+    sheet["E4"] = "Supplier"
+    sheet.merge_cells("G4:H4")
+    sheet["G4"] = "Process"
+    for row, values in enumerate(
+        (
+            (1, "K-1", "Rubber", "Acme", "Extrude"),
+            (2, "K-2", "Steel", "Beta", "Press"),
+            (3, "K-3", "Wire", "Gamma", "Draw"),
+        ),
+        start=5,
+    ):
+        sheet.cell(row=row, column=1, value=values[0])
+        sheet.cell(row=row, column=2, value=values[1])
+        sheet.cell(row=row, column=3, value=values[2])
+        sheet.cell(row=row, column=5, value=values[3])
+        sheet.cell(row=row, column=7, value=values[4])
+    return _save_workbook(workbook)
+
+
+def _merged_header_continuation_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous header continuation"
+    sheet.merge_cells("A1:H1")
+    sheet["A1"] = "Anonymous register"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Identity"
+    sheet.merge_cells("C2:H2")
+    sheet["C2"] = "Details"
+    sheet.merge_cells("A3:B3")
+    sheet["A3"] = "Code"
+    sheet.merge_cells("C3:D3")
+    sheet["C3"] = "Material"
+    sheet.merge_cells("E3:F3")
+    sheet["E3"] = "Supplier"
+    sheet.merge_cells("G3:H3")
+    sheet["G3"] = "Process"
+    for column, value in enumerate(
+        ("Code type", "Code value", "Code note", "Supplier name", "Supplier area"),
+        start=2,
+    ):
+        sheet.cell(row=4, column=column, value=value)
+    sheet["A4"] = "No"
+    sheet["H4"] = "Process name"
+    sheet.merge_cells("B5:C5")
+    sheet["B5"] = "Code detail"
+    sheet["D5"] = "Code note"
+    sheet["E5"] = "Supplier name"
+    sheet["F5"] = "Supplier area"
+    sheet["G5"] = "Process type"
+    sheet["H5"] = "Process name"
+    sheet["A5"] = "No"
+    sheet["H5"] = "Process name"
+    for row, values in enumerate(
+        (
+            (None, None, "K-1", "Rubber", "Acme", "East", "Mix", "Extrude"),
+            (None, None, "K-2", "Steel", "Beta", "West", "Mix", "Press"),
+            (None, None, "K-3", "Wire", "Gamma", "North", "Mix", "Draw"),
+        ),
+        start=6,
+    ):
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row=row, column=column, value=value)
+    return _save_workbook(workbook)
+
+
+def _optional_field_shape_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous optional field"
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous register"
+    for column, value in enumerate(("Code", "Description", "Status", "Optional"), start=1):
+        sheet.cell(row=2, column=column, value=value)
+    for row, values in enumerate(
+        (
+            ("A-1", "First", "Open", "Note"),
+            ("A-2", "Second", "Open", None),
+            ("A-3", "Third", "Closed", None),
+        ),
+        start=3,
+    ):
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row=row, column=column, value=value)
     return _save_workbook(workbook)
 
 
@@ -2284,6 +2397,103 @@ def test_supported_complete_table_requires_nonempty_ordered_columns(table_parser
         validate_tabular_structure_projection(projection)
 
 
+def test_manifest_downgrades_when_a_value_field_has_no_header_path():
+    item = {
+        "table": {
+            "enumeration_status": "supported_complete",
+            "enumeration_reason": "record_axis_proven",
+            "matched_rule": "L1-07",
+            "sheet_ordinal": 1,
+            "source_total_count": 1,
+            "table_label": "Anonymous register",
+            "table_context": [],
+        },
+        "rows": [{
+            "table_label_kwd": "Anonymous register",
+            "table_context_list": "[]",
+            "ordered_fields_list": json.dumps([
+                {
+                    "column_id": "col_v1:1:1",
+                    "column_ordinal": 1,
+                    "header_path": ["Code"],
+                    "name": "Code",
+                    "value": "A-1",
+                },
+                {
+                    "column_id": "col_v1:1:2",
+                    "column_ordinal": 2,
+                    "header_path": [],
+                    "name": "Optional",
+                    "value": "present",
+                },
+            ]),
+        }],
+        "structure_evidence": {
+            "headers_by_column": {1: "Code", 2: "Optional"},
+            "header_paths_by_column": {1: ["Code"], 2: []},
+        },
+        "proven_record_slots": [1],
+        "members": {(1, 1), (1, 2)},
+        "worksheet_name": "Anonymous register",
+    }
+
+    tabular_structure._finalize_table_manifest_evidence(item)
+
+    assert item["table"]["enumeration_status"] == "not_guaranteed_explained"
+    assert item["table"]["enumeration_reason"] == "record_axis_not_proven"
+    assert item["table"]["matched_rule"] == "R8"
+    assert item["table"]["source_total_count"] is None
+    assert item["table"]["ordered_columns"] == []
+
+
+def test_manifest_ordinals_are_dense_over_the_selected_source_axis():
+    item = {
+        "table": {
+            "enumeration_status": "supported_complete",
+            "enumeration_reason": "record_axis_proven",
+            "matched_rule": "L1-07",
+            "sheet_ordinal": 1,
+            "source_total_count": 1,
+            "table_label": "Anonymous register",
+            "table_context": [],
+        },
+        "rows": [{
+            "table_label_kwd": "Anonymous register",
+            "table_context_list": "[]",
+            "ordered_fields_list": json.dumps([
+                {
+                    "column_id": "col_v1:1:3",
+                    "column_ordinal": 1,
+                    "header_path": ["Code"],
+                    "name": "Code",
+                    "value": "A-1",
+                },
+                {
+                    "column_id": "col_v1:1:4",
+                    "column_ordinal": 2,
+                    "header_path": ["State"],
+                    "name": "State",
+                    "value": "Open",
+                },
+            ]),
+        }],
+        "structure_evidence": {
+            "headers_by_column": {3: "Code", 4: "State"},
+            "header_paths_by_column": {3: ["Code"], 4: ["State"]},
+        },
+        "proven_record_slots": [1],
+        "members": {(1, 3), (1, 4)},
+        "worksheet_name": "Anonymous register",
+    }
+
+    tabular_structure._finalize_table_manifest_evidence(item)
+
+    assert [
+        (column["column_id"], column["column_ordinal"])
+        for column in item["table"]["ordered_columns"]
+    ] == [("col_v1:1:3", 1), ("col_v1:1:4", 2)]
+
+
 def test_hidden_headerless_continuation_row_cannot_claim_complete(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -2437,6 +2647,18 @@ def test_axis_aligned_single_unknown_downgrades_complete_sibling(table_parser):
 
     assert len(projection["tables"]) == 2
     assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_context_only_unknown_overlap_does_not_downgrade_complete_sibling(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_context_only_unknown_overlap_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert projection["tables"][1]["source_total_count"] is None
 
 
 def test_isolated_annotation_does_not_downgrade_complete_sibling(table_parser):
@@ -2607,6 +2829,65 @@ def test_multilevel_merged_header_stays_with_its_record_axis(table_parser):
     assert len(projection["tables"]) == 1
     assert projection["tables"][0]["source_total_count"] == 2
     assert [row["row_ordinal_int"] for row in projection["rows"]] == [3, 4]
+
+
+def test_nested_sparse_header_is_not_emitted_as_a_data_row(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _nested_sparse_header_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    table = projection["tables"][0]
+    assert table["source_total_count"] == 3
+    assert table["matched_rule"] == "L1-04"
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [5, 6, 7]
+    assert [row["row_role_kwd"] for row in projection["rows"]] == [
+        "data",
+        "data",
+        "data",
+    ]
+    assert [
+        column["column_id"] for column in table["ordered_columns"]
+    ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 8)]
+    assert [
+        column["column_ordinal"] for column in table["ordered_columns"]
+    ] == list(range(1, 8))
+
+
+def test_merged_header_continuation_is_not_emitted_as_a_data_row(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _merged_header_continuation_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    table = projection["tables"][0]
+    assert table["source_total_count"] == 3
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [6, 7, 8]
+    assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
+    assert [
+        column["column_id"] for column in table["ordered_columns"]
+    ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 9)]
+
+
+def test_optional_field_shape_change_does_not_break_the_record_axis(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _optional_field_shape_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    table = projection["tables"][0]
+    assert table["source_total_count"] == 3
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [3, 4, 5]
+    assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
 
 
 def test_multilevel_sparse_table_ignores_context_only_g1_disagreement(table_parser):

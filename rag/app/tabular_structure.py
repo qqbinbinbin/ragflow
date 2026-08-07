@@ -1050,6 +1050,18 @@ def _parse_region_structure(parser, worksheet, rows):
             evidence = _record_axis_evidence(candidate_headers, following_rows, merged_ranges)
             if evidence is None:
                 continue
+            if (
+                len(following_rows) >= 2
+                and _row_merge_signature(following_rows[0][0], merged_ranges)
+                and not _row_merge_signature(following_rows[1][0], merged_ranges)
+                and all(
+                    not _row_merge_signature(row_ordinal, merged_ranges)
+                    for row_ordinal, _values, _follows_body_gap in following_rows[1:]
+                )
+            ):
+                # A merged row immediately followed by an unmerged stable axis
+                # is still part of the header band, not the first record.
+                continue
             record_offsets = evidence["occupied_offsets"]
             record_count = len(following_rows)
             if any(
@@ -1083,9 +1095,36 @@ def _parse_region_structure(parser, worksheet, rows):
                     headers,
                     start,
                     end,
+                    not any(
+                        _row_merge_signature(row_ordinal, merged_ranges)
+                        for row_ordinal, _values, _follows_body_gap in following_rows
+                    ),
                 )
             )
     if candidates:
+        free_axis_by_start = {}
+        for candidate in candidates:
+            if not candidate[7]:
+                continue
+            previous = free_axis_by_start.get(candidate[5])
+            if previous is None or (
+                candidate[2],
+                -candidate[1],
+                candidate[0],
+                candidate[3],
+            ) > (
+                previous[2],
+                -previous[1],
+                previous[0],
+                previous[3],
+            ):
+                free_axis_by_start[candidate[5]] = candidate
+        selection_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[5] not in free_axis_by_start
+            or free_axis_by_start[candidate[5]] is candidate
+        ]
         (
             _field_count,
             _depth,
@@ -1094,7 +1133,11 @@ def _parse_region_structure(parser, worksheet, rows):
             headers,
             header_start,
             data_start,
-        ) = max(candidates)
+            _body_merge_free,
+        ) = max(
+            selection_candidates,
+            key=lambda candidate: (candidate[0], candidate[1], candidate[2], candidate[3]),
+        )
         return headers, header_start, data_start
     return fallback
 
@@ -1582,13 +1625,38 @@ def _project_structure_region(
             )
             if _is_repeated_header_row(headers, values):
                 row_role = "unknown"
-            if (
-                row_role == "data"
-                and established_shape is not None
-                and current_shape != established_shape
-                and current_shape == next_shape
-            ):
-                row_role = "unknown"
+            if record_axis_evidence is not None:
+                required_offsets = record_axis_evidence["required_offsets"]
+                required_shape = tuple(
+                    current_shape[offset]
+                    for offset in required_offsets
+                    if offset < len(current_shape)
+                )
+                next_required_shape = (
+                    tuple(
+                        next_shape[offset]
+                        for offset in required_offsets
+                        if offset < len(next_shape)
+                    )
+                    if next_shape is not None
+                    else None
+                )
+                established_required_shape = (
+                    tuple(
+                        established_shape[offset]
+                        for offset in required_offsets
+                        if offset < len(established_shape)
+                    )
+                    if established_shape is not None
+                    else None
+                )
+                if (
+                    row_role == "data"
+                    and established_required_shape is not None
+                    and required_shape != established_required_shape
+                    and required_shape == next_required_shape
+                ):
+                    row_role = "unknown"
         if row_role == "data":
             data_row_index += 1
             current_data_index = data_row_index
@@ -2250,23 +2318,42 @@ def _finalize_table_manifest_evidence(item: dict[str, Any]) -> None:
     if evidence is None:
         table["ordered_columns"] = []
         return
+    row_fields = [json.loads(row["ordered_fields_list"]) for row in rows]
     record_axis_columns = {
         column
         for row, column in item["members"]
         if row in set(item["proven_record_slots"])
     }
-    evidence_columns = [
-        absolute_column
-        for absolute_column in sorted(evidence["headers_by_column"])
-        if not rows
-        or absolute_column in record_axis_columns
-    ]
+    evidence_columns = sorted(evidence["headers_by_column"])
+    if rows and record_axis_columns:
+        # Preserve leading structural columns that have no value in a sparse
+        # record row, while stopping before disjoint trailing sidecars.
+        evidence_columns = [
+            absolute_column
+            for absolute_column in evidence_columns
+            if absolute_column <= max(record_axis_columns)
+        ]
+    if evidence_columns:
+        # Manifest ordinals are dense over the proven table axis, while field
+        # ordinals retain their source-column coordinates. Fill only structural
+        # columns inside that axis; disjoint sidecars remain excluded.
+        axis_start = min(evidence_columns)
+        axis_end = max(evidence_columns)
+        evidence_columns = [
+            absolute_column
+            for absolute_column in range(axis_start, axis_end + 1)
+            if absolute_column in evidence["headers_by_column"]
+        ]
+    column_ordinals = {
+        absolute_column: column_ordinal
+        for column_ordinal, absolute_column in enumerate(evidence_columns, start=1)
+    }
     ordered_columns = []
-    for column_ordinal, absolute_column in enumerate(evidence_columns, start=1):
+    for absolute_column in evidence_columns:
         ordered_columns.append(
             {
                 "column_id": f"col_v1:{table['sheet_ordinal']}:{absolute_column}",
-                "column_ordinal": column_ordinal,
+                "column_ordinal": column_ordinals[absolute_column],
                 "header_path": list(evidence["header_paths_by_column"][absolute_column]),
                 "name": evidence["headers_by_column"][absolute_column],
             }
@@ -2280,16 +2367,19 @@ def _finalize_table_manifest_evidence(item: dict[str, Any]) -> None:
                 field.get(key) == column[key]
                 for key in ("column_id", "column_ordinal", "header_path", "name")
             )
-            for field in json.loads(row["ordered_fields_list"])
+            for field in fields
         )
-        for row in rows
+        for fields in row_fields
     )
     has_complete_paths = bool(ordered_columns) and all(
         column["header_path"] for column in ordered_columns
     )
-    table["ordered_columns"] = (
-        ordered_columns if has_complete_paths and row_evidence_matches else []
-    )
+    if not has_complete_paths or not row_evidence_matches:
+        table["ordered_columns"] = []
+        if table.get("enumeration_status") == "supported_complete":
+            _clear_complete_decision(table, rows, "R8")
+        return
+    table["ordered_columns"] = ordered_columns
 
 
 def _continuation_record_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3614,18 +3704,37 @@ def _build_tabular_structure_projection_with_audit(
                     later_predicates.values()
                 )
                 later_rows = _continuation_record_rows(later)
+                earlier_proven_record_columns = {
+                    column
+                    for row, column in earlier["members"]
+                    if row in set(earlier["proven_record_slots"])
+                }
+                later_proven_record_columns = {
+                    column
+                    for row, column in later["members"]
+                    if row in set(later["proven_record_slots"])
+                }
+                nested_axis_overlap = bool(
+                    earlier_proven_record_columns & later["member_columns"]
+                    or later_proven_record_columns & earlier["member_columns"]
+                )
                 nested_axis_compatible = (
                     risk_ids is not nested_unknown_ids
-                    or len(later["member_columns"]) == 1
-                    or len(later_rows) != 1
                     or (
-                        bool(later_rows)
-                        and _continuation_rows_match_proven_axis(
-                            parser=parser,
-                            worksheet=worksheet,
-                            main=earlier,
-                            continuation=later,
-                            continuation_rows=later_rows,
+                        nested_axis_overlap
+                        and (
+                            len(later["member_columns"]) == 1
+                            or len(later_rows) != 1
+                            or (
+                                bool(later_rows)
+                                and _continuation_rows_match_proven_axis(
+                                    parser=parser,
+                                    worksheet=worksheet,
+                                    main=earlier,
+                                    continuation=later,
+                                    continuation_rows=later_rows,
+                                )
+                            )
                         )
                     )
                 )
