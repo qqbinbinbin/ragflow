@@ -400,6 +400,12 @@ def test_activation_atomically_retains_old_generation_and_checks_expected_pointe
         repository=generation_repository,
     )
     assert activated_second["status"] == "active"
+    assert activated_second["producer_generation_ref"] == second_projection["producer_generation_ref"]
+    assert activated_second["projection_version"] == second_projection["version"]
+    assert activated_second["producer_schema_version"] == second_projection["producer_schema_version"]
+    assert activated_second["structure_algorithm_version"] == second_projection["structure_algorithm_version"]
+    assert activated_second["enumeration_rule_version"] == second_projection["enumeration_rule_version"]
+    assert activated_second["row_count"] == len(second_projection["rows"])
     assert generation_repository.get(first_projection["producer_generation_ref"])["status"] == "retained"
     active = service_module.TabularStructureService.get_active_generation(
         tenant_id="tenant-owner",
@@ -638,6 +644,11 @@ def test_retained_restore_atomically_switches_expected_active_generation(
     )
     assert restored["status"] == "active"
     assert restored["producer_generation_ref"] == first_projection["producer_generation_ref"]
+    assert restored["projection_version"] == first_projection["version"]
+    assert restored["producer_schema_version"] == first_projection["producer_schema_version"]
+    assert restored["structure_algorithm_version"] == first_projection["structure_algorithm_version"]
+    assert restored["enumeration_rule_version"] == first_projection["enumeration_rule_version"]
+    assert restored["row_count"] == len(first_projection["rows"])
     assert generation_repository.get(second_projection["producer_generation_ref"])["status"] == "retained"
 
 

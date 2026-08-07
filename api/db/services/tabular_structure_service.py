@@ -60,6 +60,19 @@ def _public_generation(record: dict[str, Any]) -> dict[str, Any]:
     return {key: deepcopy(value) for key, value in record.items() if key in _PUBLIC_GENERATION_FIELDS}
 
 
+def _managed_generation_result(record: dict[str, Any], projection: dict[str, Any]) -> dict[str, Any]:
+    """Return the complete version-bound response required by generation consumers."""
+    return {
+        "status": record["status"],
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "projection_version": projection["version"],
+        "producer_schema_version": projection["producer_schema_version"],
+        "structure_algorithm_version": projection["structure_algorithm_version"],
+        "enumeration_rule_version": projection["enumeration_rule_version"],
+        "row_count": record["row_count"],
+    }
+
+
 def _validate_record(record: dict[str, Any]) -> None:
     required = {
         "producer_generation_ref",
@@ -463,7 +476,7 @@ class TabularStructureService:
             target["document_id"],
         ) != (tenant_id, dataset_id, document_id):
             raise StructureSnapshotMissing("shadow structure generation is missing")
-        load_tabular_structure_projection(
+        projection = load_tabular_structure_projection(
             storage,
             bucket=dataset_id,
             document_id=document_id,
@@ -480,7 +493,7 @@ class TabularStructureService:
             producer_generation_ref,
             expected_active_generation_ref,
         )
-        return _public_generation(activated)
+        return _managed_generation_result(activated, projection)
 
     @classmethod
     def restore_retained_generation(
@@ -503,7 +516,7 @@ class TabularStructureService:
             target["document_id"],
         ) != (tenant_id, dataset_id, document_id):
             raise StructureSnapshotMissing("retained structure generation is missing")
-        load_tabular_structure_projection(
+        projection = load_tabular_structure_projection(
             storage,
             bucket=dataset_id,
             document_id=document_id,
@@ -520,7 +533,7 @@ class TabularStructureService:
             retained_generation_ref,
             expected_active_generation_ref,
         )
-        return _public_generation(restored)
+        return _managed_generation_result(restored, projection)
 
     @classmethod
     def _read_projection(
@@ -608,15 +621,7 @@ class TabularStructureService:
     @classmethod
     def read_generation(cls, storage, **kwargs) -> dict[str, Any]:
         record, projection = cls._read_generation_projection(storage, **kwargs)
-        return {
-            "status": record["status"],
-            "producer_generation_ref": projection["producer_generation_ref"],
-            "projection_version": projection["version"],
-            "producer_schema_version": projection["producer_schema_version"],
-            "structure_algorithm_version": projection["structure_algorithm_version"],
-            "enumeration_rule_version": projection["enumeration_rule_version"],
-            "row_count": record["row_count"],
-        }
+        return _managed_generation_result(record, projection)
 
     @classmethod
     def read_generation_rows(
