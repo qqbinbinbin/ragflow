@@ -460,19 +460,10 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
                 "id": self.id,
             }
 
-    def _get_model_config_by_id(
-        tenant_model_id: str,
-        allowed_tenant_ids=None,
-        requester_tenant_id=None,
-    ) -> dict:
+    def _get_model_config_by_id(tenant_id: str, model_type: str, tenant_model_id: str) -> dict:
         mock_tenant_id = "tenant-1"
-        if allowed_tenant_ids is not None:
-            if isinstance(allowed_tenant_ids, str):
-                allowed_tenant_ids = {allowed_tenant_ids}
-            else:
-                allowed_tenant_ids = {str(tenant_id) for tenant_id in allowed_tenant_ids if tenant_id}
-            if mock_tenant_id not in allowed_tenant_ids and str(requester_tenant_id) != mock_tenant_id:
-                raise LookupError(f"Tenant Model with id {tenant_model_id} not authorized")
+        if str(tenant_id) != mock_tenant_id:
+            raise LookupError(f"Tenant Model with id {tenant_model_id} not authorized")
         return _MockModelConfig2(mock_tenant_id, "model-1").to_dict()
 
     def _get_model_config_from_provider_instance(tenant_id: str, model_type: str, model_name: str):
@@ -1731,3 +1722,117 @@ class TestDocRoutesUnit:
         res = _run(module.retrieval_test.__wrapped__("tenant-1"))
         assert res["code"] == module.RetCode.DATA_ERROR
         assert "No chunk found! Check the chunk status please!" in res["message"]
+
+    def test_retrieval_resolves_nonempty_embedding_binding_by_id(self, monkeypatch):
+        module = _load_doc_module(monkeypatch)
+        kb = SimpleNamespace(tenant_id="tenant-1", embd_id="legacy-model", tenant_embd_id="embedding-binding-1")
+        model_config = {"llm_name": "bound-model", "model_type": "embedding"}
+        calls = []
+
+        monkeypatch.setattr(module, "get_request_json", lambda: _AwaitableValue({"dataset_ids": ["ds-1"], "question": "q"}))
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_ids", lambda _ids: [kb])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, kb))
+        monkeypatch.setattr(
+            module,
+            "get_model_config_by_id",
+            lambda tenant_id, model_type, model_id: calls.append((tenant_id, model_type, model_id)) or model_config,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            module,
+            "resolve_model_config",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy embedding resolution must not run")),
+        )
+        monkeypatch.setattr(module, "LLMBundle", lambda tenant_id, config: SimpleNamespace(tenant_id=tenant_id, config=config))
+        monkeypatch.setattr(module, "label_question", lambda *_args, **_kwargs: {})
+
+        class _Retriever:
+            async def retrieval(self, _question, embd_mdl, *_args, **_kwargs):
+                assert embd_mdl.config is model_config
+                return {"chunks": [], "total": 0}
+
+            def retrieval_by_children(self, chunks, *_args, **_kwargs):
+                return chunks
+
+        monkeypatch.setattr(module.settings, "retriever", _Retriever())
+
+        res = _run(_route_core(module.retrieval_test)("tenant-1"))
+
+        assert res["code"] == 0, res
+        assert calls == [("tenant-1", module.LLMType.EMBEDDING, "embedding-binding-1")]
+
+    def test_retrieval_uses_legacy_embedding_name_only_when_binding_is_empty(self, monkeypatch):
+        module = _load_doc_module(monkeypatch)
+        kb = SimpleNamespace(tenant_id="tenant-1", embd_id="legacy-model", tenant_embd_id="")
+        model_config = {"llm_name": "legacy-model", "model_type": "embedding"}
+        calls = []
+
+        monkeypatch.setattr(module, "get_request_json", lambda: _AwaitableValue({"dataset_ids": ["ds-1"], "question": "q"}))
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_ids", lambda _ids: [kb])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, kb))
+        monkeypatch.setattr(
+            module,
+            "get_model_config_by_id",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ID resolution must not run for an empty binding")),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            module,
+            "resolve_model_config",
+            lambda tenant_id, model_type, model_name: calls.append((tenant_id, model_type, model_name)) or model_config,
+        )
+        monkeypatch.setattr(module, "LLMBundle", lambda tenant_id, config: SimpleNamespace(tenant_id=tenant_id, config=config))
+        monkeypatch.setattr(module, "label_question", lambda *_args, **_kwargs: {})
+
+        class _Retriever:
+            async def retrieval(self, _question, embd_mdl, *_args, **_kwargs):
+                assert embd_mdl.config is model_config
+                return {"chunks": [], "total": 0}
+
+            def retrieval_by_children(self, chunks, *_args, **_kwargs):
+                return chunks
+
+        monkeypatch.setattr(module.settings, "retriever", _Retriever())
+
+        res = _run(_route_core(module.retrieval_test)("tenant-1"))
+
+        assert res["code"] == 0, res
+        assert calls == [("tenant-1", module.LLMType.EMBEDDING, "legacy-model")]
+
+    @pytest.mark.parametrize(
+        "resolver_error",
+        [
+            "TenantModel id=embedding-binding-1 not found.",
+            "TenantModel id=embedding-binding-1 is disabled.",
+            "TenantModel id=embedding-binding-1 cannot be used as embedding model.",
+            "Tenant tenant-1 has no access to provider owned by tenant tenant-2.",
+        ],
+    )
+    def test_retrieval_fails_closed_when_nonempty_embedding_binding_is_invalid(self, monkeypatch, resolver_error):
+        module = _load_doc_module(monkeypatch)
+        kb = SimpleNamespace(tenant_id="tenant-1", embd_id="legacy-model", tenant_embd_id="embedding-binding-1")
+        calls = []
+
+        monkeypatch.setattr(module, "get_request_json", lambda: _AwaitableValue({"dataset_ids": ["ds-1"], "question": "q"}))
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_ids", lambda _ids: [kb])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, kb))
+
+        def _fail_by_id(tenant_id, model_type, model_id):
+            calls.append((tenant_id, model_type, model_id))
+            raise LookupError(resolver_error)
+
+        monkeypatch.setattr(module, "get_model_config_by_id", _fail_by_id, raising=False)
+        monkeypatch.setattr(
+            module,
+            "resolve_model_config",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid binding must not fall back to the legacy model name")),
+        )
+
+        res = _run(_route_core(module.retrieval_test)("tenant-1"))
+
+        assert res["code"] == 500
+        assert res["message"] == resolver_error
+        assert calls == [("tenant-1", module.LLMType.EMBEDDING, "embedding-binding-1")]
