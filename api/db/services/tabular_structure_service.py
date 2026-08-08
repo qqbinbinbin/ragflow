@@ -65,6 +65,7 @@ def _managed_generation_result(record: dict[str, Any], projection: dict[str, Any
     return {
         "status": record["status"],
         "producer_generation_ref": projection["producer_generation_ref"],
+        "source_sha256": projection["source_sha256"],
         "projection_version": projection["version"],
         "producer_schema_version": projection["producer_schema_version"],
         "structure_algorithm_version": projection["structure_algorithm_version"],

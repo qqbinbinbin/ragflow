@@ -582,6 +582,68 @@ def test_exact_generation_reads_support_shadow_active_and_retained_with_scope_bi
     assert first_storage.get_calls == []
 
 
+def test_managed_generation_receipts_preserve_validated_source_identity(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    first_storage, first_projection, first_receipt = _stored_generation(table_parser)
+    second_storage, second_projection, second_receipt = _stored_generation(table_parser)
+    for storage, receipt in (
+        (first_storage, first_receipt),
+        (second_storage, second_receipt),
+    ):
+        service_module.TabularStructureService.register_shadow_generation(
+            storage,
+            tenant_id="tenant-owner",
+            dataset_id="dataset-1",
+            document_id="document-1",
+            receipt=receipt,
+            repository=generation_repository,
+        )
+
+    shadow = service_module.TabularStructureService.read_generation(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=first_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+    first_active = service_module.TabularStructureService.activate_generation(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=first_projection["producer_generation_ref"],
+        expected_active_generation_ref=None,
+        repository=generation_repository,
+    )
+    second_active = service_module.TabularStructureService.activate_generation(
+        second_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=second_projection["producer_generation_ref"],
+        expected_active_generation_ref=first_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+    restored = service_module.TabularStructureService.restore_retained_generation(
+        first_storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        retained_generation_ref=first_projection["producer_generation_ref"],
+        expected_active_generation_ref=second_projection["producer_generation_ref"],
+        repository=generation_repository,
+    )
+
+    assert shadow["source_sha256"] == first_projection["source_sha256"]
+    assert first_active["source_sha256"] == first_projection["source_sha256"]
+    assert second_active["source_sha256"] == second_projection["source_sha256"]
+    assert restored["source_sha256"] == first_projection["source_sha256"]
+
+
 def test_retained_restore_atomically_switches_expected_active_generation(
     service_module,
     generation_repository,
