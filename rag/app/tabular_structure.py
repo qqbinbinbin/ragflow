@@ -33,8 +33,8 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v13"
-ENUMERATION_RULE_VERSION = "enumeration-rules/v5"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v14"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v6"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -1306,10 +1306,9 @@ def _header_boundary_proven(
     merged_ranges,
     record_axis_evidence: dict[str, Any] | None = None,
 ) -> bool:
-    first_header_row = header_start + 1
     if any(
-        merged.min_row < data_start
-        and merged.max_row >= first_header_row
+        merged.max_row == data_start
+        and merged.min_row >= header_start + 1
         and merged.max_row > merged.min_row
         for merged in merged_ranges
     ):
@@ -1332,7 +1331,13 @@ def _header_boundary_proven(
     ]
     if len(body_values) < 2:
         return True
-    for column_index, header_value in enumerate(header_values):
+    boundary_offsets = (
+        record_axis_evidence["required_offsets"]
+        if record_axis_evidence is not None
+        else range(len(header_values))
+    )
+    for column_index in boundary_offsets:
+        header_value = header_values[column_index]
         header_kind = _row_shape([header_value], distinguish_text_digits=True)[0]
         body_kinds = {
             _row_shape([values[column_index]], distinguish_text_digits=True)[0]

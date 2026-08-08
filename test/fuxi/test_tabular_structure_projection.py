@@ -29,8 +29,8 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v13"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v5"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v14"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v6"
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -369,7 +369,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v5"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v6"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
@@ -1943,6 +1943,55 @@ def _multilevel_sparse_table_with_context_child_bytes(*, context_row_count=1):
     return _save_workbook(workbook)
 
 
+def _competing_header_depth_candidate_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous candidate selection"
+    sheet.merge_cells("A1:H2")
+    sheet["A1"] = "Anonymous register"
+    for row in (3, 4):
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        sheet.cell(row=row, column=1, value=f"Context {row} A")
+        sheet.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+        sheet.cell(row=row, column=3, value=f"Context {row} B")
+        sheet.merge_cells(start_row=row, start_column=5, end_row=row, end_column=7)
+        sheet.cell(row=row, column=5, value=f"Context {row} C")
+        sheet.cell(row=row, column=8, value=f"Context {row} D")
+    sheet["J3"] = "Anonymous sidecar"
+    sheet["J4"] = "Anonymous sidecar value"
+    sheet.merge_cells("A5:H5")
+    sheet["A5"] = "Record fields"
+    sheet.merge_cells("A6:A7")
+    sheet["A6"] = "Sequence"
+    sheet.merge_cells("B6:B7")
+    sheet["B6"] = "Code"
+    sheet.merge_cells("C6:D6")
+    sheet["C6"] = "Grouping"
+    sheet["C7"] = "Group"
+    sheet["D7"] = "State"
+    sheet.merge_cells("E6:E7")
+    sheet["E6"] = "Owner"
+    sheet.merge_cells("F6:G7")
+    sheet["F6"] = "Evidence"
+    sheet.merge_cells("H6:H7")
+    sheet["H6"] = "Optional"
+    for index, row in enumerate(range(8, 18), start=1):
+        values = [
+            index,
+            f"R-{index:02d}",
+            "A",
+            "Open",
+            "Team",
+            "0",
+            "1",
+            "present" if index == 8 else None,
+        ]
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row=row, column=column, value=value)
+        sheet.merge_cells(start_row=row, start_column=6, end_row=row, end_column=7)
+    return _save_workbook(workbook)
+
+
 def _sparse_region_workbook_bytes():
     workbook = Workbook()
     sheet = workbook.active
@@ -3190,6 +3239,27 @@ def test_varying_record_merge_shapes_are_proven_by_the_real_candidate_stage(
     assert [row["row_role_kwd"] for row in rows] == ["data"] * 4
     assert [row["data_row_index_int"] for row in rows] == [1, 2, 3, 4]
     assert table["source_total_count"] == 4
+
+
+def test_header_candidate_selection_prefers_the_largest_proven_record_axis(
+    table_parser,
+):
+    workbook = table_parser._load_excel_to_workbook(
+        BytesIO(_competing_header_depth_candidate_workbook_bytes())
+    )
+    worksheet = workbook.active
+    rows, _populated_rows, _unresolved_rows = (
+        tabular_structure._complete_worksheet_rows(worksheet)
+    )
+
+    headers, header_start, data_start = tabular_structure._parse_region_structure(
+        table_parser,
+        worksheet,
+        rows,
+    )
+
+    assert data_start == 7, (header_start, data_start, headers)
+    assert len(rows[data_start:]) == 10
 
 
 def test_vertical_merge_parent_values_are_inherited_and_emitted_once(
