@@ -33,8 +33,8 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v14"
-ENUMERATION_RULE_VERSION = "enumeration-rules/v6"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v15"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v7"
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -231,9 +231,12 @@ def _truncate_utf8(value: str, byte_limit: int) -> str:
     if byte_limit < 1:
         raise ValueError("UTF-8 byte limit must be positive")
     encoded = value.encode("utf-8")
-    if len(encoded) <= byte_limit:
-        return value
-    return encoded[:byte_limit].decode("utf-8", errors="ignore")
+    bounded = (
+        value
+        if len(encoded) <= byte_limit
+        else encoded[:byte_limit].decode("utf-8", errors="ignore")
+    )
+    return bounded.strip()
 
 
 def _cell_value(parser, worksheet, row_ordinal: int, column_ordinal: int, merged_ranges):
@@ -377,6 +380,13 @@ def _classify_body_row(
     record_axis_evidence: dict[str, Any] | None = None,
 ) -> str:
     width = len(values)
+    if record_axis_evidence is not None:
+        if row_ordinal in record_axis_evidence.get("note_row_ordinals", ()):
+            return "note"
+        if row_ordinal in record_axis_evidence.get("unknown_row_ordinals", ()):
+            return "unknown"
+        if row_ordinal not in record_axis_evidence.get("record_row_ordinals", ()):
+            return "unknown"
     if _is_full_width_merge(row_ordinal, width, merged_ranges):
         return "unknown"
     if record_axis_evidence is not None:
@@ -393,7 +403,10 @@ def _classify_body_row(
         )
         required_offsets = set(record_axis_evidence["required_offsets"])
         if required_offsets and required_offsets.issubset(row_offsets) and (
-            len(values) == 1 or len(row_offsets) >= 2
+            len(values) == 1
+            or len(row_offsets) >= 2
+            or record_axis_evidence.get("record_key_axis_proven") is True
+            or record_axis_evidence.get("single_record_axis_proven") is True
         ):
             return "data"
         return "unknown"
@@ -429,6 +442,27 @@ def _record_axis_value_shape(value: object) -> tuple[str, ...]:
     if isinstance(value, (int, float)):
         return ("number",)
     return ("text", *_text_structure(value))
+
+
+def _record_key_axis_proven(
+    rows: list[tuple[int, list[object], bool]],
+    required_offsets: set[int],
+) -> bool:
+    """Prove a source-backed numeric record key on the leftmost required field."""
+
+    if len(rows) < 2 or not required_offsets:
+        return False
+    key_offset = min(required_offsets)
+    values = [row[1][key_offset] for row in rows]
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in values
+    ):
+        return False
+    if len(set(values)) != len(values):
+        return False
+    deltas = [right - left for left, right in zip(values, values[1:])]
+    return bool(deltas) and (all(delta > 0 for delta in deltas) or all(delta < 0 for delta in deltas))
 
 
 def _is_repeated_header_row(headers: list[str], values: list[object]) -> bool:
@@ -899,6 +933,8 @@ def _parse_region_structure(parser, worksheet, rows):
             continue
         for depth in range(1, max_scan_rows - start + 1):
             end = start + depth
+            if parser._is_empty_row([cell.value for cell in rows[end - 1]]):
+                continue
             parent_rows = range(start + 1, end)
             if not all(
                 any(
@@ -957,8 +993,16 @@ def _parse_region_structure(parser, worksheet, rows):
                 ),
                 default=0,
             )
+            contiguous_header_width = 0
+            for column_index, header in enumerate(headers, start=1):
+                if not header or header.startswith("Column_"):
+                    break
+                contiguous_header_width = column_index
             if structural_width:
-                structural_width = min(structural_width, len(headers))
+                structural_width = min(
+                    max(structural_width, contiguous_header_width),
+                    len(headers),
+                )
             else:
                 structural_width = len(headers)
             if structural_width < 1:
@@ -1051,8 +1095,19 @@ def _parse_region_structure(parser, worksheet, rows):
                 following_rows.append((row_index, values, False))
             if full_width_before_axis:
                 continue
+            if following_rows and following_rows[0][0] != end + 1:
+                continue
             evidence = _record_axis_evidence(candidate_headers, following_rows, merged_ranges)
             if evidence is None:
+                continue
+            if evidence["single_record_axis_proven"] and not _single_record_header_boundary_proven(
+                worksheet,
+                header_start=start,
+                data_start=end,
+                width=structural_width,
+                merged_ranges=merged_ranges,
+                record_axis_evidence=evidence,
+            ):
                 continue
             if (
                 len(following_rows) >= 2
@@ -1067,7 +1122,7 @@ def _parse_region_structure(parser, worksheet, rows):
                 # is still part of the header band, not the first record.
                 continue
             record_offsets = evidence["occupied_offsets"]
-            record_count = len(following_rows)
+            record_count = len(evidence["record_row_ordinals"])
             if any(
                 offset >= len(candidate_headers) or candidate_headers[offset].startswith("Column_")
                 for offset in record_offsets
@@ -1092,6 +1147,12 @@ def _parse_region_structure(parser, worksheet, rows):
                 continue
             candidates.append(
                 (
+                    evidence["record_key_axis_proven"]
+                    or evidence["single_record_axis_proven"],
+                    evidence["record_key_axis_proven"],
+                    evidence["single_record_axis_proven"],
+                    not evidence["unknown_row_ordinals"],
+                    evidence["record_axis_contiguous"],
                     len(record_offsets),
                     depth,
                     record_count,
@@ -1108,28 +1169,43 @@ def _parse_region_structure(parser, worksheet, rows):
     if candidates:
         free_axis_by_start = {}
         for candidate in candidates:
-            if not candidate[7]:
+            if not candidate[12]:
                 continue
-            previous = free_axis_by_start.get(candidate[5])
+            previous = free_axis_by_start.get(candidate[10])
             if previous is None or (
-                candidate[2],
-                -candidate[1],
-                candidate[0],
+                candidate[1],
                 candidate[3],
+                candidate[4],
+                candidate[7],
+                candidate[0],
+                candidate[2],
+                -candidate[6],
+                candidate[5],
+                candidate[8],
             ) > (
-                previous[2],
-                -previous[1],
-                previous[0],
+                previous[1],
                 previous[3],
+                previous[4],
+                previous[7],
+                previous[0],
+                previous[2],
+                -previous[6],
+                previous[5],
+                previous[8],
             ):
-                free_axis_by_start[candidate[5]] = candidate
+                free_axis_by_start[candidate[10]] = candidate
         selection_candidates = [
             candidate
             for candidate in candidates
-            if candidate[5] not in free_axis_by_start
-            or free_axis_by_start[candidate[5]] is candidate
+            if candidate[10] not in free_axis_by_start
+            or free_axis_by_start[candidate[10]] is candidate
         ]
         (
+            _closed_axis_proven,
+            _record_key_axis_proven,
+            _single_record_axis_proven,
+            _has_no_unknown_rows,
+            _record_axis_contiguous,
             _field_count,
             _depth,
             _record_count,
@@ -1140,7 +1216,17 @@ def _parse_region_structure(parser, worksheet, rows):
             _body_merge_free,
         ) = max(
             selection_candidates,
-            key=lambda candidate: (candidate[0], candidate[1], candidate[2], candidate[3]),
+            key=lambda candidate: (
+                candidate[1],
+                candidate[3],
+                candidate[4],
+                candidate[7],
+                candidate[0],
+                candidate[2],
+                candidate[5],
+                candidate[6],
+                candidate[8],
+            ),
         )
         return headers, header_start, data_start
     return fallback
@@ -1166,16 +1252,89 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
         return None
     merged_ranges = list(worksheet.merged_cells.ranges)
     occupied = _logical_occupied_cells(parser, worksheet)
+    title_spans = [
+        merged
+        for merged in merged_ranges
+        if merged.min_col == 1
+        and merged.max_col > 1
+        and worksheet.cell(merged.min_row, merged.min_col).value is not None
+        and str(worksheet.cell(merged.min_row, merged.min_col).value).strip()
+    ]
+    last_populated = max(populated_rows)
+    trailing_start = last_populated
+    while trailing_start - 1 in populated_rows:
+        trailing_start -= 1
+    if trailing_start > min(populated_rows) and trailing_start - 1 not in populated_rows:
+        header_start = trailing_start - 1
+        data_start = last_populated
+        headers = parser._build_headers_for_region(
+            worksheet,
+            rows,
+            header_start,
+            data_start,
+        )
+        header_paths = _header_paths_for_region(
+            parser,
+            worksheet,
+            rows,
+            header_start,
+            data_start,
+        )
+        header_merges = [
+            merged
+            for merged in merged_ranges
+            if merged.min_row >= trailing_start
+            and merged.max_row <= data_start
+        ]
+        preceding_width = max(
+            (
+                len(
+                    {
+                        column
+                        for row, column in occupied
+                        if row == row_ordinal
+                    }
+                )
+                for row_ordinal in populated_rows
+                if row_ordinal < trailing_start
+            ),
+            default=0,
+        )
+        single_row_dense_header = (
+            trailing_start == data_start
+            and len(headers) >= 2
+            and preceding_width < len(headers)
+            and all(
+                _source_cell_anchor(data_start, column, merged_ranges)[0] == "cell"
+                for column in range(1, len(headers) + 1)
+            )
+        )
+        multilevel_structural_header = (
+            trailing_start < data_start
+            and any(
+                merged.max_col > merged.min_col or merged.max_row > merged.min_row
+                for merged in header_merges
+            )
+        )
+        if (
+            len(headers) >= 2
+            and len(header_paths) == len(headers)
+            and all(
+                header
+                and not header.startswith("Column_")
+                and path
+                for header, path in zip(headers, header_paths)
+            )
+            and len({tuple(path) for path in header_paths}) >= 2
+            and (single_row_dense_header or multilevel_structural_header)
+        ):
+            return headers, header_paths, header_start, data_start
+
     candidates = []
-    for title_merge in merged_ranges:
-        if title_merge.min_col != 1 or title_merge.max_col <= 1:
-            continue
-        title = worksheet.cell(title_merge.min_row, title_merge.min_col).value
-        if title is None or not str(title).strip():
-            continue
-        header_row = title_merge.max_row + 1
+    for title in title_spans:
+        header_row = title.max_row + 1
         header_columns = []
-        for column in range(title_merge.min_col, title_merge.max_col + 1):
+        for column in range(title.min_col, title.max_col + 1):
             value = _cell_value(parser, worksheet, header_row, column, merged_ranges)
             if (
                 value is None
@@ -1186,16 +1345,14 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
             header_columns.append(column)
         if len(header_columns) < 2:
             continue
-        first_blank_column = header_columns[-1] + 1
         if any(
             _cell_value(parser, worksheet, header_row, column, merged_ranges) is not None
             and str(_cell_value(parser, worksheet, header_row, column, merged_ranges)).strip()
-            for column in range(first_blank_column, title_merge.max_col + 1)
+            for column in range(header_columns[-1] + 1, title.max_col + 1)
         ):
             continue
-        width = header_columns[-1]
         if any(
-            row > header_row and column <= width
+            row > header_row and column <= header_columns[-1]
             for row, column in occupied
         ):
             continue
@@ -1211,9 +1368,197 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
         ):
             continue
         candidates.append((headers, [[header] for header in headers], header_row - 1, header_row))
-    if len(candidates) != 1:
+
+    for header_row in populated_rows:
+        if not any(title.max_row < header_row for title in title_spans):
+            continue
+        anchors = [
+            column
+            for column in range(1, worksheet.max_column + 1)
+            if (header_row, column) in occupied
+            and _source_cell_anchor(header_row, column, merged_ranges)[0] == "cell"
+        ]
+        if len(anchors) < 2 or anchors != list(range(anchors[0], anchors[-1] + 1)):
+            continue
+        if (
+            header_row > min(populated_rows) + 1
+            and header_row - 1 in populated_rows
+            and not any(
+                merged.max_row == header_row - 1
+                and merged.min_row < merged.max_row
+                for merged in merged_ranges
+            )
+        ):
+            continue
+        if any(
+            row > header_row and anchors[0] <= column <= anchors[-1]
+            for row, column in occupied
+        ):
+            continue
+        headers = [
+            _sanitize_untrusted_text(
+                _cell_value(parser, worksheet, header_row, column, merged_ranges)
+            ).strip()
+            for column in anchors
+        ]
+        if (
+            any(not header or header.startswith("Column_") for header in headers)
+            or len(set(headers)) != len(headers)
+        ):
+            continue
+        earlier_members = {
+            (row, column)
+            for row, column in occupied
+            if row < header_row and anchors[0] <= column <= anchors[-1]
+        }
+        if not earlier_members or not any(
+            title.min_col <= anchors[0]
+            and title.max_col >= anchors[-1]
+            and title.max_row < header_row
+            for title in title_spans
+        ):
+            continue
+        candidates.append((headers, [[header] for header in headers], header_row - 1, header_row))
+    unique_candidates = {}
+    for candidate in candidates:
+        key = (
+            tuple(candidate[0]),
+            tuple(tuple(path) for path in candidate[1]),
+            candidate[2],
+            candidate[3],
+        )
+        unique_candidates[key] = candidate
+    if len(unique_candidates) != 1:
         return None
-    return candidates[0]
+    return next(iter(unique_candidates.values()))
+
+
+def _trailing_empty_record_axis_structure(
+    parser,
+    worksheet,
+    rows,
+    populated_rows,
+    unresolved_rows,
+):
+    """Prove a final dense header band before earlier context is parsed as data."""
+
+    if unresolved_rows or len(populated_rows) < 2:
+        return None
+    last_populated = max(populated_rows)
+    trailing_start = last_populated
+    while trailing_start - 1 in populated_rows:
+        trailing_start -= 1
+    if (
+        trailing_start == min(populated_rows)
+        or trailing_start - 1 in populated_rows
+    ):
+        return None
+
+    header_start = trailing_start - 1
+    data_start = last_populated
+    headers = parser._build_headers_for_region(
+        worksheet,
+        rows,
+        header_start,
+        data_start,
+    )
+    header_paths = _header_paths_for_region(
+        parser,
+        worksheet,
+        rows,
+        header_start,
+        data_start,
+    )
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    occupied = _logical_occupied_cells(parser, worksheet)
+    preceding_width = max(
+        (
+            len({column for row, column in occupied if row == row_ordinal})
+            for row_ordinal in populated_rows
+            if row_ordinal < trailing_start
+        ),
+        default=0,
+    )
+    header_merges = [
+        merged
+        for merged in merged_ranges
+        if merged.min_row >= trailing_start
+        and merged.max_row <= data_start
+    ]
+    single_row_dense_header = (
+        trailing_start == data_start
+        and preceding_width < len(headers)
+        and all(
+            _source_cell_anchor(data_start, column, merged_ranges)[0] == "cell"
+            for column in range(1, len(headers) + 1)
+        )
+    )
+    multilevel_structural_header = (
+        trailing_start < data_start
+        and any(
+            merged.max_col > merged.min_col or merged.max_row > merged.min_row
+            for merged in header_merges
+        )
+    )
+    if (
+        len(headers) >= 2
+        and len(header_paths) == len(headers)
+        and all(
+            header
+            and not header.startswith("Column_")
+            and path
+            for header, path in zip(headers, header_paths)
+        )
+        and len({tuple(path) for path in header_paths}) >= 2
+        and (single_row_dense_header or multilevel_structural_header)
+    ):
+        return headers, header_paths, header_start, data_start
+    return None
+
+
+def _nonempty_record_axis_structure(parser, worksheet, rows, populated_rows):
+    """Return parsed structure only when its body independently proves records."""
+
+    headers, header_start, data_start = _parse_region_structure(parser, worksheet, rows)
+    if not headers:
+        return None
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    body_rows = [
+        (
+            row_ordinal,
+            [
+                _cell_value(parser, worksheet, row_ordinal, column_ordinal, merged_ranges)
+                for column_ordinal in range(1, len(headers) + 1)
+            ],
+            False,
+        )
+        for row_ordinal in populated_rows
+        if row_ordinal > data_start
+    ]
+    evidence = _record_axis_evidence(headers, body_rows, merged_ranges)
+    if evidence is None:
+        return None
+    if evidence["single_record_axis_proven"] and not _single_record_header_boundary_proven(
+        worksheet,
+        header_start=header_start,
+        data_start=data_start,
+        width=len(headers),
+        merged_ranges=merged_ranges,
+        record_axis_evidence=evidence,
+    ):
+        return None
+    if not _header_boundary_proven(
+        parser,
+        worksheet,
+        header_start=header_start,
+        data_start=data_start,
+        headers=headers,
+        body_rows=body_rows,
+        merged_ranges=merged_ranges,
+        record_axis_evidence=evidence,
+    ):
+        return None
+    return headers, header_start, data_start
 
 
 def _record_field_offsets(
@@ -1252,47 +1597,129 @@ def _record_axis_evidence(
 ) -> dict[str, Any] | None:
     """Prove one physical record axis from geometry and source-backed values."""
 
-    if len(body_rows) < 2:
+    if not body_rows:
         return None
-    row_ordinals = [row_ordinal for row_ordinal, _values, _gap in body_rows]
-    if any(right != left + 1 for left, right in zip(row_ordinals, row_ordinals[1:])):
-        return None
-    row_offsets = [
-        _record_field_offsets(
-            values,
-            row_ordinal=row_ordinal,
-            merged_ranges=merged_ranges,
+
+    def evaluate(rows, note_rows, unknown_rows=()):
+        row_ordinals = [row[0] for row in rows]
+        record_axis_contiguous = not any(
+            right != left + 1 for left, right in zip(row_ordinals, row_ordinals[1:])
         )
-        for row_ordinal, values, _gap in body_rows
+        if any(_is_full_width_merge(row[0], len(headers), merged_ranges) for row in rows):
+            return None
+        if any(_is_repeated_header_row(headers, row[1]) for row in rows):
+            return None
+        row_offsets = [
+            _record_field_offsets(
+                values,
+                row_ordinal=row_ordinal,
+                merged_ranges=merged_ranges,
+            )
+            for row_ordinal, values, _gap in rows
+        ]
+        if any(not offsets for offsets in row_offsets):
+            return None
+        if (
+            len(headers) > 1
+            and not merged_ranges
+            and len(rows) == 2
+            and len(set(row_offsets)) > 1
+        ):
+            return None
+        common_offsets = set(row_offsets[0]).intersection(
+            *(set(offsets) for offsets in row_offsets[1:])
+        )
+        occupied_offsets = set().union(*(set(offsets) for offsets in row_offsets))
+        if not common_offsets or any(
+            offset >= len(headers) or headers[offset].startswith("Column_")
+            for offset in occupied_offsets
+        ):
+            return None
+        if len({headers[offset] for offset in common_offsets}) < min(2, len(common_offsets)):
+            return None
+
+        single_axis = (
+            len(rows) == 1
+            and len(headers) >= 2
+            and len(occupied_offsets) >= 2
+            and _has_partial_row_merge(row_ordinals[0], len(headers), merged_ranges)
+        )
+        if len(rows) < 2 and not single_axis:
+            return None
+        return {
+            "record_row_ordinals": tuple(row_ordinals),
+            "row_ordinals": tuple(row[0] for row in body_rows),
+            "note_row_ordinals": tuple(row[0] for row in note_rows),
+            "unknown_row_ordinals": tuple(row[0] for row in unknown_rows),
+            "record_axis_contiguous": record_axis_contiguous,
+            "row_offsets": tuple(row_offsets),
+            "required_offsets": tuple(sorted(common_offsets)),
+            "optional_offsets": tuple(sorted(occupied_offsets - common_offsets)),
+            "occupied_offsets": tuple(sorted(occupied_offsets)),
+            "record_key_axis_proven": _record_key_axis_proven(rows, common_offsets),
+            "single_record_axis_proven": single_axis,
+        }
+
+    segments = []
+    current = []
+    for row in body_rows:
+        if current and row[0] != current[-1][0] + 1:
+            segments.append(current)
+            current = []
+        current.append(row)
+    if current:
+        segments.append(current)
+
+    record_rows = list(segments[0])
+    note_rows = []
+    unknown_rows = []
+    for segment in segments[1:]:
+        target = (
+            note_rows
+            if len(segment) == 1
+            or (
+                segment
+                and _is_full_width_merge(segment[0][0], len(headers), merged_ranges)
+            )
+            else unknown_rows
+        )
+        target.extend(segment)
+    full_width_rows = [
+        row
+        for row in record_rows
+        if _is_full_width_merge(row[0], len(headers), merged_ranges)
     ]
-    if any(not offsets for offsets in row_offsets):
-        return None
-    common_offsets = set(row_offsets[0]).intersection(*(set(offsets) for offsets in row_offsets[1:]))
-    occupied_offsets = set().union(*(set(offsets) for offsets in row_offsets))
-    if not common_offsets:
-        return None
-    if (
-        len(headers) > 1
-        and not merged_ranges
-        and len(body_rows) == 2
-        and len({tuple(offsets) for offsets in row_offsets}) > 1
-    ):
-        return None
-    if any(
-        offset >= len(headers) or headers[offset].startswith("Column_")
-        for offset in occupied_offsets
-    ):
-        return None
-    distinct_headers = {headers[offset] for offset in common_offsets}
-    if len(distinct_headers) < min(2, len(common_offsets)):
-        return None
-    return {
-        "row_ordinals": row_ordinals,
-        "row_offsets": tuple(row_offsets),
-        "required_offsets": tuple(sorted(common_offsets)),
-        "optional_offsets": tuple(sorted(occupied_offsets - common_offsets)),
-        "occupied_offsets": tuple(sorted(occupied_offsets)),
-    }
+    full_width_indexes = [
+        index
+        for index, row in enumerate(record_rows)
+        if _is_full_width_merge(row[0], len(headers), merged_ranges)
+    ]
+    if full_width_indexes:
+        candidate_records = [row for row in record_rows if row not in full_width_rows]
+        if len(candidate_records) < 2:
+            return None
+        candidate_notes = []
+        unknown_rows = [*unknown_rows, *full_width_rows]
+        only_trailing_full_width = full_width_indexes == list(
+            range(full_width_indexes[0], len(record_rows))
+        )
+        key_shapes = {
+            _record_axis_value_shape(row[1][0])
+            for row in candidate_records
+            if row[1] and row[1][0] is not None and str(row[1][0]).strip()
+        }
+        if only_trailing_full_width and len(full_width_rows) == 1:
+            note_shape = _record_axis_value_shape(full_width_rows[0][1][0])
+            if len(key_shapes) == 1 and note_shape not in key_shapes:
+                candidate_notes = list(full_width_rows)
+                unknown_rows = [
+                    row for row in unknown_rows if row not in full_width_rows
+                ]
+        record_rows = candidate_records
+        note_rows = [*candidate_notes, *note_rows]
+        return evaluate(record_rows, note_rows, unknown_rows)
+
+    return evaluate(record_rows, note_rows, unknown_rows)
 
 
 def _header_boundary_proven(
@@ -1349,6 +1776,91 @@ def _header_boundary_proven(
         if body_kinds and header_kind not in body_kinds:
             return True
     return False
+
+
+def _single_record_header_boundary_proven(
+    worksheet,
+    *,
+    header_start: int,
+    data_start: int,
+    width: int,
+    merged_ranges,
+    record_axis_evidence: dict[str, Any] | None = None,
+) -> bool:
+    header_merges = [
+        merged
+        for merged in merged_ranges
+        if merged.min_row >= header_start + 1
+        and merged.max_row <= data_start
+        and merged.max_col >= 1
+        and merged.min_col <= width
+    ]
+    leaf_sources = {
+        _source_cell_anchor(data_start, column, merged_ranges)
+        for column in range(1, width + 1)
+    }
+    contextual_boundary = (
+        any(merged.max_col > merged.min_col for merged in header_merges)
+        and any(source[0] == "cell" for source in leaf_sources)
+        and (
+            data_start - header_start >= 2
+            or (
+                header_start > 0
+                and any(
+                    merged.max_row < header_start + 1
+                    for merged in merged_ranges
+                )
+                or (
+                    header_start > 1
+                    and all(
+                        worksheet.cell(header_start, column).value is None
+                        for column in range(1, width + 1)
+                    )
+                    and any(
+                        worksheet.cell(row, column).value is not None
+                        for row in range(1, header_start)
+                        for column in range(1, width + 1)
+                    )
+                )
+            )
+        )
+    )
+    if contextual_boundary:
+        return True
+
+    record_rows = tuple(
+        (record_axis_evidence or {}).get("record_row_ordinals", ())
+    )
+    required_offsets = tuple(
+        (record_axis_evidence or {}).get("required_offsets", ())
+    )
+    if len(record_rows) != 1 or len(required_offsets) < 2:
+        return False
+    record_row = record_rows[0]
+
+    def horizontal_spans(row_ordinal: int) -> set[tuple[int, int]]:
+        return {
+            (max(1, merged.min_col), min(width, merged.max_col))
+            for merged in merged_ranges
+            if merged.min_row <= row_ordinal <= merged.max_row
+            and merged.max_col > merged.min_col
+            and merged.min_col <= width
+            and merged.max_col >= 1
+        }
+
+    header_spans = horizontal_spans(data_start)
+    record_spans = horizontal_spans(record_row)
+    key_value = worksheet.cell(record_row, min(required_offsets) + 1).value
+    return (
+        bool(header_spans)
+        and header_spans == record_spans
+        and isinstance(key_value, (int, float))
+        and not isinstance(key_value, bool)
+        and any(
+            _source_cell_anchor(record_row, column, merged_ranges)[0] == "cell"
+            for column in range(1, width + 1)
+        )
+    )
 
 
 def _text_structure(value: object) -> tuple[str, ...]:
@@ -1416,6 +1928,7 @@ def _sparse_record_axis_proven(
 
 
 def _g1_disagreement_is_outside_record_axis(
+    worksheet,
     region: dict[str, Any],
     record_row_ordinals: set[int],
 ) -> bool:
@@ -1432,18 +1945,51 @@ def _g1_disagreement_is_outside_record_axis(
     non_record_children = [
         child for child in region["g1_children"] if not child & record_members
     ]
+    record_columns = {column for _row, column in record_members}
+    record_child_columns = (
+        {column for _row, column in record_children[0]}
+        if len(record_children) == 1
+        else set()
+    )
+    merged_ranges = list(worksheet.merged_cells.ranges)
+
+    def child_is_outside_context(child: set[tuple[int, int]]) -> bool:
+        child_min_row, _min_column, child_max_row, _max_column = _region_bbox(child)
+        if child_max_row < min(record_row_ordinals):
+            child_columns = {column for _row, column in child}
+            return (
+                child_columns.issubset(record_child_columns)
+                or not _members_prove_repeated_axis(child)
+                or any(
+                merged.min_row >= child_min_row
+                and merged.max_row <= child_max_row
+                and merged.min_col <= min(record_columns)
+                and merged.max_col >= max(record_columns)
+                for merged in merged_ranges
+            )
+            )
+        if len({row for row, _column in child}) == 1:
+            return True
+        child_columns = {column for _row, column in child}
+        if not child_columns.issubset(record_columns):
+            return not _members_prove_repeated_axis(child)
+        return any(
+            merged.min_row >= child_min_row
+            and merged.max_row <= child_max_row
+            and merged.min_col <= min(record_columns)
+            and merged.max_col >= max(record_columns)
+            for merged in merged_ranges
+        )
+
     return (
         bool(record_members)
         and len(record_children) == 1
         and record_members.issubset(record_children[0])
-        and not any(
-            _members_prove_repeated_axis(child)
-            for child in non_record_children
-        )
+        and all(child_is_outside_context(child) for child in non_record_children)
         and all(
-            row_ordinal < min(record_row_ordinals)
+            max(row for row, _column in child) < min(record_row_ordinals)
+            or min(row for row, _column in child) > max(record_row_ordinals)
             for child in non_record_children
-            for row_ordinal, _column_ordinal in child
         )
     )
 
@@ -1495,9 +2041,41 @@ def _project_structure_region(
     header_rows, populated_row_ordinals, unresolved_row_ordinals = _complete_worksheet_rows(worksheet)
     if not header_rows or not populated_row_ordinals:
         return None
-    empty_structure = (
+    nonempty_structure = _nonempty_record_axis_structure(
+        parser,
+        worksheet,
+        header_rows,
+        populated_row_ordinals,
+    )
+    trailing_empty_candidate = (
         None
         if force_unknown_total
+        else _trailing_empty_record_axis_structure(
+            parser,
+            worksheet,
+            header_rows,
+            populated_row_ordinals,
+            unresolved_row_ordinals,
+        )
+    )
+    nonempty_has_unnamed_headers = (
+        nonempty_structure is not None
+        and any(
+            not header or header.startswith("Column_")
+            for header in nonempty_structure[0]
+        )
+    )
+    trailing_empty_structure = (
+        trailing_empty_candidate
+        if trailing_empty_candidate is not None
+        and (nonempty_structure is None or nonempty_has_unnamed_headers)
+        else None
+    )
+    if trailing_empty_structure is not None:
+        nonempty_structure = None
+    empty_structure = trailing_empty_structure or (
+        None
+        if force_unknown_total or nonempty_structure is not None
         else _empty_record_axis_structure(
             parser,
             worksheet,
@@ -1509,7 +2087,11 @@ def _project_structure_region(
     if empty_structure is not None:
         headers, header_paths, header_start, data_start = empty_structure
     else:
-        headers, header_start, data_start = _parse_region_structure(parser, worksheet, header_rows)
+        headers, header_start, data_start = nonempty_structure or _parse_region_structure(
+            parser,
+            worksheet,
+            header_rows,
+        )
         header_paths = _header_paths_for_region(
             parser,
             worksheet,
@@ -1584,6 +2166,19 @@ def _project_structure_region(
         previous_body_ordinal = row_ordinal
 
     record_axis_evidence = _record_axis_evidence(headers, body_rows, merged_ranges)
+    if (
+        record_axis_evidence is not None
+        and record_axis_evidence["single_record_axis_proven"]
+        and not _single_record_header_boundary_proven(
+            worksheet,
+            header_start=header_start,
+            data_start=data_start,
+            width=len(headers),
+            merged_ranges=merged_ranges,
+            record_axis_evidence=record_axis_evidence,
+        )
+    ):
+        record_axis_evidence = None
     if not _header_boundary_proven(
         parser,
         worksheet,
@@ -1661,6 +2256,7 @@ def _project_structure_region(
                 )
                 if (
                     row_role == "data"
+                    and not record_axis_evidence.get("record_key_axis_proven")
                     and established_required_shape is not None
                     and required_shape != established_required_shape
                     and required_shape == next_required_shape
@@ -1727,7 +2323,11 @@ def _project_structure_region(
         )
 
     data_field_offsets = [
-        _record_field_offsets(values)
+        _record_field_offsets(
+            values,
+            row_ordinal=_row_ordinal,
+            merged_ranges=merged_ranges,
+        )
         for _row_ordinal, values, _follows_body_gap in body_rows
         if _classify_body_row(
             _row_ordinal,
@@ -1761,16 +2361,33 @@ def _project_structure_region(
         and not _is_repeated_header_row(headers, values)
     ]
     regular_record_axis_proven = (
-        len(data_field_offsets) >= 2
-        and len(set(data_field_offsets)) == 1
-        and len(set(data_value_shapes)) == 1
-        and bool(data_field_offsets[0])
+        record_axis_evidence is not None
+        and record_axis_evidence["record_axis_contiguous"]
+        and not record_axis_evidence["unknown_row_ordinals"]
+        and data_row_index == len(record_axis_evidence["record_row_ordinals"])
         and data_row_index == len(data_field_offsets)
+        and bool(data_field_offsets)
+        and (
+            record_axis_evidence.get("record_key_axis_proven") is True
+            or (
+                len(set(data_field_offsets)) == 1
+                and len(set(data_value_shapes)) == 1
+            )
+        )
         and _single_column_axis_proven(headers, body_rows)
     )
     sparse_record_axis_proven = (
         data_row_index == len(data_field_offsets)
-        and _sparse_record_axis_proven(headers, body_rows, data_field_offsets)
+        and record_axis_evidence is not None
+        and _sparse_record_axis_proven(
+            headers,
+            [
+                row
+                for row in body_rows
+                if row[0] in record_axis_evidence["record_row_ordinals"]
+            ],
+            data_field_offsets,
+        )
     )
     record_axis_proven = regular_record_axis_proven or sparse_record_axis_proven
     source_total_count = (
@@ -1828,22 +2445,96 @@ def _column_sets_are_nested(left: set[int], right: set[int]) -> bool:
     )
 
 
+def _unknown_region_can_extend_proven_axis(
+    *,
+    parser,
+    worksheet,
+    proven: dict[str, Any],
+    unknown: dict[str, Any],
+) -> bool:
+    if (
+        proven["bbox"][2] >= unknown["bbox"][0]
+        or not _column_sets_intersect(
+            proven["member_columns"],
+            unknown["member_columns"],
+        )
+    ):
+        return False
+    proven_evidence = proven.get("structure_evidence")
+    proven_rows = [
+        row for row in proven["rows"] if row["row_role_kwd"] == "data"
+    ]
+    if not proven_evidence or not proven_rows:
+        return False
+    continuation_rows = _continuation_record_rows(unknown)
+    return bool(continuation_rows) and _continuation_rows_match_proven_axis(
+        parser=parser,
+        worksheet=worksheet,
+        main=proven,
+        continuation=unknown,
+        continuation_rows=continuation_rows,
+    )
+
+
+def _independent_region_is_physically_separated(
+    proven: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    proven_rows = sorted({row for row, _column in proven["members"]})
+    candidate_rows = sorted({row for row, _column in candidate["members"]})
+    return bool(proven_rows and candidate_rows) and (
+        candidate_rows[0] - proven_rows[-1]
+        > max(len(proven_rows), len(candidate_rows), 2)
+    )
+
+
 def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dict[str, Any] | None:
     region_worksheet, row_offset = _copy_structure_region(parser, worksheet, region)
     header_rows, populated_rows, _unresolved_rows = _complete_worksheet_rows(region_worksheet)
     if not header_rows or not populated_rows:
         return None
-    empty_structure = _empty_record_axis_structure(
+    nonempty_structure = _nonempty_record_axis_structure(
+        parser,
+        region_worksheet,
+        header_rows,
+        populated_rows,
+    )
+    trailing_empty_candidate = _trailing_empty_record_axis_structure(
         parser,
         region_worksheet,
         header_rows,
         populated_rows,
         _unresolved_rows,
     )
+    trailing_empty_structure = (
+        trailing_empty_candidate
+        if trailing_empty_candidate is not None
+        and (
+            nonempty_structure is None
+            or any(
+                not header or header.startswith("Column_")
+                for header in nonempty_structure[0]
+            )
+        )
+        else None
+    )
+    if trailing_empty_structure is not None:
+        nonempty_structure = None
+    empty_structure = trailing_empty_structure or (
+        None
+        if nonempty_structure is not None
+        else _empty_record_axis_structure(
+            parser,
+            region_worksheet,
+            header_rows,
+            populated_rows,
+            _unresolved_rows,
+        )
+    )
     if empty_structure is not None:
         headers, header_paths, header_start, data_start = empty_structure
     else:
-        headers, header_start, data_start = _parse_region_structure(
+        headers, header_start, data_start = nonempty_structure or _parse_region_structure(
             parser,
             region_worksheet,
             header_rows,
@@ -3522,9 +4213,13 @@ def _build_tabular_structure_projection_with_audit(
                 }
                 g1_disagreement_is_safe = (
                     table["source_total_count"] is not None
-                    and _g1_disagreement_is_outside_record_axis(
-                        region,
-                        record_rows,
+                    and (
+                        table["matched_rule"] == "L1-08"
+                        or _g1_disagreement_is_outside_record_axis(
+                            worksheet,
+                            region,
+                            record_rows,
+                        )
                     )
                 )
             else:
@@ -3564,6 +4259,7 @@ def _build_tabular_structure_projection_with_audit(
                     if (
                         child_table["source_total_count"] is not None
                         and _g1_disagreement_is_outside_record_axis(
+                            worksheet,
                             region,
                             child_record_rows,
                         )
@@ -3747,10 +4443,37 @@ def _build_tabular_structure_projection_with_audit(
                         )
                     )
                 )
+                unknown_is_context_for_following_structure = (
+                    later.get("positive_rule") is None
+                    and len(later["member_columns"]) == 1
+                    and any(
+                        following is not earlier
+                        and following is not later
+                        and following["bbox"][0] > later["bbox"][2]
+                        and following.get("structure_evidence") is not None
+                        and later["member_columns"].issubset(following["member_columns"])
+                        for following in projected
+                    )
+                )
                 if (
                     earlier["bbox"][2] < later["bbox"][0]
                     and not later_axis_proven
                     and nested_axis_compatible
+                    and not unknown_is_context_for_following_structure
+                    and (
+                        risk_ids is partial_overlap_ids
+                        or later.get("structure_evidence") is None
+                        or _unknown_region_can_extend_proven_axis(
+                            parser=parser,
+                            worksheet=worksheet,
+                            proven=earlier,
+                            unknown=later,
+                        )
+                        or not _independent_region_is_physically_separated(
+                            earlier,
+                            later,
+                        )
+                    )
                 ):
                     risk_ids.update((id(earlier), id(later)))
 
@@ -4047,7 +4770,7 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             continue
         if (
             any(row["row_role_kwd"] == "unknown" for row in table_rows)
-            or len(data_indices) < 2
+            or not data_indices
             or totals != {len(data_indices)}
         ):
             raise ValueError("source total is not generation-wide or fail-closed")

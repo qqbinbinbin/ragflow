@@ -24,13 +24,22 @@ from rag.app.tabular_structure import (
 )
 
 
+def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
+    value = "A" * 126 + "  suffix"
+
+    bounded = tabular_structure._truncate_utf8(value, 128)
+
+    assert len(bounded.encode("utf-8")) <= 128
+    assert bounded == bounded.strip()
+
+
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v14"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v6"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v15"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v7"
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -296,6 +305,118 @@ def test_two_cell_signoff_row_is_not_promoted_to_an_empty_list(table_parser):
     assert all(table["matched_rule"] != "L1-08" for table in projection["tables"])
 
 
+def test_delayed_structural_header_proves_an_empty_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:G1")
+    sheet["A1"] = "Anonymous register"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Context A"
+    sheet.merge_cells("C2:G2")
+    sheet["C2"] = "Value A"
+    sheet.merge_cells("A3:B3")
+    sheet["A3"] = "Context B"
+    sheet.merge_cells("C3:G3")
+    sheet["C3"] = "Value B"
+    for column, header in enumerate(
+        (
+            "Sequence",
+            "Reference",
+            "Received",
+            "Issuer",
+            "Issued",
+            "Reason",
+            "Category",
+        ),
+        start=1,
+    ):
+        sheet.cell(row=5, column=column, value=header)
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert [column["name"] for column in complete[0]["ordered_columns"]] == [
+        "Sequence",
+        "Reference",
+        "Received",
+        "Issuer",
+        "Issued",
+        "Reason",
+        "Category",
+    ]
+
+
+def test_trailing_multilevel_header_after_context_proves_an_empty_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:F1")
+    sheet["A1"] = "Anonymous register"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Context A"
+    sheet.merge_cells("C2:F2")
+    sheet["C2"] = "Value A"
+    sheet.merge_cells("A4:A5")
+    sheet["A4"] = "Sequence"
+    sheet.merge_cells("B4:C4")
+    sheet["B4"] = "Identity"
+    sheet["B5"] = "Code"
+    sheet["C5"] = "Revision"
+    sheet.merge_cells("D4:F4")
+    sheet["D4"] = "Evidence"
+    sheet["D5"] = "Received"
+    sheet["E5"] = "Issuer"
+    sheet["F5"] = "Reason"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
+
+
+def test_delayed_signoff_form_is_not_promoted_to_an_empty_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous approval form"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Prepared by"
+    sheet.merge_cells("C2:D2")
+    sheet["C2"] = "Reviewed by"
+    sheet.merge_cells("A3:B3")
+    sheet["A3"] = "Issued on"
+    sheet.merge_cells("C3:D3")
+    sheet["C3"] = "Revision"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["matched_rule"] != "L1-08" for table in projection["tables"])
+
+
 def test_header_with_unresolved_body_content_is_not_promoted_to_an_empty_list(
     table_parser,
 ):
@@ -369,7 +490,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v6"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v7"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
@@ -2058,6 +2179,147 @@ def _formula_only_workbook_bytes():
     return _save_workbook(workbook)
 
 
+def _complete_table_with_distant_multiline_signoff_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous report"
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous register"
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    for row_ordinal in range(3, 6):
+        sheet.append(
+            [
+                row_ordinal - 2,
+                f"I-{row_ordinal}",
+                row_ordinal * 10,
+                "Open",
+            ]
+        )
+
+    # A physically separated approval form reuses table columns but is not a
+    # continuation of the already closed record axis.
+    sheet.merge_cells("A35:D35")
+    sheet["A35"] = "Anonymous approval"
+    for row_ordinal in range(36, 39):
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=1,
+            end_row=row_ordinal,
+            end_column=2,
+        )
+        sheet.cell(row_ordinal, 1, f"Role {row_ordinal}")
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=3,
+            end_row=row_ordinal,
+            end_column=4,
+        )
+        sheet.cell(row_ordinal, 3, f"Signature {row_ordinal}")
+    return _save_workbook(workbook)
+
+
+def _context_with_sparse_single_record_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous plan"
+    sheet["G2"] = "Anonymous plan"
+    sheet["K4"] = "Reference"
+    sheet["N4"] = "Control"
+    sheet["K5"] = "Reference value"
+    sheet["N5"] = "Control value"
+    for column, value in enumerate(
+        (
+            "Part",
+            "P-001",
+            None,
+            "Name",
+            "Component",
+            "Mode",
+            "Program",
+            "Supplier",
+            "Supplier A",
+            None,
+            "Owner",
+            "Owner A",
+            None,
+            "Date",
+        ),
+        start=1,
+    ):
+        sheet.cell(row=6, column=column, value=value)
+    sheet["A8"] = "Context"
+    sheet.merge_cells("B8:C8")
+    sheet["B8"] = "Context value"
+    sheet["F8"] = "Approval"
+    sheet.merge_cells("H8:J8")
+    sheet["H8"] = "Approval value"
+    sheet["N8"] = "Revision"
+    sheet["N9"] = "Revision value"
+
+    sheet["A11"] = "Sequence"
+    sheet.merge_cells("B11:C11")
+    sheet["B11"] = "Process"
+    sheet.merge_cells("D11:E11")
+    sheet["D11"] = "Characteristic"
+    for column, value in enumerate(
+        (
+            "Method",
+            "Frequency",
+            "Target",
+            "Class",
+            "Requirement",
+        ),
+        start=6,
+    ):
+        sheet.cell(row=11, column=column, value=value)
+    sheet["K11"] = "Auxiliary"
+    sheet.merge_cells("L11:O11")
+    sheet["L11"] = "Note"
+
+    sheet["A12"] = 1
+    sheet.merge_cells("B12:C12")
+    sheet["B12"] = "Process A"
+    sheet.merge_cells("D12:E12")
+    sheet["D12"] = "Characteristic A"
+    for column, value in enumerate(
+        ("Method A", "Annual", "2026-01-01", "SC", "At least 1.33"),
+        start=6,
+    ):
+        sheet.cell(row=12, column=column, value=value)
+    sheet.merge_cells("L12:O12")
+    return _save_workbook(workbook)
+
+
+def _context_with_trailing_dense_empty_header_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous empty analysis"
+    sheet.merge_cells("B2:N2")
+    sheet["B2"] = "Anonymous analysis"
+    sheet["L5"] = "Reference"
+    sheet["N5"] = "Number"
+    sheet["L6"] = "Reference value"
+    sheet["N6"] = "Number value"
+    sheet["A7"] = "Submission context"
+    sheet.merge_cells("A9:C9")
+    sheet["A9"] = "Part"
+    sheet.merge_cells("D9:G9")
+    sheet["D9"] = "Name"
+    sheet["I9"] = "Program"
+    sheet["L9"] = "Owner"
+    sheet.merge_cells("O9:R9")
+    sheet["O9"] = "Contact"
+    sheet["L10"] = "Date"
+    sheet["A11"] = "Team"
+    sheet.merge_cells("D11:G11")
+    sheet["D11"] = "Revision"
+    sheet["L11"] = "Approval"
+    sheet["L12"] = "Approved on"
+    for column in range(1, 19):
+        sheet.cell(row=14, column=column, value=f"Field {column}")
+    return _save_workbook(workbook)
+
+
 @pytest.fixture
 def table_parser(monkeypatch):
     return _load_table_module(monkeypatch).Excel()
@@ -2829,6 +3091,518 @@ def test_single_record_slot_cannot_prove_a_complete_record_axis(table_parser):
     projection["rows"][0]["source_total_count_int"] = 1
     with pytest.raises(ValueError, match="source total"):
         validate_tabular_structure_projection(projection)
+
+
+def test_structurally_bounded_single_record_proves_a_complete_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:E1")
+    sheet["A1"] = "Anonymous register"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Context"
+    sheet.merge_cells("C2:E2")
+    sheet["C2"] = "Value"
+    sheet["A3"] = "Sequence"
+    sheet.merge_cells("B3:C3")
+    sheet["B3"] = "Item"
+    sheet["D3"] = "Measure"
+    sheet["E3"] = "Status"
+    sheet["A4"] = 1
+    sheet.merge_cells("B4:C4")
+    sheet["B4"] = "I-1"
+    sheet["D4"] = 2
+    sheet["E4"] = "Open"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 1
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    assert [(row["row_ordinal_int"], row["row_role_kwd"]) for row in rows] == [
+        (4, "data"),
+    ]
+
+
+def test_single_free_text_slot_remains_fail_closed(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous note"
+    sheet.merge_cells("A2:D2")
+    sheet["A2"] = "Review this statement before release"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_separated_footer_does_not_pollute_a_proven_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous register"
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    sheet.append([1, "I-1", 2, "Open"])
+    sheet.append([2, "I-2", 3, "Closed"])
+    sheet.append([3, "I-3", 4, "Open"])
+    sheet.append([None, None, None, None])
+    sheet.append(["Prepared by", "Person", "Approved by", "Person"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 3
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    assert [row["row_ordinal_int"] for row in rows if row["row_role_kwd"] == "data"] == [
+        3,
+        4,
+        5,
+    ]
+    footer = next(row for row in rows if row["row_ordinal_int"] == 7)
+    assert footer["row_role_kwd"] == "note"
+    assert footer["data_row_index_int"] is None
+    assert all(row["source_total_count_int"] == 3 for row in rows)
+
+
+def test_unseparated_footer_still_invalidates_completeness(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    sheet.append([1, "I-1", 2, "Open"])
+    sheet.append([2, "I-2", 3, "Closed"])
+    sheet.append(["Prepared by", "Person", "Approved by", "Person"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+def test_candidate_selection_prefers_the_closed_record_axis_over_wider_context(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:G1")
+    sheet["A1"] = "Anonymous register"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Context A"
+    sheet.merge_cells("C2:G2")
+    sheet["C2"] = "Value A"
+    sheet.merge_cells("A3:C3")
+    sheet["A3"] = "Context B"
+    sheet.merge_cells("D3:G3")
+    sheet["D3"] = "Value B"
+    sheet.merge_cells("A4:B4")
+    sheet["A4"] = "Sequence"
+    sheet.merge_cells("C4:D4")
+    sheet["C4"] = "Item"
+    sheet.merge_cells("E4:G4")
+    sheet["E4"] = "Measure"
+    for row_ordinal, values in enumerate(
+        ((1, "I-1", 10), (2, "I-2", 20), (3, "I-3", 30)),
+        start=5,
+    ):
+        sheet.cell(row=row_ordinal, column=1, value=values[0])
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=1,
+            end_row=row_ordinal,
+            end_column=2,
+        )
+        sheet.cell(row=row_ordinal, column=3, value=values[1])
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=3,
+            end_row=row_ordinal,
+            end_column=4,
+        )
+        sheet.cell(row=row_ordinal, column=5, value=values[2])
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=5,
+            end_row=row_ordinal,
+            end_column=7,
+        )
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 3
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+        and row["row_role_kwd"] == "data"
+    ] == [5, 6, 7]
+
+
+def test_numeric_record_key_keeps_value_shape_changes_on_one_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous register"
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    sheet.append([1, "I-1", 10, "Open"])
+    sheet.append([2, "I-2", "pending", "Open"])
+    sheet.append([3, "I-3", "pending", "Closed"])
+    sheet.append([4, "I-4", 40, "Closed"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 4
+    assert [row["row_role_kwd"] for row in projection["rows"]] == [
+        "data",
+        "data",
+        "data",
+        "data",
+    ]
+
+
+def test_repeated_context_block_separated_from_the_table_does_not_break_g1(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:F1")
+    sheet["A1"] = "Anonymous context"
+    sheet["A2"] = "Context key"
+    sheet["A3"] = "Context value"
+    sheet.merge_cells("A5:F5")
+    sheet["A5"] = "Anonymous register"
+    sheet.append(["Sequence", "Item", "Measure", "Status", "Owner", "Note"])
+    sheet.append([1, "I-1", 10, "Open", "A", None])
+    sheet.append([2, "I-2", 20, "Open", "B", None])
+    sheet.append([3, "I-3", 30, "Closed", "C", None])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 3
+
+
+def test_separated_note_section_does_not_downgrade_a_complete_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous register"
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    for row_ordinal in range(3, 7):
+        sheet.append([row_ordinal - 2, f"I-{row_ordinal}", row_ordinal * 10, "Open"])
+    sheet.merge_cells("A8:D9")
+    sheet["A8"] = "Anonymous note section"
+    sheet.merge_cells("A10:B10")
+    sheet["A10"] = "Prepared"
+    sheet.merge_cells("C10:D10")
+    sheet["C10"] = "Approved"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+
+
+def test_distant_multiline_signoff_does_not_downgrade_a_closed_record_axis(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_distant_multiline_signoff_bytes(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 3
+    complete_rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    assert [row["row_ordinal_int"] for row in complete_rows] == [3, 4, 5]
+    assert all(
+        row["row_role_kwd"] == "unknown"
+        for row in projection["rows"]
+        if row["row_ordinal_int"] >= 35
+    )
+
+
+def test_context_and_g1_splits_preserve_a_sparse_single_record_axis(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_with_sparse_single_record_bytes(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 1
+    complete_rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    assert [row["row_ordinal_int"] for row in complete_rows] == [12]
+    assert complete[0]["ordered_columns"]
+    assert all(column["header_path"] for column in complete[0]["ordered_columns"])
+
+
+def test_context_does_not_hide_a_trailing_dense_empty_record_axis(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_with_trailing_dense_empty_header_bytes(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert len(complete[0]["ordered_columns"]) == 18
+
+
+def test_unseparated_multiline_form_still_cannot_claim_a_complete_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous form"
+    for row_ordinal in range(2, 5):
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=1,
+            end_row=row_ordinal,
+            end_column=2,
+        )
+        sheet.cell(row_ordinal, 1, f"Role {row_ordinal}")
+        sheet.merge_cells(
+            start_row=row_ordinal,
+            start_column=3,
+            end_row=row_ordinal,
+            end_column=4,
+        )
+        sheet.cell(row_ordinal, 3, f"Signature {row_ordinal}")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert all(
+        table["enumeration_status"] != "supported_complete"
+        for table in projection["tables"]
+    )
+
+
+def test_single_record_after_a_separated_structural_header_is_complete(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous context"
+    sheet.merge_cells("A2:B2")
+    sheet["A2"] = "Context key"
+    sheet.merge_cells("C2:D2")
+    sheet["C2"] = "Context value"
+    sheet["A4"] = "Sequence"
+    sheet.merge_cells("B4:C4")
+    sheet["B4"] = "Item"
+    sheet["D4"] = "Status"
+    sheet["A5"] = 1
+    sheet.merge_cells("B5:C5")
+    sheet["B5"] = "I-1"
+    sheet["D5"] = "Open"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 1
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [5]
+
+
+def test_intermediate_title_belongs_to_the_following_structured_table(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Item", "Status"])
+    sheet.append([1, "I-1", "Open"])
+    sheet.append([2, "I-2", "Closed"])
+    sheet["A8"] = "Anonymous following section"
+    sheet.merge_cells("A10:C10")
+    sheet["A10"] = "Anonymous following register"
+    sheet.append(["Code", "Owner", "State"])
+    sheet.append(["F-1", "Team", "Open"])
+    sheet.append(["F-2", "Team", "Closed"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert [
+        table["source_total_count"]
+        for table in projection["tables"]
+        if table["source_total_count"] is not None
+    ] == [2, 2]
+
+
+def test_sparse_source_backed_record_slots_are_counted_from_the_stable_key_axis(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:F1")
+    sheet["A1"] = "Anonymous register"
+    for column, header in enumerate(
+        ("Sequence", "Item", "Measure A", "Measure B", "Status", "Note"),
+        start=1,
+    ):
+        sheet.cell(row=2, column=column, value=header)
+    sheet.append([1, "I-1", 10, None, "Open", None])
+    sheet.append([2, None, None, None, None, None])
+    sheet.append([3, None, None, None, None, None])
+    sheet.append([4, None, None, None, None, None])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    assert [row["row_ordinal_int"] for row in rows] == [3, 4, 5, 6]
+    assert all(row["row_role_kwd"] == "data" for row in rows)
+
+
+def test_header_only_axis_ignores_a_nonadjacent_sidecar_column(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:G1")
+    sheet["A1"] = "Anonymous register"
+    for column, header in enumerate(
+        (
+            "Sequence",
+            "Reference",
+            "Received",
+            "Issuer",
+            "Issued",
+            "Reason",
+            "Category",
+        ),
+        start=1,
+    ):
+        sheet.cell(row=2, column=column, value=header)
+    sheet["I2"] = "https://example.invalid/evidence"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
 
 
 def test_headerless_record_slots_preserve_every_row_and_cannot_claim_complete(table_parser):
