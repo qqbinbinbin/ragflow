@@ -24,6 +24,7 @@ This script provides a flexible MySQL data migration tool that supports:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -308,6 +309,140 @@ class MigrationStage:
         return self._noop_completes_migration
 
 
+class TenantModelContractPreflightStage(MigrationStage):
+    """Validate every legacy model reference before model migration writes."""
+
+    name = "tenant_model_contract_preflight"
+    description = "Validate the complete legacy-to-current tenant model reference contract"
+    source_tables = ["tenant_llm", "tenant", "knowledgebase", "dialog", "memory"]
+    target_tables = []
+
+    def check(self) -> bool:
+        if not self.db.table_exists("tenant_llm"):
+            raise RuntimeError("tenant_llm is required for tenant model migration")
+        return True
+
+    @staticmethod
+    def build_source_maps(source_models: list) -> tuple[dict, dict]:
+        source_by_id = {}
+        source_by_name = {}
+        for source_id, tenant_id, factory, model_name, model_type in source_models:
+            canonical_type = TenantModelIdMigrationStage.canonical_model_type(model_type)
+            identity = (str(tenant_id), str(factory), str(model_name), canonical_type)
+            id_key = (str(tenant_id), str(source_id), canonical_type)
+            previous = source_by_id.get(id_key)
+            if previous and previous != identity:
+                raise RuntimeError("legacy tenant model reference mapping is ambiguous")
+            source_by_id[id_key] = identity
+
+            name_key = (str(tenant_id), str(model_name), str(factory), canonical_type)
+            previous_source_id = source_by_name.get(name_key)
+            if previous_source_id is not None and previous_source_id != str(source_id):
+                raise RuntimeError("legacy tenant model name mapping is ambiguous")
+            source_by_name[name_key] = str(source_id)
+        return source_by_id, source_by_name
+
+    @staticmethod
+    def validate_reference(
+        *,
+        source_by_id: dict,
+        source_by_name: dict,
+        current_model_ids: set,
+        tenant_id: str,
+        current_reference,
+        legacy_model_name,
+        model_type: str,
+    ) -> None:
+        canonical_type = TenantModelIdMigrationStage.canonical_model_type(model_type)
+        current_value = str(current_reference).strip() if current_reference is not None else ""
+        if current_value:
+            current_key = (str(tenant_id), current_value, canonical_type)
+            if current_key in current_model_ids or current_key in source_by_id:
+                return
+            raise RuntimeError(
+                "legacy tenant model reference is unresolved: "
+                f"tenant={tenant_id} reference={current_value} type={model_type}"
+            )
+
+        legacy_value = str(legacy_model_name).strip() if legacy_model_name is not None else ""
+        if not legacy_value:
+            return
+        pure_name, _, provider_name = TenantModelIdMigrationStage._split_model_name_value(legacy_value)
+        name_key = (str(tenant_id), pure_name, provider_name, canonical_type)
+        if name_key not in source_by_name:
+            raise RuntimeError(
+                "legacy tenant model name is unresolved: "
+                f"tenant={tenant_id} model={legacy_value} type={model_type}"
+            )
+
+    def _current_model_ids(self) -> set:
+        required_tables = (
+            "tenant_model_provider",
+            "tenant_model_instance",
+            "tenant_model",
+        )
+        if any(not self.db.table_exists(table) for table in required_tables):
+            return set()
+        cursor = self.db.execute_sql(
+            "SELECT tm.id, tmp.tenant_id, tm.model_type "
+            "FROM tenant_model tm "
+            "INNER JOIN tenant_model_provider tmp ON tmp.id = tm.provider_id "
+            "INNER JOIN tenant_model_instance tmi ON tmi.id = tm.instance_id "
+            "WHERE tm.status = 'active' AND tmi.status = 'active'"
+        )
+        current_ids = set()
+        for model_id, tenant_id, model_type in cursor.fetchall():
+            for type_name, type_bit in TenantModelIdMigrationStage.MODEL_TYPE_TO_INT.items():
+                if int(model_type) & type_bit:
+                    current_ids.add(
+                        (
+                            str(tenant_id),
+                            str(model_id),
+                            TenantModelIdMigrationStage.canonical_model_type(type_name),
+                        )
+                    )
+        return current_ids
+
+    def execute(self) -> tuple[int, list]:
+        cursor = self.db.execute_sql(
+            "SELECT id, tenant_id, llm_factory, llm_name, model_type "
+            "FROM tenant_llm WHERE status = '1' ORDER BY id"
+        )
+        source_by_id, source_by_name = self.build_source_maps(cursor.fetchall())
+        current_model_ids = self._current_model_ids()
+
+        checked = 0
+        for table_name, fields in TenantModelIdMigrationStage.TENANT_ID_FIELDS.items():
+            if not self.db.table_exists(table_name):
+                continue
+            tenant_expression = "id" if table_name == "tenant" else "tenant_id"
+            for target_column, legacy_column, model_type in fields:
+                target_exists = self.db.column_exists(table_name, target_column)
+                legacy_exists = self.db.column_exists(table_name, legacy_column)
+                if not target_exists and not legacy_exists:
+                    continue
+                target_expression = f"`{target_column}`" if target_exists else "NULL"
+                legacy_expression = f"`{legacy_column}`" if legacy_exists else "NULL"
+                cursor = self.db.execute_sql(
+                    f"SELECT `{tenant_expression}`, {target_expression}, {legacy_expression} "
+                    f"FROM `{table_name}`"
+                )
+                for tenant_id, current_reference, legacy_model_name in cursor.fetchall():
+                    self.validate_reference(
+                        source_by_id=source_by_id,
+                        source_by_name=source_by_name,
+                        current_model_ids=current_model_ids,
+                        tenant_id=str(tenant_id),
+                        current_reference=current_reference,
+                        legacy_model_name=legacy_model_name,
+                        model_type=model_type,
+                    )
+                    if current_reference not in (None, "") or legacy_model_name not in (None, ""):
+                        checked += 1
+        logger.info("Validated %s tenant model references before migration writes", checked)
+        return 0, []
+
+
 class TenantModelProviderStage(MigrationStage):
     """Migrate tenant_llm to tenant_model_provider"""
 
@@ -457,6 +592,36 @@ class TenantModelInstanceStage(MigrationStage):
         """Generate 32-character UUID1"""
         return uuid.uuid1().hex
 
+    @staticmethod
+    def build_instance_extra(api_base: str | None) -> str:
+        payload = {"base_url": api_base.strip()} if api_base and api_base.strip() else {}
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def instance_identity(cls, provider_id: str, api_key: str | None, api_base: str | None) -> tuple[str, str, str]:
+        return (
+            str(provider_id),
+            cls._strip_is_tools_from_api_key(api_key or ""),
+            (api_base or "").strip(),
+        )
+
+    @staticmethod
+    def _base_url_from_extra(extra: str | None) -> str:
+        if not extra:
+            return ""
+        try:
+            payload = json.loads(extra)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError("tenant_model_instance.extra is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("tenant_model_instance.extra must be a JSON object")
+        base_url = payload.get("base_url", "")
+        if base_url is None:
+            return ""
+        if not isinstance(base_url, str):
+            raise RuntimeError("tenant_model_instance.extra.base_url must be a string")
+        return base_url.strip()
+
     def check(self) -> bool:
         """Check if migration is needed"""
         # Check if source table exists
@@ -480,19 +645,7 @@ class TenantModelInstanceStage(MigrationStage):
             logger.info("Target table 'tenant_model_instance' does not exist, will create")
             return True
 
-        # Check if there's data to migrate (distinct by tenant_id, llm_factory, api_key)
-        cursor = self.db.execute_sql(
-            "SELECT COUNT(*) FROM ("
-            "  SELECT tl.tenant_id, tl.llm_factory, tl.api_key, tmp.id as provider_id "
-            "  FROM tenant_llm tl "
-            "  INNER JOIN tenant_model_provider tmp ON tmp.tenant_id = tl.tenant_id AND tmp.provider_name = tl.llm_factory "
-            "  WHERE NOT EXISTS ("
-            "    SELECT 1 FROM tenant_model_instance tmi "
-            "    WHERE tmi.provider_id = tmp.id AND tmi.api_key = tl.api_key"
-            "  ) "
-            "  GROUP BY tl.tenant_id, tl.llm_factory, tl.api_key, tmp.id"
-            ") AS distinct_records"
-        )
+        cursor = self.db.execute_sql("SELECT COUNT(*) FROM tenant_llm WHERE status = '1'")
         count = cursor.fetchone()[0]
 
         if count == 0:
@@ -526,37 +679,47 @@ class TenantModelInstanceStage(MigrationStage):
             logger.info("[CREATE TABLE ONLY] Target table created/verified, skipping data migration")
             return 0, self.target_tables
 
-        # Get records from tenant_llm with provider_id lookup
-        # Group by tenant_id, llm_factory, api_key to get distinct records
-        # instance_name = llm_factory, provider_id from tenant_model_provider, api_key from tenant_llm
         cursor = self.db.execute_sql(
-            "SELECT tl.tenant_id, tl.llm_factory, tl.api_key, MAX(tl.status) as status, tmp.id as provider_id "
+            "SELECT tl.tenant_id, tl.llm_factory, tl.api_key, tl.api_base, tl.status, tmp.id as provider_id "
             "FROM tenant_llm tl "
             "INNER JOIN tenant_model_provider tmp ON tmp.tenant_id = tl.tenant_id AND tmp.provider_name = tl.llm_factory "
-            "WHERE NOT EXISTS ("
-            "  SELECT 1 FROM tenant_model_instance tmi "
-            "  WHERE tmi.provider_id = tmp.id AND tmi.api_key = tl.api_key"
-            ") "
-            "GROUP BY tl.tenant_id, tl.llm_factory, tl.api_key, tmp.id"
+            "WHERE tl.status = '1'"
         )
 
-        records = cursor.fetchall()
+        source_records = cursor.fetchall()
 
-        if not records:
+        if not source_records:
             logger.info("No records to migrate")
             return 0, []
 
-        # Deduplicate records where api_keys differ only by is_tools encoding.
-        # When _encode_api_key_config wraps a plain api_key into {"api_key": "...", "is_tools": true/false},
-        # multiple tenant_llm rows for the same provider can have logically identical api_keys that
-        # only differ in the is_tools field. We merge these by stripping is_tools for comparison.
-        records = self._dedup_api_key_records(records)
+        cursor = self.db.execute_sql("SELECT id, provider_id, api_key, status, extra FROM tenant_model_instance")
+        existing_by_identity = {}
+        for instance_id, provider_id, api_key, status, extra in cursor.fetchall():
+            identity = self.instance_identity(provider_id, api_key, self._base_url_from_extra(extra))
+            previous = existing_by_identity.get(identity)
+            if previous and previous != instance_id:
+                raise RuntimeError("tenant_model_instance identity is ambiguous")
+            existing_by_identity[identity] = instance_id
 
-        logger.info(f"Migrating {len(records)} tenant_model_instance records...")
+        source_by_identity = {}
+        provider_identity_counts = {}
+        for tenant_id, llm_factory, api_key, api_base, status, provider_id in source_records:
+            identity = self.instance_identity(provider_id, api_key, api_base)
+            source_by_identity.setdefault(identity, (tenant_id, llm_factory, api_key, api_base, status, provider_id))
+        for identity in source_by_identity:
+            provider_identity_counts[identity[0]] = provider_identity_counts.get(identity[0], 0) + 1
+
+        records = [record for identity, record in source_by_identity.items() if identity not in existing_by_identity]
+
+        if not records:
+            logger.info("No new tenant_model_instance records to migrate")
+            return 0, []
+
+        logger.info("Migrating %s tenant_model_instance records...", len(records))
 
         if self.dry_run:
             logger.info(f"[DRY RUN] Would insert {len(records)} records")
-            for tenant_id, llm_factory, api_key, status, provider_id in records[:5]:
+            for tenant_id, llm_factory, api_key, api_base, status, provider_id in records[:5]:
                 logger.info(f"  instance_name=default, provider_id={provider_id}, api_key=***")
             if len(records) > 5:
                 logger.info(f"  ... and {len(records) - 5} more records")
@@ -566,25 +729,39 @@ class TenantModelInstanceStage(MigrationStage):
         batch_size = 100
         for i in range(0, len(records), batch_size):
             batch = records[i : i + batch_size]
-            values = []
-            for tenant_id, llm_factory, api_key, status, provider_id in batch:
+            placeholders = []
+            params = []
+            for tenant_id, llm_factory, api_key, api_base, status, provider_id in batch:
                 record_id = self.generate_uuid()
-                instance_name = "default"
-                api_key_escaped = api_key.replace("'", "''") if api_key else ""
+                identity = self.instance_identity(provider_id, api_key, api_base)
+                digest = hashlib.sha256("\0".join(identity).encode("utf-8")).hexdigest()[:12]
+                instance_name = "default" if provider_identity_counts[str(provider_id)] == 1 else f"legacy-{digest}"
                 status_val = "active" if status in ["1", "active", "enable"] else "inactive"
-                values.append(
-                    f"('{record_id}', '{instance_name}', '{provider_id}', "
-                    f"'{api_key_escaped}', '{status_val}', "
-                    f"{current_ts * 1000}, FROM_UNIXTIME({current_ts}), "
-                    f"{current_ts * 1000}, FROM_UNIXTIME({current_ts}))"
+                placeholders.append(
+                    "(%s, %s, %s, %s, %s, %s, %s, FROM_UNIXTIME(%s), %s, FROM_UNIXTIME(%s))"
+                )
+                params.extend(
+                    [
+                        record_id,
+                        instance_name,
+                        provider_id,
+                        api_key or "",
+                        status_val,
+                        self.build_instance_extra(api_base),
+                        current_ts * 1000,
+                        current_ts,
+                        current_ts * 1000,
+                        current_ts,
+                    ]
                 )
 
             insert_sql = f"""
                 INSERT INTO tenant_model_instance
-                (id, instance_name, provider_id, api_key, status, create_time, create_date, update_time, update_date)
-                VALUES {", ".join(values)}
+                (id, instance_name, provider_id, api_key, status, extra,
+                 create_time, create_date, update_time, update_date)
+                VALUES {", ".join(placeholders)}
             """
-            self.db.execute_sql(insert_sql)
+            self.db.execute_sql(insert_sql, params)
             rows_inserted += len(batch)
             logger.info(f"Inserted batch {i // batch_size + 1}: {len(batch)} records")
 
@@ -667,7 +844,7 @@ class TenantModelInstanceStage(MigrationStage):
                     seen[canonical] = rec
                 else:
                     dup_count += 1
-                    logger.debug(f"Dedup api_key for tenant={tenant_id}, factory={llm_factory}, provider={provider_id}: keeping '{api_key[:20]}...', dropping '{seen[canonical][2][:20]}...'")
+                    logger.debug("Deduped equivalent API-key records for tenant=%s factory=%s provider=%s", tenant_id, llm_factory, provider_id)
             deduped.extend(seen.values())
 
         if dup_count > 0:
@@ -700,7 +877,7 @@ class TenantModelStage(MigrationStage):
     """Migrate tenant_llm to tenant_model"""
 
     name = "tenant_model"
-    description = "Migrate tenant_llm to tenant_model (status='0' records, plus status='1' for empty-llm factories)"
+    description = "Migrate every enabled tenant_llm model to tenant_model"
     source_tables = ["tenant_llm", "tenant_model_provider", "tenant_model_instance"]
     target_tables = ["tenant_model"]
 
@@ -720,13 +897,59 @@ class TenantModelStage(MigrationStage):
                             factories.append(item["name"])
         return factories
 
+    MODEL_TYPE_TO_INT = {
+        "chat": 1,
+        "embedding": 2,
+        "asr": 4,
+        "speech2text": 4,
+        "vision": 8,
+        "image2text": 8,
+        "rerank": 16,
+        "tts": 32,
+        "ocr": 64,
+    }
+
+    @classmethod
+    def model_type_for_storage(cls, model_type: str, storage_type: str):
+        normalized = (model_type or "").strip().lower()
+        if normalized not in cls.MODEL_TYPE_TO_INT:
+            raise ValueError(f"unsupported tenant model type: {model_type}")
+        if storage_type.lower() in ("int", "integer", "bigint"):
+            return cls.MODEL_TYPE_TO_INT[normalized]
+        return normalized
+
+    @staticmethod
+    def build_status_condition(_empty_factories: list[str] | None = None) -> str:
+        return "tl.status = '1'"
+
     def _build_status_condition(self) -> str:
-        """Build SQL WHERE condition for status filtering"""
-        empty_factories = self._get_empty_llm_factories()
-        if empty_factories:
-            placeholders = ", ".join(f"'{f}'" for f in empty_factories)
-            return f"(tl.status = '0' OR (tl.status = '1' AND tl.llm_factory IN ({placeholders})))"
-        return "tl.status = '0'"
+        return self.build_status_condition()
+
+    @staticmethod
+    def build_model_extra(api_key: str | None, max_tokens: int | None) -> str:
+        payload = {}
+        if api_key:
+            try:
+                parsed = json.loads(api_key)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and isinstance(parsed.get("is_tools"), bool):
+                payload["is_tools"] = parsed["is_tools"]
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def merge_model_extra(current_extra: str | None, source_extra: str) -> str:
+        try:
+            current = json.loads(current_extra or "{}")
+            source = json.loads(source_extra)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError("tenant_model.extra is not valid JSON") from exc
+        if not isinstance(current, dict) or not isinstance(source, dict):
+            raise RuntimeError("tenant_model.extra must be a JSON object")
+        current.update(source)
+        return json.dumps(current, ensure_ascii=False, sort_keys=True)
 
     def current_timestamp(self) -> int:
         return int(time.time())
@@ -768,17 +991,8 @@ class TenantModelStage(MigrationStage):
 
         status_condition = self._build_status_condition()
 
-        # Check if there's data to migrate
-        # We cannot JOIN tenant_model_instance on api_key directly because the instance
-        # stage deduped api_keys (stripping is_tools), so a plain SQL equality won't
-        # match records whose api_key was merged. Count at the provider level instead.
         cursor = self.db.execute_sql(
-            f"SELECT COUNT(*) FROM ("
-            f"  SELECT tl.id "
-            f"  FROM tenant_llm tl "
-            f"  INNER JOIN tenant_model_provider tmp ON tmp.tenant_id = tl.tenant_id AND tmp.provider_name = tl.llm_factory "
-            f"  WHERE {status_condition} "
-            f") AS source_records"
+            f"SELECT COUNT(*) FROM tenant_llm tl WHERE {status_condition}"
         )
         count = cursor.fetchone()[0]
 
@@ -820,24 +1034,14 @@ class TenantModelStage(MigrationStage):
 
         status_condition = self._build_status_condition()
 
-        # Load all tenant_model_instance records into memory for Python-level matching.
-        # We cannot JOIN on api_key in SQL because the instance stage deduped api_keys
-        # (stripping is_tools), so a plain SQL equality won't match records whose
-        # api_key was merged during dedup.
         instance_lookup = self._build_instance_lookup()
 
-        # Get records from tenant_llm with provider_id lookup (no instance JOIN)
-        # Migrate status='0' records, plus status='1' for empty-llm factories
         cursor = self.db.execute_sql(
             f"SELECT tl.id, tl.llm_name, tmp.id as provider_id, "
-            f"       tl.model_type, tl.status, tl.api_key "
+            f"       tl.model_type, tl.status, tl.api_key, tl.api_base, tl.max_tokens "
             f"FROM tenant_llm tl "
             f"INNER JOIN tenant_model_provider tmp ON tmp.tenant_id = tl.tenant_id AND tmp.provider_name = tl.llm_factory "
-            f"WHERE {status_condition} "
-            f"AND NOT EXISTS ("
-            f"  SELECT 1 FROM tenant_model tm "
-            f"  WHERE tm.provider_id = tmp.id AND tm.model_name = tl.llm_name"
-            f")"
+            f"WHERE {status_condition}"
         )
 
         records = cursor.fetchall()
@@ -849,48 +1053,72 @@ class TenantModelStage(MigrationStage):
         # Resolve instance_id for each record using Python-level canonical matching
         resolved_records = self._resolve_instance_ids(records, instance_lookup)
 
-        if not resolved_records:
-            logger.info("No records with matching instance_id to migrate")
+        storage_type = self.db.get_column_type("tenant_model", "model_type") or "int"
+        cursor = self.db.execute_sql("SELECT id, provider_id, instance_id, model_name, model_type, status, extra FROM tenant_model")
+        existing = {}
+        for row in cursor.fetchall():
+            model_id, provider_id, instance_id, model_name, model_type, status, extra = row
+            key = (provider_id, instance_id, model_name)
+            if key in existing:
+                raise RuntimeError("tenant_model identity is ambiguous")
+            existing[key] = (model_id, int(model_type), status, extra or "{}")
+
+        pending_inserts = []
+        pending_updates = []
+        for source_id, llm_name, provider_id, instance_id, model_type, status, api_key, api_base, max_tokens in resolved_records:
+            type_value = self.model_type_for_storage(model_type, storage_type)
+            if not isinstance(type_value, int):
+                raise RuntimeError("tenant_model.model_type must use integer bit flags")
+            extra = self.build_model_extra(api_key, max_tokens)
+            key = (provider_id, instance_id, llm_name)
+            current = existing.get(key)
+            if current:
+                model_id, current_type, current_status, current_extra = current
+                merged_type = current_type | type_value
+                merged_extra = self.merge_model_extra(current_extra, extra)
+                if current_type != merged_type or current_status != "active" or current_extra != merged_extra:
+                    pending_updates.append((merged_type, "active", merged_extra, model_id))
+                continue
+            pending_inserts.append((source_id, llm_name, provider_id, instance_id, type_value, "active", extra))
+
+        if not pending_inserts and not pending_updates:
+            logger.info("No new tenant_model records or metadata updates to migrate")
             return 0, []
 
-        logger.info(f"Migrating {len(resolved_records)} tenant_model records...")
+        logger.info("Migrating %s tenant_model inserts and %s updates...", len(pending_inserts), len(pending_updates))
 
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would insert {len(resolved_records)} records")
-            for source_id, llm_name, provider_id, instance_id, model_type, status, api_key in resolved_records[:5]:
-                logger.info(f"  model_name={llm_name}, provider_id={provider_id}, instance_id={instance_id}, model_type={model_type}")
-            if len(resolved_records) > 5:
-                logger.info(f"  ... and {len(resolved_records) - 5} more records")
-            return len(resolved_records), self.target_tables
+            return len(pending_inserts) + len(pending_updates), self.target_tables
 
-        # Insert records in batches
+        for model_type, status, extra, model_id in pending_updates:
+            self.db.execute_sql(
+                "UPDATE tenant_model SET model_type=%s, status=%s, extra=%s WHERE id=%s",
+                (model_type, status, extra, model_id),
+            )
+            rows_inserted += 1
+
         batch_size = 100
-        for i in range(0, len(resolved_records), batch_size):
-            batch = resolved_records[i : i + batch_size]
-            values = []
-            for source_id, llm_name, provider_id, instance_id, model_type, status, api_key in batch:
+        for i in range(0, len(pending_inserts), batch_size):
+            batch = pending_inserts[i : i + batch_size]
+            placeholders = []
+            params = []
+            for source_id, llm_name, provider_id, instance_id, model_type, status, extra in batch:
                 record_id = self.generate_uuid()
-                model_name_escaped = llm_name.replace("'", "''") if llm_name else ""
-                model_type_escaped = model_type.replace("'", "''") if model_type else ""
-                status_val = "active" if status in ["1", "active", "enable"] else "inactive"
-                # Extract is_tools from api_key JSON and put it in extra
-                extra = self._extract_extra_from_api_key(api_key)
-                extra_escaped = extra.replace("'", "''") if extra else "{}"
-                values.append(
-                    f"('{record_id}', '{model_name_escaped}', '{provider_id}', "
-                    f"'{instance_id}', '{model_type_escaped}', '{status_val}', "
-                    f"'{extra_escaped}', "
-                    f"{current_ts * 1000}, FROM_UNIXTIME({current_ts}), "
-                    f"{current_ts * 1000}, FROM_UNIXTIME({current_ts}))"
+                placeholders.append(
+                    "(%s, %s, %s, %s, %s, %s, %s, %s, FROM_UNIXTIME(%s), %s, FROM_UNIXTIME(%s))"
+                )
+                params.extend(
+                    [record_id, llm_name or "", provider_id, instance_id, model_type, status,
+                     extra, current_ts * 1000, current_ts, current_ts * 1000, current_ts]
                 )
 
             insert_sql = f"""
                 INSERT INTO tenant_model
                 (id, model_name, provider_id, instance_id, model_type, status, extra,
                  create_time, create_date, update_time, update_date)
-                VALUES {", ".join(values)}
+                VALUES {", ".join(placeholders)}
             """
-            self.db.execute_sql(insert_sql)
+            self.db.execute_sql(insert_sql, params)
             rows_inserted += len(batch)
             logger.info(f"Inserted batch {i // batch_size + 1}: {len(batch)} records")
 
@@ -905,11 +1133,17 @@ class TenantModelStage(MigrationStage):
         Returns:
             dict mapping (provider_id, canonical_api_key) -> instance_id
         """
-        cursor = self.db.execute_sql("SELECT id, provider_id, api_key FROM tenant_model_instance")
+        cursor = self.db.execute_sql("SELECT id, provider_id, api_key, extra FROM tenant_model_instance")
         lookup = {}
-        for instance_id, provider_id, api_key in cursor.fetchall():
-            canonical = TenantModelInstanceStage._strip_is_tools_from_api_key(api_key)
-            lookup[(provider_id, canonical)] = instance_id
+        for instance_id, provider_id, api_key, extra in cursor.fetchall():
+            identity = TenantModelInstanceStage.instance_identity(
+                provider_id,
+                api_key,
+                TenantModelInstanceStage._base_url_from_extra(extra),
+            )
+            if identity in lookup and lookup[identity] != instance_id:
+                raise RuntimeError("tenant_model_instance identity is ambiguous")
+            lookup[identity] = instance_id
         logger.info(f"Loaded {len(lookup)} instance records for lookup")
         return lookup
 
@@ -918,35 +1152,28 @@ class TenantModelStage(MigrationStage):
         """Resolve instance_id for each tenant_llm record using canonical api_key matching.
 
         Args:
-            records: list of tuples (source_id, llm_name, provider_id, model_type, status, api_key)
-            instance_lookup: dict mapping (provider_id, canonical_api_key) -> instance_id
+            records: source tenant_llm rows with provider and endpoint evidence
 
         Returns:
-            list of tuples (source_id, llm_name, provider_id, instance_id, model_type, status, api_key)
-            Only records with a matching instance_id are included.
+            source rows with the exact matching instance_id inserted after provider_id.
         """
         resolved = []
-        skipped = 0
-        for source_id, llm_name, provider_id, model_type, status, api_key in records:
-            canonical = TenantModelInstanceStage._strip_is_tools_from_api_key(api_key)
-            instance_id = instance_lookup.get((provider_id, canonical))
+        missing = []
+        for record in records:
+            source_id, llm_name, provider_id, model_type, status, api_key, *metadata = record
+            api_base = metadata[0] if metadata else ""
+            identity = TenantModelInstanceStage.instance_identity(provider_id, api_key, api_base)
+            instance_id = instance_lookup.get(identity)
             if instance_id:
-                resolved.append((source_id, llm_name, provider_id, instance_id, model_type, status, api_key))
+                resolved.append((source_id, llm_name, provider_id, instance_id, model_type, status, api_key, *metadata))
             else:
-                skipped += 1
-                # Don't include the API key (even truncated) in the log:
-                # CodeQL flags this as clear-text-logging-sensitive-data,
-                # and the first 30 chars of an API key often carry enough
-                # entropy to be useful to an attacker who reads the log.
-                logger.warning(
-                    "No matching instance for tenant_llm id=%s provider_id=%s llm_name=%s",
-                    source_id,
-                    provider_id,
-                    llm_name,
-                )
+                missing.append((source_id, provider_id, llm_name))
 
-        if skipped > 0:
-            logger.warning(f"Skipped {skipped} records with no matching instance_id")
+        if missing:
+            raise RuntimeError(
+                "tenant_model_instance mapping is incomplete for tenant_llm ids: "
+                + ",".join(str(item[0]) for item in missing)
+            )
 
         return resolved
 
@@ -981,7 +1208,7 @@ class TenantModelStage(MigrationStage):
             model_name VARCHAR(128),
             provider_id VARCHAR(32) NOT NULL,
             instance_id VARCHAR(32) NOT NULL,
-            model_type VARCHAR(32) NOT NULL,
+            model_type INT NOT NULL,
             status VARCHAR(32) DEFAULT 'active',
             extra VARCHAR(1024) DEFAULT '{}',
             create_time BIGINT,
@@ -1752,6 +1979,178 @@ class TenantModelIdMigrationStage(MigrationStage):
 
     scan_batch_size = 500
 
+    @classmethod
+    def canonical_model_type(cls, model_type: str) -> str:
+        aliases = {"speech2text": "asr", "image2text": "vision"}
+        normalized = (model_type or "").strip().lower()
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in cls.MODEL_TYPE_TO_INT:
+            raise ValueError(f"unsupported tenant model type: {model_type}")
+        return normalized
+
+    @classmethod
+    def resolve_legacy_reference(
+        cls,
+        exact_mapping: dict,
+        *,
+        tenant_id: str,
+        legacy_reference,
+        model_type: str,
+    ) -> str:
+        key = (
+            str(tenant_id),
+            str(legacy_reference),
+            cls.canonical_model_type(model_type),
+        )
+        resolved = exact_mapping.get(key)
+        if not resolved:
+            raise RuntimeError(
+                "legacy tenant model reference is unresolved: "
+                f"tenant={tenant_id} reference={legacy_reference} type={model_type}"
+            )
+        return resolved
+
+    @classmethod
+    def resolve_legacy_model_name(
+        cls,
+        exact_mapping: dict,
+        *,
+        tenant_id: str,
+        legacy_model_name: str,
+        model_type: str,
+    ) -> str:
+        pure_name, _, provider_name = cls._split_model_name_value(legacy_model_name)
+        key = (
+            str(tenant_id),
+            pure_name,
+            provider_name,
+            cls.canonical_model_type(model_type),
+        )
+        resolved = exact_mapping.get(key)
+        if not resolved:
+            raise RuntimeError(
+                "legacy tenant model name is unresolved: "
+                f"tenant={tenant_id} model={legacy_model_name} type={model_type}"
+            )
+        return resolved
+
+    def _build_exact_source_mapping(self) -> tuple[dict, dict]:
+        cursor = self.db.execute_sql(
+            "SELECT id, tenant_id, llm_factory, llm_name, model_type, api_key, api_base "
+            "FROM tenant_llm WHERE status = '1' ORDER BY id"
+        )
+        source_models = cursor.fetchall()
+
+        cursor = self.db.execute_sql(
+            "SELECT id, tenant_id, provider_name FROM tenant_model_provider"
+        )
+        providers = {}
+        for provider_id, tenant_id, provider_name in cursor.fetchall():
+            key = (str(tenant_id), provider_name)
+            if key in providers and providers[key] != provider_id:
+                raise RuntimeError("tenant_model_provider mapping is ambiguous")
+            providers[key] = provider_id
+
+        cursor = self.db.execute_sql(
+            "SELECT id, provider_id, api_key, extra FROM tenant_model_instance WHERE status = 'active'"
+        )
+        instances = {}
+        for instance_id, provider_id, api_key, extra in cursor.fetchall():
+            identity = TenantModelInstanceStage.instance_identity(
+                provider_id,
+                api_key,
+                TenantModelInstanceStage._base_url_from_extra(extra),
+            )
+            if identity in instances and instances[identity] != instance_id:
+                raise RuntimeError("tenant_model_instance mapping is ambiguous")
+            instances[identity] = instance_id
+
+        cursor = self.db.execute_sql(
+            "SELECT id, provider_id, instance_id, model_name, model_type "
+            "FROM tenant_model WHERE status = 'active'"
+        )
+        models = {}
+        valid_new_references = {}
+        provider_tenants = {provider_id: tenant_id for (tenant_id, _), provider_id in providers.items()}
+        for model_id, provider_id, instance_id, model_name, model_type in cursor.fetchall():
+            key = (provider_id, instance_id, model_name)
+            if key in models and models[key][0] != model_id:
+                raise RuntimeError("tenant_model mapping is ambiguous")
+            models[key] = (model_id, int(model_type))
+            tenant_id = provider_tenants.get(provider_id)
+            if not tenant_id:
+                raise RuntimeError("tenant_model provider ownership is unresolved")
+            for type_name, type_bit in self.MODEL_TYPE_TO_INT.items():
+                canonical_type = self.canonical_model_type(type_name)
+                if int(model_type) & type_bit:
+                    valid_new_references[(str(tenant_id), str(model_id), canonical_type)] = str(model_id)
+
+        exact_mapping = dict(valid_new_references)
+        exact_name_mapping = {}
+        for source_id, tenant_id, factory, model_name, model_type, api_key, api_base in source_models:
+            provider_id = providers.get((str(tenant_id), factory))
+            if not provider_id:
+                raise RuntimeError(f"tenant_model_provider mapping is incomplete for tenant_llm id={source_id}")
+            identity = TenantModelInstanceStage.instance_identity(provider_id, api_key, api_base)
+            instance_id = instances.get(identity)
+            if not instance_id:
+                raise RuntimeError(f"tenant_model_instance mapping is incomplete for tenant_llm id={source_id}")
+            model = models.get((provider_id, instance_id, model_name))
+            canonical_type = self.canonical_model_type(model_type)
+            type_bit = self.MODEL_TYPE_TO_INT[canonical_type]
+            if not model or not (model[1] & type_bit):
+                raise RuntimeError(f"tenant_model mapping is incomplete for tenant_llm id={source_id}")
+            key = (str(tenant_id), str(source_id), canonical_type)
+            if key in exact_mapping and exact_mapping[key] != str(model[0]):
+                raise RuntimeError("legacy tenant model reference mapping is ambiguous")
+            exact_mapping[key] = str(model[0])
+            name_key = (str(tenant_id), model_name, factory, canonical_type)
+            if name_key in exact_name_mapping and exact_name_mapping[name_key] != str(model[0]):
+                raise RuntimeError("legacy tenant model name mapping is ambiguous")
+            exact_name_mapping[name_key] = str(model[0])
+        return exact_mapping, exact_name_mapping
+
+    def _collect_reference_updates(self, exact_mapping: dict, exact_name_mapping: dict) -> tuple[list, list]:
+        updates = []
+        columns_to_add = []
+        for table_name, fields in self.TENANT_ID_FIELDS.items():
+            if not self.db.table_exists(table_name):
+                continue
+            for tenant_id_col, legacy_col, model_type_str in fields:
+                target_exists = self.db.column_exists(table_name, tenant_id_col)
+                legacy_exists = self.db.column_exists(table_name, legacy_col)
+                if not target_exists:
+                    columns_to_add.append((table_name, tenant_id_col))
+                if not legacy_exists and not target_exists:
+                    continue
+
+                target_expr = f"`{tenant_id_col}`" if target_exists else "NULL"
+                legacy_expr = f"`{legacy_col}`" if legacy_exists else "NULL"
+                tenant_expr = "id" if table_name == "tenant" else "tenant_id"
+                cursor = self.db.execute_sql(
+                    f"SELECT id, `{tenant_expr}`, {target_expr}, {legacy_expr} FROM `{table_name}`"
+                )
+                for row_id, tenant_id, current_ref, model_name in cursor.fetchall():
+                    if current_ref is None or str(current_ref).strip() == "":
+                        if not model_name or not str(model_name).strip():
+                            continue
+                        resolved_id = self.resolve_legacy_model_name(
+                            exact_name_mapping,
+                            tenant_id=str(tenant_id),
+                            legacy_model_name=str(model_name),
+                            model_type=model_type_str,
+                        )
+                    else:
+                        resolved_id = self.resolve_legacy_reference(
+                            exact_mapping,
+                            tenant_id=str(tenant_id),
+                            legacy_reference=current_ref,
+                            model_type=model_type_str,
+                        )
+                    if str(current_ref or "") != resolved_id:
+                        updates.append((table_name, tenant_id_col, row_id, resolved_id))
+        return columns_to_add, updates
+
     def check(self) -> bool:
         """Check if migration is needed - any tenant_*_id column is still INT or empty."""
         if not self.db.table_exists("tenant_model"):
@@ -1780,8 +2179,15 @@ class TenantModelIdMigrationStage(MigrationStage):
                 if col_type and col_type.lower() in ("int", "bigint", "integer"):
                     has_work = True
                     break
-                # Check if there are NULL values that should be populated
-                cursor = self.db.execute_sql(f"SELECT COUNT(*) FROM `{table_name}` WHERE `{tenant_id_col}` IS NULL OR `{tenant_id_col}` = '' OR LENGTH(`{tenant_id_col}`) <> 32")
+                _, legacy_col, _ = next(field for field in fields if field[0] == tenant_id_col)
+                if not self.db.column_exists(table_name, legacy_col):
+                    continue
+                cursor = self.db.execute_sql(
+                    f"SELECT COUNT(*) FROM `{table_name}` WHERE "
+                    f"(`{tenant_id_col}` IS NOT NULL AND `{tenant_id_col}` != '' AND LENGTH(`{tenant_id_col}`) <> 32) "
+                    f"OR ((`{tenant_id_col}` IS NULL OR `{tenant_id_col}` = '') "
+                    f"AND `{legacy_col}` IS NOT NULL AND `{legacy_col}` != '')"
+                )
                 null_count = cursor.fetchone()[0]
                 if null_count > 0:
                     has_work = True
@@ -1797,7 +2203,7 @@ class TenantModelIdMigrationStage(MigrationStage):
         return True
 
     def execute(self) -> tuple[int, list]:
-        """Execute migration: alter column types and populate tenant_*_id values."""
+        """Validate every reference first, then alter columns and write exact IDs."""
         rows_updated = 0
         tables_operated = set()
 
@@ -1805,7 +2211,18 @@ class TenantModelIdMigrationStage(MigrationStage):
             logger.info("[CREATE TABLE ONLY] No tables are created for this data migration")
             return 0, []
 
-        # Step 1: Add missing columns as VARCHAR(32) or alter existing INT columns to VARCHAR(32)
+        exact_mapping, exact_name_mapping = self._build_exact_source_mapping()
+        columns_to_add, updates = self._collect_reference_updates(exact_mapping, exact_name_mapping)
+
+        if self.dry_run:
+            logger.info(
+                "[DRY RUN] Validated full tenant model chain; would add %s columns and update %s rows",
+                len(columns_to_add),
+                len(updates),
+            )
+            return len(updates), sorted({item[0] for item in columns_to_add + updates})
+
+        # All source and target references are proven before the first DDL or DML statement.
         for table_name, fields in self.TENANT_ID_FIELDS.items():
             if not self.db.table_exists(table_name):
                 continue
@@ -1813,105 +2230,42 @@ class TenantModelIdMigrationStage(MigrationStage):
                 if not self.db.column_exists(table_name, tenant_id_col):
                     # Column does not exist yet — add it as VARCHAR(32)
                     logger.info(f"Adding column {table_name}.{tenant_id_col} as VARCHAR(32) NULL")
-                    if not self.dry_run:
-                        self.db.execute_sql(f"ALTER TABLE `{table_name}` ADD COLUMN `{tenant_id_col}` VARCHAR(32) NULL")
+                    self.db.execute_sql(f"ALTER TABLE `{table_name}` ADD COLUMN `{tenant_id_col}` VARCHAR(32) NULL")
                     tables_operated.add(table_name)
                     continue
                 col_type = self.db.get_column_type(table_name, tenant_id_col)
                 if col_type and col_type.lower() in ("int", "bigint", "integer"):
                     logger.info(f"Converting {table_name}.{tenant_id_col} from {col_type} to VARCHAR(32)")
-                    if not self.dry_run:
-                        self.db.execute_sql(f"ALTER TABLE `{table_name}` MODIFY COLUMN `{tenant_id_col}` VARCHAR(32) NULL")
+                    self.db.execute_sql(f"ALTER TABLE `{table_name}` MODIFY COLUMN `{tenant_id_col}` VARCHAR(32) NULL")
                     tables_operated.add(table_name)
 
-        # Step 2: Build lookup cache from tenant_model joined with provider + instance
-        # to resolve model_name@instance@provider -> tenant_model.id
-        model_lookup = self._build_model_lookup()
-        logger.info(f"Built model lookup with {len(model_lookup)} entries")
+        for table_name, tenant_id_col, row_id, resolved_id in updates:
+            self.db.execute_sql(
+                f"UPDATE `{table_name}` SET `{tenant_id_col}` = %s WHERE id = %s",
+                (resolved_id, row_id),
+            )
+            rows_updated += 1
+            tables_operated.add(table_name)
 
-        # Step 3: Populate tenant_*_id from model_name
-        for table_name, fields in self.TENANT_ID_FIELDS.items():
-            if not self.db.table_exists(table_name):
-                continue
-            for tenant_id_col, legacy_col, model_type_str in fields:
-                if not self.db.column_exists(table_name, tenant_id_col):
-                    logger.info(f"Column {table_name}.{tenant_id_col} does not exist, skipping")
-                    continue
-                if not self.db.column_exists(table_name, legacy_col):
-                    logger.info(f"Column {table_name}.{legacy_col} does not exist, skipping")
-                    continue
-
-                # Also need tenant_id for model lookup
-                # For tenant table, the PK is the tenant_id
-                # For knowledgebase, dialog, memory we also need tenant_id
-                if table_name == "tenant":
-                    cursor = self.db.execute_sql(
-                        f"SELECT id, `{legacy_col}` FROM `{table_name}` WHERE (`{tenant_id_col}` IS NULL OR `{tenant_id_col}` = '' OR LENGTH(`{tenant_id_col}`) <> 32) AND `{legacy_col}` IS NOT NULL AND `{legacy_col}` != ''"
-                    )
-                    while True:
-                        rows = cursor.fetchmany(self.scan_batch_size)
-                        if not rows:
-                            break
-                        for row_id, model_name in rows:
-                            tenant_id = row_id  # For tenant table, id == tenant_id
-                            resolved_id = self._resolve_model_id(model_lookup, tenant_id, model_name, model_type_str)
-                            if resolved_id:
-                                if not self.dry_run:
-                                    self.db.execute_sql(
-                                        f"UPDATE `{table_name}` SET `{tenant_id_col}` = %s WHERE id = %s",
-                                        (resolved_id, row_id),
-                                    )
-                            else:
-                                if not self.dry_run:
-                                    self.db.execute_sql(
-                                        f"UPDATE `{table_name}` SET `{tenant_id_col}` = '' WHERE id = %s",
-                                        (row_id,),
-                                    )
-                            rows_updated += 1
-                            tables_operated.add(table_name)
-                else:
-                    cursor = self.db.execute_sql(
-                        f"SELECT id, tenant_id, `{legacy_col}` FROM `{table_name}` WHERE (`{tenant_id_col}` IS NULL OR `{tenant_id_col}` = '' OR LENGTH(`{tenant_id_col}`) <> 32) AND `{legacy_col}` IS NOT NULL AND `{legacy_col}` != ''"
-                    )
-                    while True:
-                        rows = cursor.fetchmany(self.scan_batch_size)
-                        if not rows:
-                            break
-                        for row_id, tenant_id, model_name in rows:
-                            resolved_id = self._resolve_model_id(model_lookup, tenant_id, model_name, model_type_str)
-                            if resolved_id:
-                                if not self.dry_run:
-                                    self.db.execute_sql(
-                                        f"UPDATE `{table_name}` SET `{tenant_id_col}` = %s WHERE id = %s",
-                                        (resolved_id, row_id),
-                                    )
-                            else:
-                                if not self.dry_run:
-                                    self.db.execute_sql(
-                                        f"UPDATE `{table_name}` SET `{tenant_id_col}` = '' WHERE id = %s",
-                                        (row_id,),
-                                    )
-                            rows_updated += 1
-                            tables_operated.add(table_name)
-
-        if self.dry_run:
-            logger.info(f"[DRY RUN] Would update {rows_updated} rows")
-        else:
-            logger.info(f"Updated {rows_updated} rows with tenant_model.id values")
+        logger.info(f"Updated {rows_updated} rows with tenant_model.id values")
 
         return rows_updated, sorted(tables_operated)
 
-    def _split_model_name(self, model_name: str) -> tuple[str, str, str]:
+    @staticmethod
+    def _split_model_name_value(model_name: str) -> tuple[str, str, str]:
         """Parse model_name: {model_name}@{factory_name} or {model_name}@{instance_name}@{factory_name}"""
         if not model_name:
             return "", "", ""
-        parts = model_name.split("@")
+        parts = model_name.rsplit("@", 2)
         if len(parts) == 1:
             return parts[0], "default", ""
         elif len(parts) == 2:
             return parts[0], "default", parts[1]
         else:
             return parts[0], parts[1], parts[2]
+
+    def _split_model_name(self, model_name: str) -> tuple[str, str, str]:
+        return self._split_model_name_value(model_name)
 
     def _build_model_lookup(self) -> dict:
         """Build a lookup dict: (tenant_id, model_name_pure, provider_name, model_type_int) -> tenant_model.id"""
@@ -1921,12 +2275,21 @@ class TenantModelIdMigrationStage(MigrationStage):
             "INNER JOIN tenant_model_provider tmp ON tm.provider_id = tmp.id "
             "WHERE tm.status = 'active'"
         )
+        cursor = self.db.execute_sql(
+            "SELECT tm.id, tm.model_name, tm.model_type, tmp.tenant_id, tmp.provider_name, tmi.instance_name "
+            "FROM tenant_model tm "
+            "INNER JOIN tenant_model_provider tmp ON tm.provider_id = tmp.id "
+            "INNER JOIN tenant_model_instance tmi ON tm.instance_id = tmi.id "
+            "WHERE tm.status = 'active' AND tmi.status = 'active'"
+        )
         lookup = {}
-        for model_id, model_name, model_type, tenant_id, provider_name in cursor.fetchall():
+        for model_id, model_name, model_type, tenant_id, provider_name, instance_name in cursor.fetchall():
             # model_type is a binary integer; we check each bit
             for type_str, type_bit in self.MODEL_TYPE_TO_INT.items():
                 if model_type & type_bit:
-                    key = (tenant_id, model_name, provider_name, type_str)
+                    key = (str(tenant_id), model_name, instance_name, provider_name, self.canonical_model_type(type_str))
+                    if key in lookup and lookup[key] != model_id:
+                        raise RuntimeError("tenant model name mapping is ambiguous")
                     lookup[key] = model_id
         return lookup
 
@@ -1938,16 +2301,10 @@ class TenantModelIdMigrationStage(MigrationStage):
             return None
 
         # Try exact lookup with the provider name from the model_name
-        key = (tenant_id, pure_name, provider_name, model_type_str)
+        key = (str(tenant_id), pure_name, instance_name, provider_name, self.canonical_model_type(model_type_str))
         result = model_lookup.get(key)
         if result:
             return result
-
-        # Try with instance_name as part of provider (shouldn't normally happen)
-        # Try without specific provider (any provider matching model_name + type for this tenant)
-        for (t_id, m_name, p_name, m_type), m_id in model_lookup.items():
-            if t_id == tenant_id and m_name == pure_name and m_type == model_type_str:
-                return m_id
 
         logger.warning(f"No tenant_model.id found for tenant={tenant_id}, model={model_name}, type={model_type_str}")
         return None
@@ -1955,6 +2312,7 @@ class TenantModelIdMigrationStage(MigrationStage):
 
 # Registry of available migration stages
 MIGRATION_STAGES = {
+    "tenant_model_contract_preflight": TenantModelContractPreflightStage,
     "tenant_model_provider": TenantModelProviderStage,
     "tenant_model_instance": TenantModelInstanceStage,
     "tenant_model": TenantModelStage,
