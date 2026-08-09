@@ -171,11 +171,14 @@ def test_all_enabled_legacy_models_are_migration_candidates():
     assert "tl.status = '0'" not in condition
 
 
-def test_service_entrypoint_runs_model_migration_before_starting_webserver():
+def test_service_entrypoint_migrates_model_contract_before_database_init_and_webserver():
     source = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
-    startup = source[source.index("ensure_db_init") : source.index('if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]')]
-    assert re.search(r"ensure_db_init\s+tools/scripts/run_migrations\.sh", startup)
-    assert "INIT_MODEL_PROVIDER_TABLES" not in startup.split("tools/scripts/run_migrations.sh", 1)[0]
+    startup = source[
+        source.index("tools/scripts/run_migrations.sh") :
+        source.index('if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]')
+    ]
+    assert re.search(r"tools/scripts/run_migrations\.sh\s+ensure_db_init", startup)
+    assert "INIT_MODEL_PROVIDER_TABLES" not in startup.split("ensure_db_init", 1)[0]
 
 
 def test_service_migration_does_not_skip_contract_repair_from_version_marker():

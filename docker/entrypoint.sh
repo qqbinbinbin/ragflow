@@ -271,8 +271,8 @@ PY
 # Start components based on flags
 # -----------------------------------------------------------------------------
 ensure_docling
-ensure_db_init
 tools/scripts/run_migrations.sh
+ensure_db_init
 ensure_minio_bucket
 
 if [[ "${INIT_MODEL_PROVIDER_TABLES}" -eq 1 ]]; then
