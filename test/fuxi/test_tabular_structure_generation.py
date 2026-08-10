@@ -6,6 +6,7 @@ import inspect
 import json
 import sys
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -19,6 +20,29 @@ from test.fuxi.test_tabular_structure_projection import _workbook_bytes
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVICE_MODULE_PATH = REPO_ROOT / "api" / "db" / "services" / "tabular_structure_service.py"
 CHUNK_API_PATH = REPO_ROOT / "api" / "apps" / "restful_apis" / "chunk_api.py"
+
+
+def _load_authorized_document_source_name(document_service):
+    module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
+    helper = next(
+        node
+        for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_authorized_document_source_name"
+    )
+    namespace = {
+        "DocumentService": document_service,
+        "unicodedata": unicodedata,
+    }
+    exec(
+        compile(
+            ast.Module(body=[helper], type_ignores=[]),
+            str(CHUNK_API_PATH),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["_authorized_document_source_name"]
 
 
 class _Storage:
@@ -1287,6 +1311,85 @@ def test_discovery_api_is_post_only_and_rejects_client_authorization_scope():
     assert "provider_scope" in source
     assert "unexpected discovery request field" in source
     assert "discover_active_tables" in source
+
+
+def test_authorized_active_generation_projects_document_name_separately_from_manifest():
+    module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
+    route = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "get_active_tabular_structure_generation"
+    )
+    source_name_helper = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_authorized_document_source_name"
+    )
+    string_values = {
+        node.value
+        for node in ast.walk(route)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    helper_calls = [
+        node
+        for node in ast.walk(route)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_authorized_document_source_name"
+    ]
+    query_calls = [
+        node
+        for node in ast.walk(source_name_helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "query"
+    ]
+
+    assert "document_name" in string_values
+    assert helper_calls
+    assert query_calls, "the authorized document control record must provide source identity"
+
+
+@pytest.mark.parametrize(
+    ("documents", "message"),
+    [
+        ([], "unavailable"),
+        ([object(), object()], "unavailable"),
+        ([type("Document", (), {"name": None})()], "unavailable"),
+        ([type("Document", (), {"name": "unsafe\u0000name.xlsx"})()], "invalid"),
+        ([type("Document", (), {"name": "x" * 1025})()], "invalid"),
+    ],
+)
+def test_authorized_document_source_name_rejects_ambiguous_or_unsafe_identity(
+    documents,
+    message,
+):
+    class StubDocumentService:
+        @staticmethod
+        def query(**kwargs):
+            assert kwargs == {"id": "document-1", "kb_id": "dataset-1"}
+            return documents
+
+    helper = _load_authorized_document_source_name(StubDocumentService)
+
+    with pytest.raises(ValueError, match=message):
+        helper("dataset-1", "document-1")
+
+
+def test_authorized_document_source_name_returns_bounded_nfc_identity():
+    decomposed = "  cafe\u0301.xlsx  "
+
+    class StubDocumentService:
+        @staticmethod
+        def query(**kwargs):
+            assert kwargs == {"id": "document-1", "kb_id": "dataset-1"}
+            return [type("Document", (), {"name": decomposed})()]
+
+    helper = _load_authorized_document_source_name(StubDocumentService)
+
+    assert helper("dataset-1", "document-1") == "caf\u00e9.xlsx"
 
 
 def test_peewee_repository_locks_document_and_switches_inside_one_transaction():

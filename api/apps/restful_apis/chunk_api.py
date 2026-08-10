@@ -19,6 +19,7 @@ import datetime
 import json
 import logging
 import re
+import unicodedata
 
 import xxhash
 from pydantic import BaseModel, Field, validator
@@ -165,6 +166,22 @@ def _authorized_structure_dataset_owner(tenant_id, dataset_id):
     return dataset.tenant_id, None
 
 
+def _authorized_document_source_name(dataset_id, document_id):
+    docs = DocumentService.query(id=document_id, kb_id=dataset_id)
+    if len(docs) != 1:
+        raise ValueError("authorized document source identity is unavailable")
+    value = getattr(docs[0], "name", None)
+    if not isinstance(value, str):
+        raise ValueError("authorized document source identity is unavailable")
+    normalized = unicodedata.normalize("NFC", value).strip()
+    if not normalized or len(normalized.encode("utf-8")) > 1024 or any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        for character in normalized
+    ):
+        raise ValueError("authorized document source identity is invalid")
+    return normalized
+
+
 @manager.route("/datasets/<dataset_id>/tabular-structure/discovery/v1", methods=["POST"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs
@@ -271,6 +288,10 @@ async def get_active_tabular_structure_generation(tenant_id, dataset_id, documen
                 "status",
             )
         }
+        data["document_name"] = _authorized_document_source_name(
+            dataset_id,
+            document_id,
+        )
         return get_result(data=data)
     except Exception as error:
         return _tabular_structure_error_response(
