@@ -30,6 +30,8 @@ from typing import Any
 import unicodedata
 
 from rag.app.tabular_structure import (
+    PRODUCER_SCHEMA_VERSION,
+    PROJECTION_VERSION,
     StructureGenerationConflict,
     StructureSnapshotChanged,
     StructureSnapshotMissing,
@@ -321,6 +323,9 @@ class InMemoryTabularStructureRepository:
                 if record["tenant_id"] == tenant_id
                 and record["kb_id"] == dataset_id
                 and record["status"] == "active"
+                and record["producer_schema_version"]
+                == PRODUCER_SCHEMA_VERSION
+                and record["projection_version"] == PROJECTION_VERSION
                 and (
                     after_document_id is None
                     or record["document_id"] > after_document_id
@@ -1027,6 +1032,8 @@ class PeeweeTabularStructureRepository:
                 Generation.tenant_id == tenant_id,
                 Generation.kb_id == dataset_id,
                 Generation.status == "active",
+                Generation.producer_schema_version == PRODUCER_SCHEMA_VERSION,
+                Generation.projection_version == PROJECTION_VERSION,
             )
             .order_by(Generation.document_id)
             .limit(limit)

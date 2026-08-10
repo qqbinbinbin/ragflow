@@ -821,12 +821,141 @@ def test_backfill_is_resumable_and_rechecks_active_before_committing(
     }
 
 
+def test_backfill_ignores_active_generations_outside_the_current_contract(
+    service_module,
+    table_parser,
+):
+    repository = service_module.InMemoryTabularStructureRepository()
+    storage, projection, receipt = _stored_generation(
+        table_parser,
+        document_id="document-current",
+    )
+    current = {
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "tenant_id": "tenant-owner",
+        "kb_id": "dataset-1",
+        "document_id": "document-current",
+        "projection_version": projection["version"],
+        "producer_schema_version": projection["producer_schema_version"],
+        "manifest_object_name": receipt["manifest_object_name"],
+        "manifest_sha256": receipt["manifest_sha256"],
+        "source_sha256": projection["source_sha256"],
+        "row_count": len(projection["rows"]),
+        "part_count": receipt["part_count"],
+        "status": "active",
+        "safe_error_code": None,
+        "activated_at": None,
+        "retained_at": None,
+    }
+    legacy = {
+        **current,
+        "producer_generation_ref": str(uuid.uuid4()),
+        "document_id": "document-legacy",
+        "projection_version": "tabular-structure-projection/legacy",
+        "producer_schema_version": "table-producer/legacy",
+        "manifest_object_name": "legacy-manifest-is-not-readable",
+        "manifest_sha256": "0" * 64,
+    }
+    repository.inject(legacy)
+    repository.inject(current)
+    repository.mark_backfill_pending("tenant-owner", "dataset-1")
+
+    result = service_module.TabularStructureService.backfill_active_generation_indexes(
+        storage,
+        repository=repository,
+    )
+
+    assert result == {"batches": 1, "documents": 1, "datasets_completed": 1}
+    assert repository.backfill_state("tenant-owner", "dataset-1") == {
+        "status": "complete",
+        "cursor": None,
+    }
+
+
 def test_backfill_has_no_default_batch_count_truncation(service_module):
     signature = inspect.signature(
         service_module.TabularStructureService.backfill_active_generation_indexes
     )
 
     assert signature.parameters["max_batches"].default is None
+
+
+def test_peewee_backfill_query_filters_legacy_contract_before_manifest_io(
+    service_module,
+    monkeypatch,
+):
+    peewee = pytest.importorskip("peewee")
+    test_database = peewee.SqliteDatabase(":memory:")
+
+    class Base(peewee.Model):
+        class Meta:
+            database = test_database
+
+    class Document(Base):
+        id = peewee.CharField(primary_key=True)
+        kb_id = peewee.CharField()
+
+    class Generation(Base):
+        producer_generation_ref = peewee.CharField(primary_key=True)
+        tenant_id = peewee.CharField()
+        kb_id = peewee.CharField()
+        document_id = peewee.CharField()
+        projection_version = peewee.CharField()
+        producer_schema_version = peewee.CharField()
+        status = peewee.CharField()
+
+        def to_dict(self):
+            return dict(self.__data__)
+
+    test_database.create_tables([Document, Generation])
+    Document.insert_many(
+        [
+            {"id": "document-current", "kb_id": "dataset-1"},
+            {"id": "document-legacy", "kb_id": "dataset-1"},
+        ]
+    ).execute()
+    Generation.insert_many(
+        [
+            {
+                "producer_generation_ref": "generation-current",
+                "tenant_id": "tenant-owner",
+                "kb_id": "dataset-1",
+                "document_id": "document-current",
+                "projection_version": tabular_structure.PROJECTION_VERSION,
+                "producer_schema_version": tabular_structure.PRODUCER_SCHEMA_VERSION,
+                "status": "active",
+            },
+            {
+                "producer_generation_ref": "generation-legacy",
+                "tenant_id": "tenant-owner",
+                "kb_id": "dataset-1",
+                "document_id": "document-legacy",
+                "projection_version": "tabular-structure-projection/legacy",
+                "producer_schema_version": "table-producer/legacy",
+                "status": "active",
+            },
+        ]
+    ).execute()
+    repository = service_module.PeeweeTabularStructureRepository()
+    monkeypatch.setattr(
+        repository,
+        "_models",
+        lambda: (test_database, Document, object, Generation, object, object),
+    )
+
+    try:
+        records = repository.list_active_generations_for_backfill(
+            "tenant-owner",
+            "dataset-1",
+            None,
+            100,
+        )
+
+        assert [record["producer_generation_ref"] for record in records] == [
+            "generation-current"
+        ]
+    finally:
+        test_database.close()
 
 
 def test_discovery_api_is_post_only_and_rejects_client_authorization_scope():

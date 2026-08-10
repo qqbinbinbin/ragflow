@@ -16,25 +16,29 @@ class _Model:
     pass
 
 
-peewee = types.ModuleType("peewee")
-for name in (
-    "CharField",
-    "IntegerField",
-    "BigIntegerField",
-    "DateTimeField",
-    "PrimaryKeyField",
-    "TextField",
-):
-    setattr(peewee, name, _Field)
-peewee.Model = _Model
-peewee.MySQLDatabase = type("MySQLDatabase", (), {})
-sys.modules.setdefault("peewee", peewee)
+try:
+    import peewee  # noqa: F401
+    import playhouse.migrate  # noqa: F401
+except ImportError:
+    peewee = types.ModuleType("peewee")
+    for name in (
+        "CharField",
+        "IntegerField",
+        "BigIntegerField",
+        "DateTimeField",
+        "PrimaryKeyField",
+        "TextField",
+    ):
+        setattr(peewee, name, _Field)
+    peewee.Model = _Model
+    peewee.MySQLDatabase = type("MySQLDatabase", (), {})
+    sys.modules.setdefault("peewee", peewee)
 
-playhouse = types.ModuleType("playhouse")
-playhouse_migrate = types.ModuleType("playhouse.migrate")
-playhouse_migrate.MySQLMigrator = type("MySQLMigrator", (), {})
-sys.modules.setdefault("playhouse", playhouse)
-sys.modules.setdefault("playhouse.migrate", playhouse_migrate)
+    playhouse = types.ModuleType("playhouse")
+    playhouse_migrate = types.ModuleType("playhouse.migrate")
+    playhouse_migrate.MySQLMigrator = type("MySQLMigrator", (), {})
+    sys.modules.setdefault("playhouse", playhouse)
+    sys.modules.setdefault("playhouse.migrate", playhouse_migrate)
 
 from tools.scripts.mysql_migration import (
     MIGRATION_STAGES,
