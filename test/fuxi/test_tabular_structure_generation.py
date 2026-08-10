@@ -644,6 +644,40 @@ def test_managed_generation_receipts_preserve_validated_source_identity(
     assert restored["source_sha256"] == first_projection["source_sha256"]
 
 
+def test_active_generation_public_identity_preserves_source_sha256(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation(table_parser)
+    service_module.TabularStructureService.register_shadow_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        receipt=receipt,
+        repository=generation_repository,
+    )
+    service_module.TabularStructureService.activate_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        expected_active_generation_ref=None,
+        repository=generation_repository,
+    )
+
+    active = service_module.TabularStructureService.get_active_generation(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        repository=generation_repository,
+    )
+
+    assert active["source_sha256"] == projection["source_sha256"]
+
+
 def test_retained_restore_atomically_switches_expected_active_generation(
     service_module,
     generation_repository,

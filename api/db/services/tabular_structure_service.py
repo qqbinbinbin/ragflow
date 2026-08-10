@@ -41,6 +41,7 @@ _PUBLIC_GENERATION_FIELDS = {
     "document_id",
     "projection_version",
     "producer_schema_version",
+    "source_sha256",
     "row_count",
     "part_count",
     "status",
