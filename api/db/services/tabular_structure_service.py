@@ -30,12 +30,15 @@ from typing import Any
 import unicodedata
 
 from rag.app.tabular_structure import (
+    ENUMERATION_RULE_VERSION,
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_VERSION,
+    STRUCTURE_PRODUCER_ALGORITHM_VERSION,
     StructureGenerationConflict,
     StructureSnapshotChanged,
     StructureSnapshotMissing,
     load_tabular_structure_projection,
+    load_tabular_structure_projection_for_backfill,
     page_tabular_structure_rows,
 )
 
@@ -1302,7 +1305,7 @@ class TabularStructureService:
             has_more = len(fetched) > batch_size
             index_projections = []
             for generation in generations:
-                projection = load_tabular_structure_projection(
+                projection = load_tabular_structure_projection_for_backfill(
                     storage,
                     bucket=dataset_id,
                     document_id=generation["document_id"],
@@ -1314,6 +1317,15 @@ class TabularStructureService:
                     expected_part_count=generation["part_count"],
                     tenant_id=tenant_id,
                 )
+                is_current_contract = (
+                    projection["version"] == PROJECTION_VERSION
+                    and projection["producer_schema_version"]
+                    == PRODUCER_SCHEMA_VERSION
+                    and projection["structure_algorithm_version"]
+                    == STRUCTURE_PRODUCER_ALGORITHM_VERSION
+                    and projection["enumeration_rule_version"]
+                    == ENUMERATION_RULE_VERSION
+                )
                 index_projections.append(
                     build_tabular_discovery_index_projection(
                         tenant_id=tenant_id,
@@ -1321,6 +1333,8 @@ class TabularStructureService:
                         document_id=generation["document_id"],
                         projection=projection,
                     )
+                    if is_current_contract
+                    else []
                 )
             next_cursor = generations[-1]["document_id"] if has_more else None
             repository.commit_backfill_batch(

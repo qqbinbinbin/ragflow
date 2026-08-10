@@ -35,6 +35,22 @@ PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
 STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v15"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v7"
+_CURRENT_PROJECTION_CONTRACT = (
+    PRODUCER_SCHEMA_VERSION,
+    PROJECTION_VERSION,
+    STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+    ENUMERATION_RULE_VERSION,
+)
+_KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
+    {
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v10", "enumeration-rules/v3"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v11", "enumeration-rules/v3"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v12", "enumeration-rules/v4"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v13", "enumeration-rules/v5"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v14", "enumeration-rules/v6"),
+        _CURRENT_PROJECTION_CONTRACT,
+    }
+)
 PROJECTION_FIELDS = frozenset(
     {
         "version",
@@ -131,14 +147,37 @@ def _table_ref(
     table_ordinal: int,
     membership_sha256: str,
 ) -> str:
+    return _table_ref_for_contract(
+        source_sha256,
+        sheet_ordinal,
+        table_ordinal,
+        membership_sha256,
+        producer_schema_version=PRODUCER_SCHEMA_VERSION,
+        projection_version=PROJECTION_VERSION,
+        structure_algorithm_version=STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+        enumeration_rule_version=ENUMERATION_RULE_VERSION,
+    )
+
+
+def _table_ref_for_contract(
+    source_sha256: str,
+    sheet_ordinal: int,
+    table_ordinal: int,
+    membership_sha256: str,
+    *,
+    producer_schema_version: str,
+    projection_version: str,
+    structure_algorithm_version: str,
+    enumeration_rule_version: str,
+) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", membership_sha256):
         raise ValueError("table membership SHA-256 is invalid")
     identity = _versioned_digest(
         "tabular-table/v2",
-        PRODUCER_SCHEMA_VERSION,
-        PROJECTION_VERSION,
-        STRUCTURE_PRODUCER_ALGORITHM_VERSION,
-        ENUMERATION_RULE_VERSION,
+        producer_schema_version,
+        projection_version,
+        structure_algorithm_version,
+        enumeration_rule_version,
         source_sha256,
         sheet_ordinal,
         table_ordinal,
@@ -4617,16 +4656,25 @@ def build_tabular_structure_projection(
     return projection
 
 
-def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
+def _validate_tabular_structure_projection_for_contract(
+    projection: dict[str, Any],
+    contract: tuple[str, str, str, str],
+) -> None:
+    (
+        producer_schema_version,
+        projection_version,
+        structure_algorithm_version,
+        enumeration_rule_version,
+    ) = contract
     if not isinstance(projection, dict) or set(projection) != PROJECTION_FIELDS:
         raise ValueError("structure projection does not match the fixed top-level schema")
-    if projection.get("version") != PROJECTION_VERSION:
+    if projection.get("version") != projection_version:
         raise ValueError("unsupported tabular structure projection version")
-    if projection.get("producer_schema_version") != PRODUCER_SCHEMA_VERSION:
+    if projection.get("producer_schema_version") != producer_schema_version:
         raise ValueError("unsupported table producer schema version")
-    if projection.get("structure_algorithm_version") != STRUCTURE_PRODUCER_ALGORITHM_VERSION:
+    if projection.get("structure_algorithm_version") != structure_algorithm_version:
         raise ValueError("unsupported structure algorithm version")
-    if projection.get("enumeration_rule_version") != ENUMERATION_RULE_VERSION:
+    if projection.get("enumeration_rule_version") != enumeration_rule_version:
         raise ValueError("unsupported enumeration rule version")
     generation_ref = projection.get("producer_generation_ref")
     _validate_generation_ref(generation_ref)
@@ -4648,7 +4696,7 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
             raise ValueError("unsupported structure row version")
         if row["structure_kind_kwd"] != "table_row":
             raise ValueError("invalid structure kind")
-        if row["producer_schema_version_kwd"] != PRODUCER_SCHEMA_VERSION:
+        if row["producer_schema_version_kwd"] != producer_schema_version:
             raise ValueError("unsupported row producer schema version")
         if row["producer_generation_ref_kwd"] != generation_ref:
             raise ValueError("mixed producer generations are not allowed")
@@ -4875,11 +4923,15 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         table_ref = table["table_ref"]
         table_ref_match = re.fullmatch(r"tbl_v2_([0-9a-f]{64})_[0-9a-f]{64}", table_ref)
         expected_table_ref = (
-            _table_ref(
+            _table_ref_for_contract(
                 source_sha256,
                 table["sheet_ordinal"],
                 table["table_ordinal"],
                 table_ref_match.group(1),
+                producer_schema_version=producer_schema_version,
+                projection_version=projection_version,
+                structure_algorithm_version=structure_algorithm_version,
+                enumeration_rule_version=enumeration_rule_version,
             )
             if table_ref_match
             else None
@@ -4933,6 +4985,13 @@ def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
         for ordinals in ordinals_by_sheet.values()
     ):
         raise ValueError("table manifest ordinals are not contiguous within a worksheet")
+
+
+def validate_tabular_structure_projection(projection: dict[str, Any]) -> None:
+    _validate_tabular_structure_projection_for_contract(
+        projection,
+        _CURRENT_PROJECTION_CONTRACT,
+    )
 
 
 def partition_tabular_structure_projection(
@@ -5057,7 +5116,7 @@ def _decode_snapshot_json(payload: bytes, label: str) -> dict[str, Any]:
     return value
 
 
-def load_tabular_structure_projection(
+def _load_tabular_structure_projection_for_contracts(
     storage,
     *,
     bucket: str,
@@ -5067,6 +5126,7 @@ def load_tabular_structure_projection(
     manifest_sha256: str,
     expected_part_count: int | None = None,
     tenant_id: str | None = None,
+    accepted_contracts: frozenset[tuple[str, str, str, str]],
 ) -> dict[str, Any]:
     """Read and verify one exact immutable projection generation."""
 
@@ -5098,12 +5158,13 @@ def load_tabular_structure_projection(
     }
     if set(manifest) != expected_manifest_fields:
         raise StructureSnapshotChanged("manifest schema changed")
-    if (
-        manifest["version"] != PROJECTION_VERSION
-        or manifest["producer_schema_version"] != PRODUCER_SCHEMA_VERSION
-        or manifest["structure_algorithm_version"] != STRUCTURE_PRODUCER_ALGORITHM_VERSION
-        or manifest["enumeration_rule_version"] != ENUMERATION_RULE_VERSION
-    ):
+    contract = (
+        manifest["producer_schema_version"],
+        manifest["version"],
+        manifest["structure_algorithm_version"],
+        manifest["enumeration_rule_version"],
+    )
+    if contract not in accepted_contracts:
         raise StructureSnapshotChanged("manifest version changed")
     if manifest["producer_generation_ref"] != producer_generation_ref:
         raise StructureSnapshotChanged("manifest generation changed")
@@ -5169,10 +5230,62 @@ def load_tabular_structure_projection(
         "rows": rows,
     }
     try:
-        validate_tabular_structure_projection(projection)
+        _validate_tabular_structure_projection_for_contract(projection, contract)
     except ValueError as exc:
         raise StructureSnapshotChanged("structure projection validation changed") from exc
     return projection
+
+
+def load_tabular_structure_projection(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    manifest_object_name: str,
+    manifest_sha256: str,
+    expected_part_count: int | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Read one projection using only the current runtime contract."""
+
+    return _load_tabular_structure_projection_for_contracts(
+        storage,
+        bucket=bucket,
+        document_id=document_id,
+        producer_generation_ref=producer_generation_ref,
+        manifest_object_name=manifest_object_name,
+        manifest_sha256=manifest_sha256,
+        expected_part_count=expected_part_count,
+        tenant_id=tenant_id,
+        accepted_contracts=frozenset({_CURRENT_PROJECTION_CONTRACT}),
+    )
+
+
+def load_tabular_structure_projection_for_backfill(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    manifest_object_name: str,
+    manifest_sha256: str,
+    expected_part_count: int | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate a known immutable generation before deciding index eligibility."""
+
+    return _load_tabular_structure_projection_for_contracts(
+        storage,
+        bucket=bucket,
+        document_id=document_id,
+        producer_generation_ref=producer_generation_ref,
+        manifest_object_name=manifest_object_name,
+        manifest_sha256=manifest_sha256,
+        expected_part_count=expected_part_count,
+        tenant_id=tenant_id,
+        accepted_contracts=_KNOWN_BACKFILL_PROJECTION_CONTRACTS,
+    )
 
 
 def page_tabular_structure_rows(

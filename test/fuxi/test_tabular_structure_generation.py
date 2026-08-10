@@ -86,6 +86,138 @@ def _stored_generation(
     return storage, projection, receipt
 
 
+def _stored_generation_with_contract(
+    table_parser,
+    *,
+    document_id: str,
+    structure_algorithm_version: str,
+    enumeration_rule_version: str,
+):
+    storage, projection, _receipt = _stored_generation(
+        table_parser,
+        document_id=document_id,
+    )
+    projection = copy.deepcopy(projection)
+    projection["structure_algorithm_version"] = structure_algorithm_version
+    projection["enumeration_rule_version"] = enumeration_rule_version
+    projection["producer_generation_ref"] = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "fuxi:tabular-generation:"
+            f"{projection['producer_schema_version']}:"
+            f"{projection['version']}:"
+            f"{structure_algorithm_version}:"
+            f"{enumeration_rule_version}:"
+            f"{document_id}:{projection['source_sha256']}",
+        )
+    )
+
+    table_refs = {}
+    for table in projection["tables"]:
+        old_ref = table["table_ref"]
+        membership_sha256 = old_ref.split("_", 3)[2]
+        identity = tabular_structure._versioned_digest(
+            "tabular-table/v2",
+            projection["producer_schema_version"],
+            projection["version"],
+            structure_algorithm_version,
+            enumeration_rule_version,
+            projection["source_sha256"],
+            table["sheet_ordinal"],
+            table["table_ordinal"],
+            membership_sha256,
+        )
+        new_ref = f"tbl_v2_{membership_sha256}_{identity}"
+        table["table_ref"] = new_ref
+        table_refs[old_ref] = new_ref
+    for row in projection["rows"]:
+        row["producer_generation_ref_kwd"] = projection[
+            "producer_generation_ref"
+        ]
+        row["table_ref_kwd"] = table_refs[row["table_ref_kwd"]]
+        row["row_ref_kwd"] = (
+            f"{row['table_ref_kwd']}:{row['row_ordinal_int']}"
+        )
+        row["id"] = "tsr_v1_" + tabular_structure._versioned_digest(
+            "tabular-row-record/v1",
+            projection["producer_generation_ref"],
+            row["row_ref_kwd"],
+        )
+
+    part = {
+        "version": tabular_structure.PROJECTION_PART_VERSION,
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "part_number": 1,
+        "row_offset": 0,
+        "row_count": len(projection["rows"]),
+        "rows": projection["rows"],
+    }
+    part_payload = tabular_structure._canonical_json(part)
+    part_sha256 = hashlib.sha256(part_payload).hexdigest()
+    document_ref = tabular_structure._versioned_digest(
+        "tabular-structure-document/v1",
+        document_id,
+    )
+    prefix = (
+        f"_fuxi/tabular-structure/v1/{document_ref}/"
+        f"{projection['producer_generation_ref']}"
+    )
+    part_object_name = f"{prefix}/part-000001-{part_sha256}.json"
+    manifest = {
+        "version": projection["version"],
+        "producer_schema_version": projection["producer_schema_version"],
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "structure_algorithm_version": structure_algorithm_version,
+        "enumeration_rule_version": enumeration_rule_version,
+        "source_sha256": projection["source_sha256"],
+        "row_count": len(projection["rows"]),
+        "tables": projection["tables"],
+        "parts": [
+            {
+                "part_number": 1,
+                "object_name": part_object_name,
+                "row_offset": 0,
+                "row_count": len(projection["rows"]),
+                "sha256": part_sha256,
+            }
+        ],
+    }
+    manifest_payload = tabular_structure._canonical_json(manifest)
+    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+    manifest_object_name = f"{prefix}/manifest-{manifest_sha256}.json"
+    storage = _Storage()
+    storage.put("dataset-1", part_object_name, part_payload)
+    storage.put("dataset-1", manifest_object_name, manifest_payload)
+    receipt = {
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "manifest_object_name": manifest_object_name,
+        "manifest_sha256": manifest_sha256,
+        "part_count": 1,
+        "row_count": len(projection["rows"]),
+    }
+    return storage, projection, receipt
+
+
+def _active_generation_record(projection, receipt, *, document_id: str):
+    return {
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "tenant_id": "tenant-owner",
+        "kb_id": "dataset-1",
+        "document_id": document_id,
+        "projection_version": projection["version"],
+        "producer_schema_version": projection["producer_schema_version"],
+        "manifest_object_name": receipt["manifest_object_name"],
+        "manifest_sha256": receipt["manifest_sha256"],
+        "source_sha256": projection["source_sha256"],
+        "row_count": len(projection["rows"]),
+        "part_count": receipt["part_count"],
+        "status": "active",
+        "safe_error_code": None,
+        "activated_at": None,
+        "retained_at": None,
+    }
+
+
 def test_generation_model_has_document_scoped_control_fields():
     model_path = REPO_ROOT / "api" / "db" / "db_models.py"
     module = ast.parse(model_path.read_text(encoding="utf-8"))
@@ -870,6 +1002,192 @@ def test_backfill_ignores_active_generations_outside_the_current_contract(
         "status": "complete",
         "cursor": None,
     }
+
+
+def test_backfill_validates_known_historical_inner_contract_and_indexes_current_only(
+    service_module,
+    table_parser,
+):
+    repository = service_module.InMemoryTabularStructureRepository()
+    current_storage, current_projection, current_receipt = _stored_generation(
+        table_parser,
+        document_id="document-current",
+    )
+    historical_storage, historical_projection, historical_receipt = (
+        _stored_generation_with_contract(
+            table_parser,
+            document_id="document-historical",
+            structure_algorithm_version="region-producer/v10",
+            enumeration_rule_version="enumeration-rules/v3",
+        )
+    )
+    storage = _Storage()
+    storage.objects.update(current_storage.objects)
+    storage.objects.update(historical_storage.objects)
+    repository.inject(
+        _active_generation_record(
+            current_projection,
+            current_receipt,
+            document_id="document-current",
+        )
+    )
+    repository.inject(
+        _active_generation_record(
+            historical_projection,
+            historical_receipt,
+            document_id="document-historical",
+        )
+    )
+    repository.mark_backfill_pending("tenant-owner", "dataset-1")
+
+    result = service_module.TabularStructureService.backfill_active_generation_indexes(
+        storage,
+        repository=repository,
+    )
+    discovery = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query="Inspection",
+        cursor=None,
+        page_size=10,
+        max_pages=1,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=10_000,
+        repository=repository,
+    )
+
+    assert result == {"batches": 1, "documents": 2, "datasets_completed": 1}
+    assert discovery["incomplete"] is False
+    assert {
+        seed["producer_generation_ref"] for seed in discovery["seeds"]
+    } == {current_projection["producer_generation_ref"]}
+
+
+def test_backfill_with_only_known_historical_inner_contract_finishes_without_candidates(
+    service_module,
+    table_parser,
+):
+    repository = service_module.InMemoryTabularStructureRepository()
+    storage, projection, receipt = _stored_generation_with_contract(
+        table_parser,
+        document_id="document-historical",
+        structure_algorithm_version="region-producer/v10",
+        enumeration_rule_version="enumeration-rules/v3",
+    )
+    repository.inject(
+        _active_generation_record(
+            projection,
+            receipt,
+            document_id="document-historical",
+        )
+    )
+    repository.mark_backfill_pending("tenant-owner", "dataset-1")
+
+    result = service_module.TabularStructureService.backfill_active_generation_indexes(
+        storage,
+        repository=repository,
+    )
+    discovery = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query="Inspection",
+        cursor=None,
+        page_size=10,
+        max_pages=1,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=10_000,
+        repository=repository,
+    )
+
+    assert result == {"batches": 1, "documents": 1, "datasets_completed": 1}
+    assert discovery["incomplete"] is False
+    assert discovery["seeds"] == []
+
+
+def test_backfill_rejects_unknown_inner_contract_instead_of_broadly_skipping(
+    service_module,
+    table_parser,
+):
+    repository = service_module.InMemoryTabularStructureRepository()
+    storage, projection, receipt = _stored_generation_with_contract(
+        table_parser,
+        document_id="document-unknown",
+        structure_algorithm_version="region-producer/v999",
+        enumeration_rule_version="enumeration-rules/v999",
+    )
+    repository.inject(
+        _active_generation_record(
+            projection,
+            receipt,
+            document_id="document-unknown",
+        )
+    )
+    repository.mark_backfill_pending("tenant-owner", "dataset-1")
+
+    with pytest.raises(
+        service_module.StructureSnapshotChanged,
+        match="manifest version changed",
+    ):
+        service_module.TabularStructureService.backfill_active_generation_indexes(
+            storage,
+            repository=repository,
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["manifest_digest", "manifest_generation", "manifest_scope", "part_count", "part_digest"],
+)
+def test_historical_inner_contract_backfill_keeps_snapshot_corruption_fail_closed(
+    service_module,
+    table_parser,
+    corruption,
+):
+    repository = service_module.InMemoryTabularStructureRepository()
+    storage, projection, receipt = _stored_generation_with_contract(
+        table_parser,
+        document_id="document-historical",
+        structure_algorithm_version="region-producer/v10",
+        enumeration_rule_version="enumeration-rules/v3",
+    )
+    if corruption == "manifest_digest":
+        key = ("dataset-1", receipt["manifest_object_name"])
+        storage.objects[key] += b" "
+    elif corruption == "manifest_generation":
+        old_name = receipt["manifest_object_name"]
+        manifest = json.loads(storage.objects[("dataset-1", old_name)])
+        manifest["producer_generation_ref"] = str(uuid.uuid4())
+        payload = tabular_structure._canonical_json(manifest)
+        digest = hashlib.sha256(payload).hexdigest()
+        receipt["manifest_sha256"] = digest
+        receipt["manifest_object_name"] = old_name.rsplit("manifest-", 1)[0] + f"manifest-{digest}.json"
+        storage.objects[("dataset-1", receipt["manifest_object_name"])] = payload
+    elif corruption == "manifest_scope":
+        receipt["manifest_object_name"] = "_fuxi/tabular-structure/v1/wrong/manifest.json"
+    elif corruption == "part_count":
+        receipt["part_count"] = 2
+    else:
+        manifest = json.loads(
+            storage.objects[("dataset-1", receipt["manifest_object_name"])]
+        )
+        part_name = manifest["parts"][0]["object_name"]
+        storage.objects[("dataset-1", part_name)] += b" "
+    repository.inject(
+        _active_generation_record(
+            projection,
+            receipt,
+            document_id="document-historical",
+        )
+    )
+    repository.mark_backfill_pending("tenant-owner", "dataset-1")
+
+    with pytest.raises(service_module.StructureSnapshotChanged):
+        service_module.TabularStructureService.backfill_active_generation_indexes(
+            storage,
+            repository=repository,
+        )
 
 
 def test_backfill_has_no_default_batch_count_truncation(service_module):
