@@ -1,4 +1,5 @@
 from pathlib import Path
+import inspect
 import re
 import sys
 import types
@@ -36,6 +37,8 @@ sys.modules.setdefault("playhouse", playhouse)
 sys.modules.setdefault("playhouse.migrate", playhouse_migrate)
 
 from tools.scripts.mysql_migration import (
+    MIGRATION_STAGES,
+    TabularStructureDiscoveryIndexStage,
     TenantModelContractPreflightStage,
     TenantModelIdMigrationStage,
     TenantModelInstanceStage,
@@ -226,9 +229,12 @@ def test_service_migration_preflights_references_before_any_write_stage():
     source = (ROOT / "tools" / "scripts" / "run_migrations.sh").read_text(
         encoding="utf-8"
     )
-    stage_list = re.search(r"--stages\s+([^\s\\]+)", source)
-    assert stage_list is not None
-    stages = stage_list.group(1).split(",")
+    stage_lists = re.findall(r"--stages\s+([^\s\\]+)", source)
+    stages = next(
+        value.split(",")
+        for value in stage_lists
+        if "tenant_model_contract_preflight" in value
+    )
     assert stages == [
         "tenant_model_contract_preflight",
         "tenant_model_provider",
@@ -236,3 +242,75 @@ def test_service_migration_preflights_references_before_any_write_stage():
         "tenant_model",
         "tenant_model_id_migration",
     ]
+
+
+def test_tabular_structure_discovery_index_uses_a_formal_mysql_ngram_migration_stage():
+    assert "tabular_structure_discovery_index" in MIGRATION_STAGES
+    stage = MIGRATION_STAGES["tabular_structure_discovery_index"]
+    source = inspect.getsource(stage)
+
+    assert "tabular_structure_dataset_index_state" in source
+    assert "tabular_structure_table_index" in source
+    assert "WITH PARSER ngram" in source
+    assert "FULLTEXT" in source
+    assert "SELECT VERSION()" in source
+    assert "discovery_unsupported_backend" in source
+
+
+def test_discovery_migration_recovers_when_active_generations_lack_index_state():
+    class Cursor:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Database:
+        config = type("Config", (), {"database": "anonymous"})()
+
+        def table_exists(self, table):
+            return True
+
+        def execute_sql(self, sql, params=None):
+            if sql == "SELECT VERSION()":
+                return Cursor(("8.0.40",))
+            if "INFORMATION_SCHEMA.PLUGINS" in sql:
+                return Cursor(("ACTIVE",))
+            if "information_schema.statistics" in sql:
+                return Cursor((1,))
+            if "LEFT JOIN tabular_structure_dataset_index_state" in sql:
+                return Cursor((1,))
+            raise AssertionError(sql)
+
+    stage = TabularStructureDiscoveryIndexStage(Database(), dry_run=True)
+
+    assert stage.check() is True
+
+
+def test_tabular_structure_discovery_migration_runs_before_backend_start():
+    source = (ROOT / "tools" / "scripts" / "run_migrations.sh").read_text(
+        encoding="utf-8",
+    )
+
+    assert "--stages tabular_structure_discovery_index" in source
+    assert "--backfill-tabular-structure-index" in source
+    ddl = source.index("--stages tabular_structure_discovery_index")
+    backfill = source.index("--backfill-tabular-structure-index")
+    model_contract = source.index("--stages tenant_model_contract_preflight")
+    version_marker = source.index("--mark-database-version")
+    assert ddl < backfill < model_contract < version_marker
+    assert source.count('--config "$CONFIG"') >= 3
+
+
+def test_tabular_structure_backfill_cli_uses_the_service_layer_not_sql_reconstruction():
+    source = (ROOT / "tools" / "scripts" / "mysql_migration.py").read_text(
+        encoding="utf-8",
+    )
+
+    assert '"--backfill-tabular-structure-index"' in source
+    assert "backfill_active_generation_indexes" in source
+    assert "STORAGE_IMPL" in source
+    assert 'DB.lock("tabular_structure_discovery_index_backfill"' in source
+    assert "load_tabular_structure_projection" not in inspect.getsource(
+        MIGRATION_STAGES["tabular_structure_discovery_index"]
+    )

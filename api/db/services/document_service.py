@@ -819,6 +819,15 @@ class DocumentService(CommonService):
             )
             if doc is None:
                 return False
+            from api.db.services.tabular_structure_service import PeeweeTabularStructureRepository
+
+            knowledgebase = Knowledgebase.get_or_none(Knowledgebase.id == doc.kb_id)
+            if knowledgebase is not None:
+                PeeweeTabularStructureRepository.deactivate_document_index(
+                    knowledgebase.tenant_id,
+                    doc.kb_id,
+                    doc.id,
+                )
             deleted = cls.model.delete().where(cls.model.id == doc_id).execute()
             if not deleted:
                 return False

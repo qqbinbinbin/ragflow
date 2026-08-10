@@ -69,6 +69,23 @@ from rag.prompts.generator import cross_languages, keyword_extraction
 DOC_STOP_PARSING_INVALID_STATE_MESSAGE = "Can't stop parsing document that has not started or already completed"
 DOC_STOP_PARSING_INVALID_STATE_ERROR_CODE = "DOC_STOP_PARSING_INVALID_STATE"
 TABULAR_STRUCTURE_PAGE_SIZE_MAX = 3000
+TABULAR_DISCOVERY_PAGE_SIZE_MAX = 100
+_TABULAR_DISCOVERY_REQUEST_FIELDS = {
+    "contract_version",
+    "query",
+    "cursor",
+    "candidate_page_size",
+    "candidate_max_pages",
+    "max_candidate_evidence_bytes",
+    "max_candidate_evidence_tokens",
+    "deadline_ms",
+}
+_TABULAR_DISCOVERY_FORBIDDEN_SCOPE_FIELDS = {
+    "tenant_id",
+    "provider_scope",
+    "dataset_id",
+    "authorized_scope",
+}
 
 
 def _get_tabular_structure_service():
@@ -137,6 +154,87 @@ def _authorized_structure_owner(tenant_id, dataset_id, document_id):
     if not found or not getattr(dataset, "tenant_id", None):
         return None, get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
     return dataset.tenant_id, None
+
+
+def _authorized_structure_dataset_owner(tenant_id, dataset_id):
+    if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
+        return None, get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    found, dataset = KnowledgebaseService.get_by_id(dataset_id)
+    if not found or not getattr(dataset, "tenant_id", None):
+        return None, get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    return dataset.tenant_id, None
+
+
+@manager.route("/datasets/<dataset_id>/tabular-structure/discovery/v1", methods=["POST"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def discover_tabular_structure_tables(tenant_id, dataset_id):
+    owner_tenant_id, error = _authorized_structure_dataset_owner(tenant_id, dataset_id)
+    if error:
+        return error
+    req = await get_request_json()
+    if not isinstance(req, dict):
+        return construct_json_result(
+            code=RetCode.ARGUMENT_ERROR,
+            message="invalid tabular discovery request",
+        )
+    forged_scope = set(req) & _TABULAR_DISCOVERY_FORBIDDEN_SCOPE_FIELDS
+    if forged_scope:
+        return construct_json_result(
+            code=RetCode.ARGUMENT_ERROR,
+            message=f"unexpected discovery request field: {sorted(forged_scope)[0]}",
+        )
+    unexpected = set(req) - _TABULAR_DISCOVERY_REQUEST_FIELDS
+    if unexpected:
+        return construct_json_result(
+            code=RetCode.ARGUMENT_ERROR,
+            message=f"unexpected discovery request field: {sorted(unexpected)[0]}",
+        )
+    if req.get("contract_version") != "discovery/v1":
+        return construct_json_result(
+            code=RetCode.ARGUMENT_ERROR,
+            message="unsupported tabular discovery contract",
+        )
+    query = req.get("query")
+    cursor = req.get("cursor")
+    if not isinstance(query, str) or not query.strip() or (
+        cursor is not None and not isinstance(cursor, str)
+    ):
+        return construct_json_result(
+            code=RetCode.ARGUMENT_ERROR,
+            message="invalid tabular discovery query or cursor",
+        )
+    try:
+        data = _get_tabular_structure_service().discover_active_tables(
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            query=query,
+            cursor=cursor,
+            page_size=req.get("candidate_page_size", 20),
+            max_pages=req.get("candidate_max_pages", 2),
+            max_evidence_bytes=req.get("max_candidate_evidence_bytes", 64_000),
+            max_evidence_tokens=req.get("max_candidate_evidence_tokens", 16_000),
+            deadline_ms=req.get("deadline_ms", 2_000),
+        )
+        return get_result(data=data)
+    except Exception as error:
+        from rag.app.tabular_structure import StructureSnapshotChanged
+
+        if isinstance(error, StructureSnapshotChanged):
+            reason = "structure_discovery_incomplete"
+            return construct_json_result(
+                code=RetCode.DATA_ERROR,
+                message=reason,
+                data={"reason": reason, "incomplete_cause": "revision_drift"},
+            )
+        if settings.DATABASE_TYPE.lower() != "mysql":
+            reason = "discovery_unsupported_backend"
+            return construct_json_result(
+                code=RetCode.DATA_ERROR,
+                message=reason,
+                data={"reason": reason},
+            )
+        return _tabular_structure_error_response(error)
 
 
 @manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/active-generation", methods=["GET"])  # noqa: F821

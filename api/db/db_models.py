@@ -945,6 +945,49 @@ class TabularStructureGeneration(DataBaseModel):
         )
 
 
+class TabularStructureDatasetIndexState(DataBaseModel):
+    tenant_id = CharField(max_length=32, null=False)
+    kb_id = CharField(max_length=256, null=False)
+    index_revision = BigIntegerField(null=False, default=0)
+    backfill_status = CharField(max_length=16, null=False, default="pending")
+    backfill_cursor = CharField(max_length=32, null=True)
+    index_schema_version = CharField(max_length=64, null=False)
+
+    class Meta:
+        db_table = "tabular_structure_dataset_index_state"
+        primary_key = CompositeKey("tenant_id", "kb_id")
+
+
+class TabularStructureTableIndex(DataBaseModel):
+    tenant_id = CharField(max_length=32, null=False)
+    kb_id = CharField(max_length=256, null=False)
+    document_id = CharField(max_length=32, null=False)
+    producer_generation_ref = CharField(max_length=36, null=False)
+    table_ref = CharField(max_length=96, null=False)
+    table_ordinal = IntegerField(null=False)
+    search_text = LongTextField(null=False, default="")
+    identity_hash = CharField(max_length=64, null=False)
+    index_revision = BigIntegerField(null=False)
+    active = BooleanField(null=False, default=True)
+    projection_status = CharField(max_length=16, null=False, default="safe")
+    unsafe_reason = CharField(max_length=64, null=True)
+
+    class Meta:
+        db_table = "tabular_structure_table_index"
+        primary_key = CompositeKey(
+            "tenant_id",
+            "kb_id",
+            "document_id",
+            "producer_generation_ref",
+            "table_ref",
+        )
+        indexes = (
+            (("tenant_id", "kb_id", "active", "index_revision"), False),
+            (("document_id",), False),
+            (("identity_hash",), False),
+        )
+
+
 class File(DataBaseModel):
     id = CharField(max_length=32, primary_key=True)
     parent_id = CharField(max_length=32, null=False, help_text="parent folder id", index=True)

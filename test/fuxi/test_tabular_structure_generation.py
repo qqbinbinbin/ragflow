@@ -2,8 +2,10 @@ import ast
 import copy
 import hashlib
 import importlib.util
+import inspect
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from test.fuxi.test_tabular_structure_projection import _workbook_bytes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVICE_MODULE_PATH = REPO_ROOT / "api" / "db" / "services" / "tabular_structure_service.py"
+CHUNK_API_PATH = REPO_ROOT / "api" / "apps" / "restful_apis" / "chunk_api.py"
 
 
 class _Storage:
@@ -58,7 +61,13 @@ def generation_repository(service_module):
     return repository
 
 
-def _stored_generation(table_parser, *, generation_ref=None, rows_per_part=2):
+def _stored_generation(
+    table_parser,
+    *,
+    generation_ref=None,
+    rows_per_part=2,
+    document_id="document-1",
+):
     projection = tabular_structure.build_tabular_structure_projection(
         "anonymous.xlsx",
         _workbook_bytes(include_note=False),
@@ -69,7 +78,7 @@ def _stored_generation(table_parser, *, generation_ref=None, rows_per_part=2):
     receipt = tabular_structure.store_tabular_structure_projection(
         storage,
         bucket="dataset-1",
-        document_id="document-1",
+        document_id=document_id,
         projection=projection,
         rows_per_part=rows_per_part,
         tenant_id="tenant-owner",
@@ -113,6 +122,724 @@ def test_generation_model_has_document_scoped_control_fields():
     manifest_call = assignments["manifest_object_name"]
     assert isinstance(manifest_call, ast.Call)
     assert not any(keyword.arg == "index" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in manifest_call.keywords)
+
+
+def test_structure_discovery_models_separate_dataset_state_from_table_recall_index():
+    model_path = REPO_ROOT / "api" / "db" / "db_models.py"
+    module = ast.parse(model_path.read_text(encoding="utf-8"))
+    models = {
+        node.name: node
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+    }
+
+    state = models["TabularStructureDatasetIndexState"]
+    table_index = models["TabularStructureTableIndex"]
+    state_fields = {
+        target.id
+        for statement in state.body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    table_fields = {
+        target.id
+        for statement in table_index.body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+
+    assert {
+        "tenant_id",
+        "kb_id",
+        "index_revision",
+        "backfill_status",
+        "backfill_cursor",
+        "index_schema_version",
+    } <= state_fields
+    assert {
+        "tenant_id",
+        "kb_id",
+        "document_id",
+        "producer_generation_ref",
+        "table_ref",
+        "table_ordinal",
+        "search_text",
+        "identity_hash",
+        "index_revision",
+        "active",
+        "projection_status",
+        "unsafe_reason",
+    } <= table_fields
+
+
+def test_peewee_activation_switches_generation_index_and_dataset_revision_in_one_transaction():
+    module = ast.parse(SERVICE_MODULE_PATH.read_text(encoding="utf-8"))
+    repository = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "PeeweeTabularStructureRepository")
+    activate = next(node for node in repository.body if isinstance(node, ast.FunctionDef) and node.name == "activate")
+    source = ast.get_source_segment(SERVICE_MODULE_PATH.read_text(encoding="utf-8"), activate)
+
+    assert source is not None
+    assert "with DB.atomic()" in source
+    assert ".for_update()" in source
+    assert "index_projection" in source
+    assert "index_revision" in source
+    assert "TabularStructureDatasetIndexState" in source
+    assert "TabularStructureTableIndex" in source
+
+
+def test_peewee_repository_exposes_the_runtime_model_bundle(service_module, monkeypatch):
+    class AnonymousModel:
+        pass
+
+    model_module = type(sys)("api.db.db_models")
+    for name in (
+        "DB",
+        "Document",
+        "Knowledgebase",
+        "TabularStructureGeneration",
+        "TabularStructureDatasetIndexState",
+        "TabularStructureTableIndex",
+    ):
+        model = type(name, (AnonymousModel,), {})
+        setattr(model_module, name, model)
+    monkeypatch.setitem(sys.modules, "api.db.db_models", model_module)
+
+    models = service_module.PeeweeTabularStructureRepository._models()
+
+    assert isinstance(models, tuple)
+    assert len(models) == 6
+    assert [model.__name__ for model in models[1:]] == [
+        "Document",
+        "Knowledgebase",
+        "TabularStructureGeneration",
+        "TabularStructureDatasetIndexState",
+        "TabularStructureTableIndex",
+    ]
+
+
+def test_peewee_discovery_sql_binds_every_placeholder_in_statement_order(
+    service_module,
+    monkeypatch,
+):
+    class Field:
+        def __eq__(self, other):
+            return ("eq", other)
+
+    class State:
+        tenant_id = Field()
+        kb_id = Field()
+        index_revision = 9
+        backfill_status = "complete"
+
+        @classmethod
+        def get_or_none(cls, *conditions):
+            return cls()
+
+    class Cursor:
+        def __init__(self, row=None, rows=None):
+            self.row = row
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class Database:
+        def __init__(self):
+            self.calls = []
+
+        def atomic(self):
+            class Atomic:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return False
+
+            return Atomic()
+
+        def execute_sql(self, sql, params):
+            self.calls.append((sql, params))
+            assert sql.count("%s") == len(params)
+            if sql.startswith("SELECT 1"):
+                return Cursor(row=None)
+            return Cursor(
+                rows=[
+                    (
+                        "document-a",
+                        "generation-a",
+                        "table-a",
+                        1,
+                        "b" * 64,
+                        500_000,
+                    )
+                ]
+            )
+
+    database = Database()
+    repository = service_module.PeeweeTabularStructureRepository()
+    monkeypatch.setattr(
+        repository,
+        "_models",
+        lambda: (database, object, object, object, State, object),
+    )
+
+    result = repository.discover_active_tables(
+        "tenant-a",
+        "dataset-a",
+        "anonymous register",
+        ("0000000050000000", "a" * 64),
+        3,
+    )
+
+    sql, params = database.calls[1]
+    assert params == (
+        "anonymous register",
+        "tenant-a",
+        "dataset-a",
+        "anonymous register",
+        "anonymous register",
+        50_000_000,
+        "anonymous register",
+        50_000_000,
+        "a" * 64,
+        3,
+    )
+    assert "INNER JOIN document" in sql
+    assert "g.status = 'active'" in sql
+    assert result["records"][0]["score_encoded"] == "0000000000500000"
+
+
+def test_peewee_discovery_binds_revision_and_rows_inside_one_transaction_snapshot(
+    service_module,
+    monkeypatch,
+):
+    class Field:
+        def __eq__(self, other):
+            return ("eq", other)
+
+    class Database:
+        def __init__(self):
+            self.in_transaction = False
+            self.sql_calls = 0
+
+        def atomic(self):
+            database = self
+
+            class Atomic:
+                def __enter__(self):
+                    assert database.in_transaction is False
+                    database.in_transaction = True
+
+                def __exit__(self, exc_type, exc, traceback):
+                    database.in_transaction = False
+
+            return Atomic()
+
+        def execute_sql(self, sql, params):
+            assert self.in_transaction is True
+            self.sql_calls += 1
+
+            class Cursor:
+                def fetchone(self):
+                    return None
+
+                def fetchall(self):
+                    return []
+
+            return Cursor()
+
+    database = Database()
+
+    class State:
+        tenant_id = Field()
+        kb_id = Field()
+        index_revision = 9
+        backfill_status = "complete"
+        reads = 0
+
+        @classmethod
+        def get_or_none(cls, *conditions):
+            assert database.in_transaction is True
+            cls.reads += 1
+            return cls()
+
+    repository = service_module.PeeweeTabularStructureRepository()
+    monkeypatch.setattr(
+        repository,
+        "_models",
+        lambda: (database, object, object, object, State, object),
+    )
+
+    result = repository.discover_active_tables(
+        "tenant-a",
+        "dataset-a",
+        "anonymous register",
+        None,
+        1,
+    )
+
+    assert result["index_revision"] == 9
+    assert State.reads == 2
+    assert database.sql_calls == 2
+    assert database.in_transaction is False
+
+
+def test_peewee_discovery_discards_rows_when_revision_changes_during_read(
+    service_module,
+    monkeypatch,
+):
+    class Field:
+        def __eq__(self, other):
+            return ("eq", other)
+
+    class State:
+        tenant_id = Field()
+        kb_id = Field()
+        backfill_status = "complete"
+        reads = 0
+
+        @classmethod
+        def get_or_none(cls, *conditions):
+            cls.reads += 1
+            instance = cls()
+            instance.index_revision = 9 if cls.reads == 1 else 10
+            return instance
+
+    class Database:
+        def atomic(self):
+            class Atomic:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return False
+
+            return Atomic()
+
+        def execute_sql(self, sql, params):
+            class Cursor:
+                def fetchone(self):
+                    return None
+
+                def fetchall(self):
+                    return [
+                        (
+                            "document-a",
+                            "generation-a",
+                            "table-a",
+                            1,
+                            "a" * 64,
+                            500_000,
+                        )
+                    ]
+
+            return Cursor()
+
+    repository = service_module.PeeweeTabularStructureRepository()
+    monkeypatch.setattr(
+        repository,
+        "_models",
+        lambda: (Database(), object, object, object, State, object),
+    )
+
+    result = repository.discover_active_tables(
+        "tenant-a",
+        "dataset-a",
+        "anonymous register",
+        None,
+        1,
+    )
+
+    assert result == {
+        "index_revision": 10,
+        "backfill_status": "complete",
+        "unsafe": False,
+        "records": [],
+    }
+
+
+def test_discovery_query_normalization_preserves_semantic_punctuation(service_module):
+    normalized = service_module.normalize_tabular_discovery_query(
+        "  DVP＆R　2D／3D  ABC－123．4  "
+    )
+
+    assert normalized == "dvp&r 2d/3d abc-123.4"
+
+
+def test_table_index_discovery_is_generation_bound_and_content_free(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation(table_parser)
+    service_module.TabularStructureService.register_shadow_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        receipt=receipt,
+        repository=generation_repository,
+    )
+    service_module.TabularStructureService.activate_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        expected_active_generation_ref=None,
+        repository=generation_repository,
+    )
+    generation_repository.complete_backfill("tenant-owner", "dataset-1")
+    indexed, unsafe_reason = service_module._table_search_text(
+        projection["tables"][0],
+    )
+    assert unsafe_reason is None
+    query = indexed.split()[0]
+
+    result = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query=query,
+        cursor=None,
+        page_size=10,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1_000,
+        repository=generation_repository,
+    )
+
+    assert result["incomplete"] is False
+    assert result["index_revision"] >= 1
+    assert result["query_digest"] == hashlib.sha256(query.encode()).hexdigest()
+    assert len(result["seeds"]) == 1
+    assert result["seeds"][0] == {
+        "document_id": "document-1",
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "table_ref": projection["tables"][0]["table_ref"],
+        "table_ordinal": 1,
+        "retrieval_rule": "bm25-ngram/v1",
+        "score_encoded": result["seeds"][0]["score_encoded"],
+        "identity_hash": result["seeds"][0]["identity_hash"],
+    }
+    assert "search_text" not in result["seeds"][0]
+
+
+def test_discovery_revision_is_dataset_scoped(service_module):
+    repository = service_module.InMemoryTabularStructureRepository()
+    repository.add_authorization_scope("tenant-owner", "dataset-a", "document-a")
+    repository.add_authorization_scope("tenant-owner", "dataset-b", "document-b")
+    repository.seed_discovery_index(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-a",
+        document_id="document-a",
+        producer_generation_ref="generation-a",
+        table_ref="table-a",
+        search_text="anonymous register",
+    )
+    repository.seed_discovery_index(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-a",
+        document_id="document-a",
+        producer_generation_ref="generation-a",
+        table_ref="table-a-2",
+        search_text="anonymous register secondary",
+        table_ordinal=2,
+    )
+    repository.seed_discovery_index(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-b",
+        document_id="document-b",
+        producer_generation_ref="generation-b",
+        table_ref="table-b",
+        search_text="anonymous register",
+    )
+    repository.complete_backfill("tenant-owner", "dataset-a")
+    repository.complete_backfill("tenant-owner", "dataset-b")
+
+    first = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-a",
+        query="anonymous register",
+        cursor=None,
+        page_size=1,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1_000,
+        repository=repository,
+    )
+    repository.advance_dataset_revision("tenant-owner", "dataset-b")
+    assert first["next_cursor"] is not None
+    replay = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-a",
+        query="anonymous register",
+        cursor=first["next_cursor"],
+        page_size=1,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1_000,
+        repository=repository,
+    )
+
+    assert replay["incomplete"] is False
+    assert replay["index_revision"] == first["index_revision"]
+
+
+def test_discovery_cursor_binds_page_ordinal_and_marks_results_beyond_window(
+    service_module,
+):
+    repository = service_module.InMemoryTabularStructureRepository()
+    for ordinal in range(1, 4):
+        repository.add_authorization_scope(
+            "tenant-owner", "dataset-1", f"document-{ordinal}"
+        )
+        repository.seed_discovery_index(
+            tenant_id="tenant-owner",
+            dataset_id="dataset-1",
+            document_id=f"document-{ordinal}",
+            producer_generation_ref=f"generation-{ordinal}",
+            table_ref=f"table-{ordinal}",
+            search_text="anonymous register",
+            table_ordinal=ordinal,
+        )
+    repository.complete_backfill("tenant-owner", "dataset-1")
+
+    first = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query="anonymous register",
+        cursor=None,
+        page_size=1,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1_000,
+        repository=repository,
+    )
+    second = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query="anonymous register",
+        cursor=first["next_cursor"],
+        page_size=1,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1_000,
+        repository=repository,
+    )
+
+    assert first["has_more_in_window"] is True
+    assert first["has_more_beyond_window"] is False
+    assert second["has_more_in_window"] is False
+    assert second["has_more_beyond_window"] is True
+    assert second["next_cursor"] is None
+
+    with pytest.raises(ValueError, match="cursor"):
+        service_module.TabularStructureService.discover_active_tables(
+            tenant_id="tenant-owner",
+            dataset_id="dataset-1",
+            query="anonymous register",
+            cursor=first["next_cursor"],
+            page_size=1,
+            max_pages=3,
+            max_evidence_bytes=10_000,
+            max_evidence_tokens=10_000,
+            deadline_ms=1_000,
+            repository=repository,
+        )
+
+
+def test_discovery_fails_closed_for_pending_or_unsafe_dataset(service_module):
+    repository = service_module.InMemoryTabularStructureRepository()
+    repository.add_authorization_scope("tenant-owner", "dataset-1", "document-1")
+    repository.seed_discovery_index(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref="generation-a",
+        table_ref="table-a",
+        search_text="",
+        projection_status="unsafe",
+        unsafe_reason="unsafe_control_character",
+    )
+
+    pending = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query="anonymous register",
+        cursor=None,
+        page_size=10,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1_000,
+        repository=repository,
+    )
+    assert pending["incomplete_cause"] == "backfill_pending"
+
+    repository.complete_backfill("tenant-owner", "dataset-1")
+    unsafe = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query="anonymous register",
+        cursor=None,
+        page_size=10,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1_000,
+        repository=repository,
+    )
+    assert unsafe["incomplete"] is True
+    assert unsafe["incomplete_cause"] == "projection_unsafe"
+    assert unsafe["seeds"] == []
+    assert "unsafe_control_character" not in json.dumps(unsafe)
+
+
+def test_discovery_deadline_discards_late_repository_results(service_module):
+    class SlowRepository(service_module.InMemoryTabularStructureRepository):
+        def discover_active_tables(self, *args, **kwargs):
+            time.sleep(0.01)
+            return super().discover_active_tables(*args, **kwargs)
+
+    repository = SlowRepository()
+    repository.add_authorization_scope("tenant-owner", "dataset-1", "document-1")
+    repository.seed_discovery_index(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref="generation-a",
+        table_ref="table-a",
+        search_text="anonymous register",
+    )
+    repository.complete_backfill("tenant-owner", "dataset-1")
+
+    result = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        query="anonymous register",
+        cursor=None,
+        page_size=10,
+        max_pages=2,
+        max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000,
+        deadline_ms=1,
+        repository=repository,
+    )
+
+    assert result["incomplete"] is True
+    assert result["incomplete_cause"] == "deadline"
+    assert result["seeds"] == []
+
+
+def test_backfill_is_resumable_and_rechecks_active_before_committing(
+    service_module,
+    table_parser,
+):
+    repository = service_module.InMemoryTabularStructureRepository()
+    storage = _Storage()
+    projections = []
+    for ordinal in range(1, 3):
+        document_id = f"document-{ordinal}"
+        repository.add_authorization_scope("tenant-owner", "dataset-1", document_id)
+        document_storage, projection, receipt = _stored_generation(
+            table_parser,
+            generation_ref=str(uuid.uuid4()),
+            document_id=document_id,
+        )
+        storage.objects.update(document_storage.objects)
+        record = {
+            "producer_generation_ref": projection["producer_generation_ref"],
+            "tenant_id": "tenant-owner",
+            "kb_id": "dataset-1",
+            "document_id": document_id,
+            "projection_version": projection["version"],
+            "producer_schema_version": projection["producer_schema_version"],
+            "manifest_object_name": receipt["manifest_object_name"],
+            "manifest_sha256": receipt["manifest_sha256"],
+            "source_sha256": projection["source_sha256"],
+            "row_count": len(projection["rows"]),
+            "part_count": receipt["part_count"],
+            "status": "active",
+            "safe_error_code": None,
+            "activated_at": None,
+            "retained_at": None,
+        }
+        repository.inject(record)
+        projections.append((record, projection))
+    repository.mark_backfill_pending("tenant-owner", "dataset-1")
+
+    first = service_module.TabularStructureService.backfill_active_generation_indexes(
+        storage,
+        batch_size=1,
+        max_batches=1,
+        repository=repository,
+    )
+    assert first == {"batches": 1, "documents": 1, "datasets_completed": 0}
+    assert repository.backfill_state("tenant-owner", "dataset-1") == {
+        "status": "pending",
+        "cursor": "document-1",
+    }
+
+    second = service_module.TabularStructureService.backfill_active_generation_indexes(
+        storage,
+        batch_size=1,
+        max_batches=1,
+        repository=repository,
+    )
+    assert second == {"batches": 1, "documents": 1, "datasets_completed": 1}
+    assert repository.backfill_state("tenant-owner", "dataset-1") == {
+        "status": "complete",
+        "cursor": None,
+    }
+
+    repository.mark_backfill_pending("tenant-owner", "dataset-1")
+    repository.set_backfill_commit_hook(
+        lambda: repository.remove_active_generation(
+            projections[0][0]["producer_generation_ref"]
+        )
+    )
+    with pytest.raises(service_module.StructureSnapshotChanged):
+        service_module.TabularStructureService.backfill_active_generation_indexes(
+            storage,
+            batch_size=1,
+            max_batches=1,
+            repository=repository,
+        )
+    assert repository.backfill_state("tenant-owner", "dataset-1") == {
+        "status": "pending",
+        "cursor": None,
+    }
+
+
+def test_backfill_has_no_default_batch_count_truncation(service_module):
+    signature = inspect.signature(
+        service_module.TabularStructureService.backfill_active_generation_indexes
+    )
+
+    assert signature.parameters["max_batches"].default is None
+
+
+def test_discovery_api_is_post_only_and_rejects_client_authorization_scope():
+    source = CHUNK_API_PATH.read_text(encoding="utf-8")
+
+    assert (
+        '@manager.route("/datasets/<dataset_id>/tabular-structure/discovery/v1", methods=["POST"])'
+        in source
+    )
+    assert "tenant_id" in source
+    assert "provider_scope" in source
+    assert "unexpected discovery request field" in source
+    assert "discover_active_tables" in source
 
 
 def test_peewee_repository_locks_document_and_switches_inside_one_transaction():

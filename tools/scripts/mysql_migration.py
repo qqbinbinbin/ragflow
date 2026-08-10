@@ -2310,8 +2310,128 @@ class TenantModelIdMigrationStage(MigrationStage):
         return None
 
 
+class TabularStructureDiscoveryIndexStage(MigrationStage):
+    """Create the MySQL 8 ngram index used only for bounded table recall."""
+
+    name = "tabular_structure_discovery_index"
+    description = "Create the versioned tabular structure discovery index"
+    source_tables = ["tabular_structure_generation", "document", "knowledgebase"]
+    target_tables = [
+        "tabular_structure_dataset_index_state",
+        "tabular_structure_table_index",
+    ]
+
+    def _require_supported_backend(self):
+        version_row = self.db.execute_sql("SELECT VERSION()").fetchone()
+        version = str(version_row[0] if version_row else "")
+        if not version.startswith("8.0."):
+            raise RuntimeError("discovery_unsupported_backend: MySQL 8.0 is required")
+        plugin = self.db.execute_sql(
+            "SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS "
+            "WHERE PLUGIN_NAME = 'ngram' AND PLUGIN_TYPE = 'FTPARSER'"
+        ).fetchone()
+        if not plugin or str(plugin[0]).upper() != "ACTIVE":
+            raise RuntimeError("discovery_unsupported_backend: MySQL ngram parser is unavailable")
+
+    def _fulltext_index_exists(self) -> bool:
+        if not self.db.table_exists("tabular_structure_table_index"):
+            return False
+        cursor = self.db.execute_sql(
+            "SELECT COUNT(*) FROM information_schema.statistics "
+            "WHERE table_schema = %s AND table_name = %s "
+            "AND index_name = %s AND index_type = 'FULLTEXT'",
+            (
+                self.db.config.database,
+                "tabular_structure_table_index",
+                "ft_tabular_structure_search_text",
+            ),
+        )
+        return cursor.fetchone()[0] > 0
+
+    def check(self) -> bool:
+        self._require_supported_backend()
+        missing_schema = (
+            any(not self.db.table_exists(table) for table in self.target_tables)
+            or not self._fulltext_index_exists()
+        )
+        if missing_schema:
+            return True
+        missing_state = self.db.execute_sql(
+            "SELECT 1 FROM tabular_structure_generation g "
+            "LEFT JOIN tabular_structure_dataset_index_state s "
+            "ON s.tenant_id = g.tenant_id AND s.kb_id = g.kb_id "
+            "WHERE g.status = 'active' AND s.tenant_id IS NULL LIMIT 1"
+        ).fetchone()
+        return missing_state is not None
+
+    def execute(self) -> tuple[int, list]:
+        self._require_supported_backend()
+        if self.dry_run:
+            return 0, self.target_tables
+        self.create_target_table()
+        if not self._fulltext_index_exists():
+            self.db.execute_sql(
+                "ALTER TABLE tabular_structure_table_index "
+                "ADD FULLTEXT INDEX ft_tabular_structure_search_text (search_text) WITH PARSER ngram"
+            )
+        self.db.execute_sql(
+            "INSERT INTO tabular_structure_dataset_index_state "
+            "(tenant_id, kb_id, index_revision, backfill_status, backfill_cursor, index_schema_version) "
+            "SELECT DISTINCT tenant_id, kb_id, 0, 'pending', NULL, 'tabular-structure-index/v1' "
+            "FROM tabular_structure_generation WHERE status = 'active' "
+            "ON DUPLICATE KEY UPDATE index_schema_version = VALUES(index_schema_version)"
+        )
+        return 0, self.target_tables
+
+    def create_target_table(self):
+        self.db.execute_sql(
+            """
+            CREATE TABLE IF NOT EXISTS tabular_structure_dataset_index_state (
+                tenant_id VARCHAR(32) NOT NULL,
+                kb_id VARCHAR(256) NOT NULL,
+                index_revision BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                backfill_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                backfill_cursor VARCHAR(32) NULL,
+                index_schema_version VARCHAR(64) NOT NULL,
+                create_time BIGINT NULL,
+                create_date DATETIME NULL,
+                update_time BIGINT NULL,
+                update_date DATETIME NULL,
+                PRIMARY KEY (tenant_id, kb_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        self.db.execute_sql(
+            """
+            CREATE TABLE IF NOT EXISTS tabular_structure_table_index (
+                tenant_id VARCHAR(32) NOT NULL,
+                kb_id VARCHAR(256) NOT NULL,
+                document_id VARCHAR(32) NOT NULL,
+                producer_generation_ref VARCHAR(36) NOT NULL,
+                table_ref VARCHAR(96) NOT NULL,
+                table_ordinal INT UNSIGNED NOT NULL,
+                search_text TEXT NOT NULL,
+                identity_hash CHAR(64) NOT NULL,
+                index_revision BIGINT UNSIGNED NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                projection_status VARCHAR(16) NOT NULL DEFAULT 'safe',
+                unsafe_reason VARCHAR(64) NULL,
+                create_time BIGINT NULL,
+                create_date DATETIME NULL,
+                update_time BIGINT NULL,
+                update_date DATETIME NULL,
+                PRIMARY KEY (tenant_id, kb_id, document_id, producer_generation_ref, table_ref),
+                INDEX idx_tabular_structure_dataset_revision (tenant_id, kb_id, active, index_revision),
+                INDEX idx_tabular_structure_document (document_id),
+                INDEX idx_tabular_structure_identity (identity_hash)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+
+
 # Registry of available migration stages
 MIGRATION_STAGES = {
+    "tabular_structure_discovery_index": TabularStructureDiscoveryIndexStage,
     "tenant_model_contract_preflight": TenantModelContractPreflightStage,
     "tenant_model_provider": TenantModelProviderStage,
     "tenant_model_instance": TenantModelInstanceStage,
@@ -2518,12 +2638,43 @@ Examples:
     parser.add_argument("--mark-database-version-on-success", action="store_true", help="When used with --stages and --execute, write --database-version after all stages succeed")
     parser.add_argument("--execute", "-e", action="store_true", default=False, help="Execute full migration: create tables and migrate data")
     parser.add_argument("--create-table-only", action="store_true", default=False, help="Only create target tables, skip data migration")
+    parser.add_argument(
+        "--backfill-tabular-structure-index",
+        action="store_true",
+        help="Backfill the active tabular structure discovery index from immutable manifests",
+    )
 
     args = parser.parse_args()
 
     # List stages and exit
     if args.list_stages:
         list_available_stages()
+        return
+
+    if args.backfill_tabular_structure_index:
+        if args.execute or args.create_table_only or args.stages:
+            logger.error(
+                "--backfill-tabular-structure-index cannot be combined with migration stages or table modes"
+            )
+            sys.exit(1)
+        from common import config_utils
+
+        if args.config:
+            loaded = config_utils.load_yaml_conf(args.config)
+            if not isinstance(loaded, dict):
+                raise RuntimeError("tabular discovery backfill config is invalid")
+            config_utils.CONFIGS = loaded
+        from common import settings
+
+        settings.init_settings()
+        from api.db.db_models import DB
+        from api.db.services.tabular_structure_service import TabularStructureService
+
+        with DB.lock("tabular_structure_discovery_index_backfill", -1):
+            stats = TabularStructureService.backfill_active_generation_indexes(
+                settings.STORAGE_IMPL,
+            )
+        logger.info("Tabular structure discovery index backfill completed: %s", stats)
         return
 
     # Load configuration: command line args take precedence over config file

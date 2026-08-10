@@ -19,6 +19,19 @@ CONFIG="${1:-conf/service_conf.yaml}"
 
 echo "Running model provider table migrations..."
 
+# Structure discovery is a MySQL 8-only capability. The stage performs the
+# backend/ngram preflight before creating any discovery state.
+"$PY" tools/scripts/mysql_migration.py \
+    --stages tabular_structure_discovery_index \
+    --config "$CONFIG" \
+    --execute
+
+# Read immutable Active manifests outside the DDL transaction, then commit each
+# index batch only after rechecking the generation CAS in the service layer.
+"$PY" tools/scripts/mysql_migration.py \
+    --backfill-tabular-structure-index \
+    --config "$CONFIG"
+
 # The stages are idempotent and validate the complete legacy-to-current model
 # mapping on every startup. A version marker must never hide partial schema/data.
 "$PY" tools/scripts/mysql_migration.py \
