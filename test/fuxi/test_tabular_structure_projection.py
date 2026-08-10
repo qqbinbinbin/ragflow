@@ -38,8 +38,8 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v15"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v7"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v16"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v8"
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -490,7 +490,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v7"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v8"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
@@ -3530,7 +3530,7 @@ def test_intermediate_title_belongs_to_the_following_structured_table(table_pars
     ] == [2, 2]
 
 
-def test_sparse_source_backed_record_slots_are_counted_from_the_stable_key_axis(
+def test_numeric_key_only_slots_are_preserved_but_not_counted_as_business_records(
     table_parser,
 ):
     workbook = Workbook()
@@ -3559,14 +3559,108 @@ def test_sparse_source_backed_record_slots_are_counted_from_the_stable_key_axis(
         if table["enumeration_status"] == "supported_complete"
     ]
     assert len(complete) == 1
-    assert complete[0]["source_total_count"] == 4
+    assert complete[0]["source_total_count"] == 1
     rows = [
         row
         for row in projection["rows"]
         if row["table_ref_kwd"] == complete[0]["table_ref"]
     ]
     assert [row["row_ordinal_int"] for row in rows] == [3, 4, 5, 6]
-    assert all(row["row_role_kwd"] == "data" for row in rows)
+    assert [row["row_role_kwd"] for row in rows] == [
+        "data",
+        "note",
+        "note",
+        "note",
+    ]
+    assert [row["data_row_index_int"] for row in rows] == [1, None, None, None]
+    assert all(row["source_total_count_int"] == 1 for row in rows)
+
+
+def test_numeric_key_only_slot_between_filled_rows_is_not_a_business_record(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Item", "Status"])
+    sheet.append([1, "I-1", "Open"])
+    sheet.append([2, None, None])
+    sheet.append([3, "I-3", "Closed"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert [row["row_role_kwd"] for row in projection["rows"]] == [
+        "data",
+        "note",
+        "data",
+    ]
+    assert [row["data_row_index_int"] for row in projection["rows"]] == [
+        1,
+        None,
+        2,
+    ]
+
+
+def test_single_numeric_key_only_slot_is_not_a_business_record(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Item", "Status"])
+    sheet.append([1, "I-1", "Open"])
+    sheet.append([2, "I-2", "Closed"])
+    sheet.append([3, None, None])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 2
+    assert [row["row_role_kwd"] for row in projection["rows"]] == [
+        "data",
+        "data",
+        "note",
+    ]
+
+
+def test_sparse_row_with_any_non_key_field_remains_a_business_record(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Item", "Status"])
+    sheet.append([1, "I-1", "Open"])
+    sheet.append([2, "I-2", None])
+    sheet.append([3, "I-3", "Closed"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 3
+    assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
+
+
+def test_single_column_numeric_records_are_not_treated_as_key_only_slots(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Reading"])
+    sheet.append([10])
+    sheet.append([20])
+    sheet.append([30])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 3
+    assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
 
 
 def test_header_only_axis_ignores_a_nonadjacent_sidecar_column(table_parser):

@@ -33,8 +33,8 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v15"
-ENUMERATION_RULE_VERSION = "enumeration-rules/v7"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v16"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v8"
 _CURRENT_PROJECTION_CONTRACT = (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_VERSION,
@@ -48,6 +48,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v12", "enumeration-rules/v4"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v13", "enumeration-rules/v5"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v14", "enumeration-rules/v6"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v15", "enumeration-rules/v7"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -502,6 +503,25 @@ def _record_key_axis_proven(
         return False
     deltas = [right - left for left, right in zip(values, values[1:])]
     return bool(deltas) and (all(delta > 0 for delta in deltas) or all(delta < 0 for delta in deltas))
+
+
+def _record_key_only_slots(
+    rows: list[tuple[int, list[object], bool]],
+    row_offsets: list[tuple[int, ...]],
+    required_offsets: set[int],
+) -> tuple[int, ...]:
+    """Identify multi-field template slots that contain only a numeric key."""
+
+    if len(required_offsets) != 1 or not _record_key_axis_proven(rows, required_offsets):
+        return ()
+    key_offset = next(iter(required_offsets))
+    if not any(any(offset != key_offset for offset in offsets) for offsets in row_offsets):
+        return ()
+    return tuple(
+        row[0]
+        for row, offsets in zip(rows, row_offsets)
+        if set(offsets) == {key_offset}
+    )
 
 
 def _is_repeated_header_row(headers: list[str], values: list[object]) -> bool:
@@ -1677,6 +1697,20 @@ def _record_axis_evidence(
         if len({headers[offset] for offset in common_offsets}) < min(2, len(common_offsets)):
             return None
 
+        record_key_axis_proven = _record_key_axis_proven(rows, common_offsets)
+        key_only_slots = (
+            _record_key_only_slots(rows, row_offsets, common_offsets)
+            if len(headers) > 1
+            else ()
+        )
+        key_only_slot_set = set(key_only_slots)
+        record_row_ordinals = tuple(
+            row_ordinal
+            for row_ordinal in row_ordinals
+            if row_ordinal not in key_only_slot_set
+        )
+        if not record_row_ordinals:
+            return None
         single_axis = (
             len(rows) == 1
             and len(headers) >= 2
@@ -1686,16 +1720,18 @@ def _record_axis_evidence(
         if len(rows) < 2 and not single_axis:
             return None
         return {
-            "record_row_ordinals": tuple(row_ordinals),
+            "record_row_ordinals": record_row_ordinals,
             "row_ordinals": tuple(row[0] for row in body_rows),
-            "note_row_ordinals": tuple(row[0] for row in note_rows),
+            "note_row_ordinals": tuple(
+                sorted({row[0] for row in note_rows} | key_only_slot_set)
+            ),
             "unknown_row_ordinals": tuple(row[0] for row in unknown_rows),
             "record_axis_contiguous": record_axis_contiguous,
             "row_offsets": tuple(row_offsets),
             "required_offsets": tuple(sorted(common_offsets)),
             "optional_offsets": tuple(sorted(occupied_offsets - common_offsets)),
             "occupied_offsets": tuple(sorted(occupied_offsets)),
-            "record_key_axis_proven": _record_key_axis_proven(rows, common_offsets),
+            "record_key_axis_proven": record_key_axis_proven,
             "single_record_axis_proven": single_axis,
         }
 
