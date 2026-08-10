@@ -164,6 +164,7 @@ async def get_active_tabular_structure_generation(tenant_id, dataset_id, documen
             key: (manifest[key] if key in manifest else generation[key])
             for key in (
                 "producer_generation_ref",
+                "source_sha256",
                 "projection_version",
                 "producer_schema_version",
                 "structure_algorithm_version",

@@ -968,6 +968,7 @@ class TestDocRoutesUnit:
             "code": 0,
             "data": {
                 "producer_generation_ref": "generation-1",
+                "source_sha256": "a" * 64,
                 "projection_version": "tabular-structure-projection/v2",
                 "producer_schema_version": "table-producer/v4",
                 "structure_algorithm_version": "region-producer/v7",
@@ -1067,6 +1068,7 @@ class TestDocRoutesUnit:
                 return {
                     "status": "active",
                     "producer_generation_ref": kwargs["producer_generation_ref"],
+                    "source_sha256": "b" * 64,
                     "row_count": 3,
                 }
 
@@ -1076,6 +1078,7 @@ class TestDocRoutesUnit:
                 return {
                     "status": "active",
                     "producer_generation_ref": kwargs["retained_generation_ref"],
+                    "source_sha256": "a" * 64,
                     "row_count": 3,
                 }
 
@@ -1098,6 +1101,7 @@ class TestDocRoutesUnit:
         assert activated["data"] == {
             "status": "active",
             "producer_generation_ref": "generation-2",
+            "source_sha256": "b" * 64,
             "row_count": 3,
         }
         assert calls[-1][2] == {
@@ -1142,6 +1146,7 @@ class TestDocRoutesUnit:
         assert restored["data"] == {
             "status": "active",
             "producer_generation_ref": "generation-1",
+            "source_sha256": "a" * 64,
             "row_count": 3,
         }
         assert calls[-1][2] == {
@@ -1183,6 +1188,7 @@ class TestDocRoutesUnit:
                 return {
                     "status": "shadow",
                     "producer_generation_ref": kwargs["producer_generation_ref"],
+                    "source_sha256": "b" * 64,
                     "row_count": 3,
                     "projection_version": "tabular-structure-projection/v2",
                     "producer_schema_version": "table-producer/v4",
@@ -1204,6 +1210,7 @@ class TestDocRoutesUnit:
         assert result["data"] == {
             "status": "shadow",
             "producer_generation_ref": "generation-2",
+            "source_sha256": "b" * 64,
             "row_count": 3,
             "projection_version": "tabular-structure-projection/v2",
             "producer_schema_version": "table-producer/v4",
