@@ -42,6 +42,7 @@ from peewee import (
     IntegerField,
     Metadata,
     Model,
+    SQL,
     TextField,
 )
 from playhouse.migrate import MySQLMigrator, PostgresqlMigrator, migrate
@@ -963,7 +964,18 @@ class TabularStructureTableIndex(DataBaseModel):
     kb_id = CharField(max_length=256, null=False)
     document_id = CharField(max_length=32, null=False)
     producer_generation_ref = CharField(max_length=36, null=False)
-    table_ref = CharField(max_length=96, null=False)
+    table_ref = CharField(
+        max_length=512,
+        null=False,
+        constraints=(
+            [SQL("CHARACTER SET ascii")]
+            if settings.DATABASE_TYPE.lower() == "mysql"
+            else None
+        ),
+        collation=(
+            "ascii_bin" if settings.DATABASE_TYPE.lower() == "mysql" else None
+        ),
+    )
     table_ordinal = IntegerField(null=False)
     search_text = LongTextField(null=False, default="")
     identity_hash = CharField(max_length=64, null=False)

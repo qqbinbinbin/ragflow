@@ -46,7 +46,7 @@ from rag.app.tabular_structure import (
 _GENERATION_STATUSES = {"shadow", "active", "retained", "failed"}
 TABULAR_DISCOVERY_CONTRACT_VERSION = "discovery/v1"
 TABULAR_DISCOVERY_NORMALIZATION_VERSION = "normalization/v1"
-TABULAR_DISCOVERY_INDEX_SCHEMA_VERSION = "tabular-structure-index/v1"
+TABULAR_DISCOVERY_INDEX_SCHEMA_VERSION = "tabular-structure-index/v2"
 TABULAR_DISCOVERY_RETRIEVAL_RULE = "bm25-ngram/v1"
 _INDEX_TEXT_MAX_CHARS = 16_384
 _UNSAFE_INDEX_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202e]")

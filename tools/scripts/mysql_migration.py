@@ -149,6 +149,9 @@ class MigrationDatabase:
     def execute_sql(self, sql: str, params=None):
         return self.db.execute_sql(sql, params)
 
+    def atomic(self):
+        return self.db.atomic()
+
     def table_exists(self, table_name: str) -> bool:
         cursor = self.execute_sql("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s AND table_name = %s", (self.config.database, table_name))
         return cursor.fetchone()[0] > 0
@@ -2313,6 +2316,8 @@ class TenantModelIdMigrationStage(MigrationStage):
 class TabularStructureDiscoveryIndexStage(MigrationStage):
     """Create the MySQL 8 ngram index used only for bounded table recall."""
 
+    INDEX_SCHEMA_VERSION = "tabular-structure-index/v2"
+    TABLE_REF_COLUMN_CONTRACT = ("varchar", 512, "ascii", "ascii_bin")
     name = "tabular_structure_discovery_index"
     description = "Create the versioned tabular structure discovery index"
     source_tables = ["tabular_structure_generation", "document", "knowledgebase"]
@@ -2348,6 +2353,53 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
         )
         return cursor.fetchone()[0] > 0
 
+    def _table_ref_column_contract(self) -> tuple[str, int, str, str] | None:
+        if not self.db.table_exists("tabular_structure_table_index"):
+            return None
+        row = self.db.execute_sql(
+            "SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, CHARACTER_SET_NAME, COLLATION_NAME "
+            "FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            (
+                self.db.config.database,
+                "tabular_structure_table_index",
+                "table_ref",
+            ),
+        ).fetchone()
+        if not row:
+            return None
+        return (
+            str(row[0]).lower(),
+            int(row[1]),
+            str(row[2]).lower(),
+            str(row[3]).lower(),
+        )
+
+    def _has_stale_index_schema_state(self) -> bool:
+        if not self.db.table_exists("tabular_structure_dataset_index_state"):
+            return False
+        return (
+            self.db.execute_sql(
+                "SELECT 1 FROM tabular_structure_dataset_index_state "
+                "WHERE index_schema_version <> %s LIMIT 1",
+                (self.INDEX_SCHEMA_VERSION,),
+            ).fetchone()
+            is not None
+        )
+
+    def _active_generation_lacks_index_state(self) -> bool:
+        if not self.db.table_exists("tabular_structure_dataset_index_state"):
+            return True
+        return (
+            self.db.execute_sql(
+                "SELECT 1 FROM tabular_structure_generation g "
+                "LEFT JOIN tabular_structure_dataset_index_state s "
+                "ON s.tenant_id = g.tenant_id AND s.kb_id = g.kb_id "
+                "WHERE g.status = 'active' AND s.tenant_id IS NULL LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
     def check(self) -> bool:
         self._require_supported_backend()
         missing_schema = (
@@ -2356,19 +2408,48 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
         )
         if missing_schema:
             return True
-        missing_state = self.db.execute_sql(
-            "SELECT 1 FROM tabular_structure_generation g "
-            "LEFT JOIN tabular_structure_dataset_index_state s "
-            "ON s.tenant_id = g.tenant_id AND s.kb_id = g.kb_id "
-            "WHERE g.status = 'active' AND s.tenant_id IS NULL LIMIT 1"
-        ).fetchone()
-        return missing_state is not None
+        if self._table_ref_column_contract() != self.TABLE_REF_COLUMN_CONTRACT:
+            return True
+        if self._has_stale_index_schema_state():
+            return True
+        return self._active_generation_lacks_index_state()
 
     def execute(self) -> tuple[int, list]:
         self._require_supported_backend()
         if self.dry_run:
             return 0, self.target_tables
+        index_table_existed = self.db.table_exists("tabular_structure_table_index")
+        state_table_existed = self.db.table_exists(
+            "tabular_structure_dataset_index_state"
+        )
+        table_ref_contract = self._table_ref_column_contract()
+        stale_index_state = self._has_stale_index_schema_state()
+        requires_reprojection = (index_table_existed or state_table_existed) and (
+            not index_table_existed
+            or not state_table_existed
+            or table_ref_contract != self.TABLE_REF_COLUMN_CONTRACT
+            or stale_index_state
+        )
         self.create_target_table()
+        if (
+            index_table_existed
+            and table_ref_contract != self.TABLE_REF_COLUMN_CONTRACT
+        ):
+            self.db.execute_sql(
+                "ALTER TABLE tabular_structure_table_index MODIFY table_ref VARCHAR(512) "
+                "CHARACTER SET ascii COLLATE ascii_bin NOT NULL"
+            )
+        if requires_reprojection:
+            # A truncated opaque identity cannot be reconstructed from the index.
+            # Mark every affected dataset pending so startup backfill reads Active manifests.
+            with self.db.atomic():
+                self.db.execute_sql("DELETE FROM tabular_structure_table_index")
+                self.db.execute_sql(
+                    "UPDATE tabular_structure_dataset_index_state "
+                    "SET index_revision = index_revision + 1, "
+                    "backfill_status = 'pending', backfill_cursor = NULL, "
+                    "index_schema_version = 'tabular-structure-index/v2'"
+                )
         if not self._fulltext_index_exists():
             self.db.execute_sql(
                 "ALTER TABLE tabular_structure_table_index "
@@ -2377,7 +2458,7 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
         self.db.execute_sql(
             "INSERT INTO tabular_structure_dataset_index_state "
             "(tenant_id, kb_id, index_revision, backfill_status, backfill_cursor, index_schema_version) "
-            "SELECT DISTINCT tenant_id, kb_id, 0, 'pending', NULL, 'tabular-structure-index/v1' "
+            "SELECT DISTINCT tenant_id, kb_id, 0, 'pending', NULL, 'tabular-structure-index/v2' "
             "FROM tabular_structure_generation WHERE status = 'active' "
             "ON DUPLICATE KEY UPDATE index_schema_version = VALUES(index_schema_version)"
         )
@@ -2408,7 +2489,7 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
                 kb_id VARCHAR(256) NOT NULL,
                 document_id VARCHAR(32) NOT NULL,
                 producer_generation_ref VARCHAR(36) NOT NULL,
-                table_ref VARCHAR(96) NOT NULL,
+                table_ref VARCHAR(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
                 table_ordinal INT UNSIGNED NOT NULL,
                 search_text TEXT NOT NULL,
                 identity_hash CHAR(64) NOT NULL,

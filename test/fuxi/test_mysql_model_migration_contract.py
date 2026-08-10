@@ -1,8 +1,11 @@
 from pathlib import Path
+from contextlib import nullcontext
 import inspect
+import os
 import re
 import sys
 import types
+import uuid
 
 import pytest
 
@@ -42,6 +45,8 @@ except ImportError:
 
 from tools.scripts.mysql_migration import (
     MIGRATION_STAGES,
+    MigrationConfig,
+    MigrationDatabase,
     TabularStructureDiscoveryIndexStage,
     TenantModelContractPreflightStage,
     TenantModelIdMigrationStage,
@@ -261,6 +266,293 @@ def test_tabular_structure_discovery_index_uses_a_formal_mysql_ngram_migration_s
     assert "discovery_unsupported_backend" in source
 
 
+def test_tabular_structure_discovery_index_preserves_full_opaque_table_identity():
+    source = inspect.getsource(TabularStructureDiscoveryIndexStage)
+    model_source = (ROOT / "api" / "db" / "db_models.py").read_text(
+        encoding="utf-8"
+    )
+    service_source = (
+        ROOT / "api" / "db" / "services" / "tabular_structure_service.py"
+    ).read_text(encoding="utf-8")
+
+    assert "table_ref VARCHAR(512) CHARACTER SET ascii COLLATE ascii_bin" in source
+    assert "table_ref VARCHAR(96)" not in source
+    assert "tabular-structure-index/v2" in source
+    assert re.search(
+        r"table_ref\s*=\s*CharField\(\s*max_length=512",
+        model_source,
+    )
+    assert 'SQL("CHARACTER SET ascii")' in model_source
+    assert '"ascii_bin" if settings.DATABASE_TYPE.lower() == "mysql"' in model_source
+    assert 'settings.DATABASE_TYPE.lower() == "mysql"' in model_source
+    assert (
+        'TABULAR_DISCOVERY_INDEX_SCHEMA_VERSION = "tabular-structure-index/v2"'
+        in service_source
+    )
+
+
+def test_discovery_migration_repairs_truncated_table_identity_before_backfill():
+    class Cursor:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Database:
+        config = type("Config", (), {"database": "anonymous"})()
+
+        def __init__(self):
+            self.statements = []
+
+        def table_exists(self, table):
+            return True
+
+        def atomic(self):
+            return nullcontext()
+
+        def execute_sql(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.statements.append((normalized, params))
+            if sql == "SELECT VERSION()":
+                return Cursor(("8.0.40",))
+            if "INFORMATION_SCHEMA.PLUGINS" in sql:
+                return Cursor(("ACTIVE",))
+            if "information_schema.columns" in sql:
+                return Cursor(("varchar", 96, "utf8mb4", "utf8mb4_0900_ai_ci"))
+            if "information_schema.statistics" in sql:
+                return Cursor((1,))
+            if "LEFT JOIN tabular_structure_dataset_index_state" in sql:
+                return Cursor(None)
+            return Cursor(None)
+
+    database = Database()
+    stage = TabularStructureDiscoveryIndexStage(database, dry_run=False)
+
+    assert stage.check() is True
+    stage.execute()
+
+    executed = "\n".join(sql for sql, _params in database.statements)
+    assert "with self.db.atomic()" in inspect.getsource(
+        TabularStructureDiscoveryIndexStage.execute
+    )
+    assert (
+        "ALTER TABLE tabular_structure_table_index MODIFY table_ref VARCHAR(512) "
+        "CHARACTER SET ascii COLLATE ascii_bin NOT NULL" in executed
+    )
+    assert "DELETE FROM tabular_structure_table_index" in executed
+    assert "backfill_status = 'pending'" in executed
+    assert "backfill_cursor = NULL" in executed
+    assert "index_schema_version = 'tabular-structure-index/v2'" in executed
+
+
+def test_discovery_migration_is_idempotent_after_identity_contract_repair():
+    class Cursor:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Database:
+        config = type("Config", (), {"database": "anonymous"})()
+
+        def table_exists(self, table):
+            return True
+
+        def execute_sql(self, sql, params=None):
+            if sql == "SELECT VERSION()":
+                return Cursor(("8.0.40",))
+            if "INFORMATION_SCHEMA.PLUGINS" in sql:
+                return Cursor(("ACTIVE",))
+            if "information_schema.columns" in sql:
+                return Cursor(("varchar", 512, "ascii", "ascii_bin"))
+            if "information_schema.statistics" in sql:
+                return Cursor((1,))
+            if "index_schema_version <>" in sql:
+                return Cursor(None)
+            if "LEFT JOIN tabular_structure_dataset_index_state" in sql:
+                return Cursor(None)
+            raise AssertionError(sql)
+
+    stage = TabularStructureDiscoveryIndexStage(Database(), dry_run=False)
+
+    assert stage.check() is False
+
+
+def test_discovery_migration_reprojects_when_index_table_is_missing_but_state_exists():
+    class Cursor:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Database:
+        config = type("Config", (), {"database": "anonymous"})()
+
+        def __init__(self):
+            self.statements = []
+
+        def table_exists(self, table):
+            return table != "tabular_structure_table_index"
+
+        def atomic(self):
+            return nullcontext()
+
+        def execute_sql(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.statements.append((normalized, params))
+            if sql == "SELECT VERSION()":
+                return Cursor(("8.0.40",))
+            if "INFORMATION_SCHEMA.PLUGINS" in sql:
+                return Cursor(("ACTIVE",))
+            if "index_schema_version <>" in sql:
+                return Cursor(None)
+            if "LEFT JOIN tabular_structure_dataset_index_state" in sql:
+                return Cursor(None)
+            if "information_schema.statistics" in sql:
+                return Cursor((0,))
+            return Cursor(None)
+
+    database = Database()
+    stage = TabularStructureDiscoveryIndexStage(database, dry_run=False)
+
+    stage.execute()
+
+    executed = "\n".join(sql for sql, _params in database.statements)
+    assert "DELETE FROM tabular_structure_table_index" in executed
+    assert "backfill_status = 'pending'" in executed
+
+
+@pytest.mark.skipif(
+    not os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_PASSWORD"),
+    reason="explicit isolated MySQL integration target is not configured",
+)
+def test_discovery_identity_migration_round_trips_opaque_refs_in_mysql():
+    database_name = f"adr039_table_ref_{uuid.uuid4().hex}"
+    password = os.environ["FUXI_ADR039_MYSQL_INTEGRATION_PASSWORD"]
+    host = os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_HOST", "mysql")
+    port = int(os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_PORT", "3306"))
+    user = os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_USER", "root")
+    admin = MigrationDatabase(
+        MigrationConfig(host=host, port=port, user=user, password=password, database="mysql")
+    )
+    target = None
+    admin.connect()
+    try:
+        admin.execute_sql(f"CREATE DATABASE `{database_name}` CHARACTER SET utf8mb4")
+        target = MigrationDatabase(
+            MigrationConfig(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database_name,
+            )
+        )
+        target.connect()
+        target.execute_sql(
+            "CREATE TABLE tabular_structure_generation ("
+            "producer_generation_ref VARCHAR(36) PRIMARY KEY, tenant_id VARCHAR(32) NOT NULL, "
+            "kb_id VARCHAR(256) NOT NULL, document_id VARCHAR(32) NOT NULL, "
+            "status VARCHAR(16) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        )
+        target.execute_sql(
+            "CREATE TABLE tabular_structure_dataset_index_state ("
+            "tenant_id VARCHAR(32) NOT NULL, kb_id VARCHAR(256) NOT NULL, "
+            "index_revision BIGINT UNSIGNED NOT NULL DEFAULT 1, "
+            "backfill_status VARCHAR(16) NOT NULL DEFAULT 'complete', "
+            "backfill_cursor VARCHAR(32) NULL, index_schema_version VARCHAR(64) NOT NULL, "
+            "create_time BIGINT NULL, create_date DATETIME NULL, update_time BIGINT NULL, "
+            "update_date DATETIME NULL, PRIMARY KEY (tenant_id, kb_id)) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        )
+        target.execute_sql(
+            "CREATE TABLE tabular_structure_table_index ("
+            "tenant_id VARCHAR(32) NOT NULL, kb_id VARCHAR(256) NOT NULL, "
+            "document_id VARCHAR(32) NOT NULL, producer_generation_ref VARCHAR(36) NOT NULL, "
+            "table_ref VARCHAR(96) NOT NULL, table_ordinal INT UNSIGNED NOT NULL, "
+            "search_text TEXT NOT NULL, identity_hash CHAR(64) NOT NULL, "
+            "index_revision BIGINT UNSIGNED NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, "
+            "projection_status VARCHAR(16) NOT NULL DEFAULT 'safe', unsafe_reason VARCHAR(64) NULL, "
+            "create_time BIGINT NULL, create_date DATETIME NULL, update_time BIGINT NULL, "
+            "update_date DATETIME NULL, "
+            "PRIMARY KEY (tenant_id, kb_id, document_id, producer_generation_ref, table_ref), "
+            "INDEX idx_tabular_structure_dataset_revision "
+            "(tenant_id, kb_id, active, index_revision), "
+            "INDEX idx_tabular_structure_document (document_id), "
+            "INDEX idx_tabular_structure_identity (identity_hash), "
+            "FULLTEXT INDEX ft_tabular_structure_search_text (search_text) WITH PARSER ngram) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        )
+        target.execute_sql(
+            "INSERT INTO tabular_structure_generation VALUES "
+            "('11111111-1111-1111-1111-111111111111','tenant','dataset','document','active')"
+        )
+        target.execute_sql(
+            "INSERT INTO tabular_structure_dataset_index_state VALUES "
+            "('tenant','dataset',1,'complete',NULL,'tabular-structure-index/v1',NULL,NULL,NULL,NULL)"
+        )
+        target.execute_sql(
+            "INSERT INTO tabular_structure_table_index "
+            "(tenant_id,kb_id,document_id,producer_generation_ref,table_ref,table_ordinal,"
+            "search_text,identity_hash,index_revision) VALUES "
+            "('tenant','dataset','document','11111111-1111-1111-1111-111111111111',"
+            "REPEAT('a',96),1,'anonymous',REPEAT('b',64),1)"
+        )
+
+        stage = TabularStructureDiscoveryIndexStage(target, dry_run=False)
+        assert stage.check() is True
+        stage.execute()
+
+        contract = target.execute_sql(
+            "SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, CHARACTER_SET_NAME, COLLATION_NAME "
+            "FROM information_schema.columns WHERE table_schema=%s "
+            "AND table_name='tabular_structure_table_index' AND column_name='table_ref'",
+            (database_name,),
+        ).fetchone()
+        assert contract == ("varchar", 512, "ascii", "ascii_bin")
+        assert target.execute_sql(
+            "SELECT COUNT(*) FROM tabular_structure_table_index"
+        ).fetchone()[0] == 0
+        assert target.execute_sql(
+            "SELECT index_revision, backfill_status, backfill_cursor, index_schema_version "
+            "FROM tabular_structure_dataset_index_state"
+        ).fetchone() == (2, "pending", None, "tabular-structure-index/v2")
+
+        refs = ["tbl_v2_" + "a" * 64 + "_" + "b" * 64, "x" * 512]
+        for ordinal, table_ref in enumerate(refs, 1):
+            target.execute_sql(
+                "INSERT INTO tabular_structure_table_index "
+                "(tenant_id,kb_id,document_id,producer_generation_ref,table_ref,table_ordinal,"
+                "search_text,identity_hash,index_revision) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    "tenant",
+                    "dataset",
+                    "document",
+                    "11111111-1111-1111-1111-111111111111",
+                    table_ref,
+                    ordinal,
+                    "anonymous",
+                    str(ordinal) * 64,
+                    2,
+                ),
+            )
+        assert [
+            row[0]
+            for row in target.execute_sql(
+                "SELECT table_ref FROM tabular_structure_table_index ORDER BY table_ordinal"
+            ).fetchall()
+        ] == refs
+        assert stage.check() is False
+    finally:
+        if target is not None:
+            target.close()
+        admin.execute_sql(f"DROP DATABASE IF EXISTS `{database_name}`")
+        admin.close()
+
+
 def test_discovery_migration_recovers_when_active_generations_lack_index_state():
     class Cursor:
         def __init__(self, row):
@@ -280,8 +572,12 @@ def test_discovery_migration_recovers_when_active_generations_lack_index_state()
                 return Cursor(("8.0.40",))
             if "INFORMATION_SCHEMA.PLUGINS" in sql:
                 return Cursor(("ACTIVE",))
+            if "information_schema.columns" in sql:
+                return Cursor(("varchar", 512, "ascii", "ascii_bin"))
             if "information_schema.statistics" in sql:
                 return Cursor((1,))
+            if "index_schema_version <>" in sql:
+                return Cursor(None)
             if "LEFT JOIN tabular_structure_dataset_index_state" in sql:
                 return Cursor((1,))
             raise AssertionError(sql)
