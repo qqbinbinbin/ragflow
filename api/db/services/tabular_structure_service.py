@@ -37,13 +37,25 @@ from rag.app.tabular_structure import (
     StructureGenerationConflict,
     StructureSnapshotChanged,
     StructureSnapshotMissing,
+    tabular_structure_projection_prefix,
     load_tabular_structure_projection,
     load_tabular_structure_projection_for_backfill,
+    delete_tabular_structure_projection_manifest,
+    delete_tabular_structure_projection_parts,
+    delete_tabular_structure_projection_prefix,
     page_tabular_structure_rows,
 )
 
 
-_GENERATION_STATUSES = {"shadow", "active", "retained", "failed"}
+_GENERATION_STATUSES = {
+    "writing",
+    "shadow",
+    "active",
+    "retained",
+    "failed",
+    "deleting",
+    "parts_deleted",
+}
 TABULAR_DISCOVERY_CONTRACT_VERSION = "discovery/v1"
 TABULAR_DISCOVERY_NORMALIZATION_VERSION = "normalization/v1"
 TABULAR_DISCOVERY_INDEX_SCHEMA_VERSION = "tabular-structure-index/v2"
@@ -502,6 +514,55 @@ class InMemoryTabularStructureRepository:
             self._records[generation_ref] = deepcopy(record)
             return deepcopy(record)
 
+    def begin_write(self, record: dict[str, Any]) -> dict[str, Any]:
+        _validate_record(record)
+        if record["status"] != "writing":
+            raise ValueError("generation write intent status is invalid")
+        generation_ref = record["producer_generation_ref"]
+        with self._lock:
+            existing = self._records.get(generation_ref)
+            if existing is not None:
+                comparable_fields = {
+                    "producer_generation_ref",
+                    "tenant_id",
+                    "kb_id",
+                    "document_id",
+                    "projection_version",
+                    "producer_schema_version",
+                    "source_sha256",
+                    "row_count",
+                }
+                if any(
+                    existing.get(key) != record.get(key)
+                    for key in comparable_fields
+                ):
+                    raise StructureGenerationConflict(
+                        "generation identity already exists with different metadata"
+                    )
+                return deepcopy(existing)
+            self._records[generation_ref] = deepcopy(record)
+            return deepcopy(record)
+
+    def complete_write(self, record: dict[str, Any]) -> dict[str, Any]:
+        _validate_record(record)
+        if record["status"] != "shadow":
+            raise ValueError("completed generation status is invalid")
+        generation_ref = record["producer_generation_ref"]
+        with self._lock:
+            existing = self._records.get(generation_ref)
+            if existing is None:
+                raise StructureSnapshotMissing(
+                    "generation write intent is missing"
+                )
+            if existing["status"] == "writing":
+                self._records[generation_ref] = deepcopy(record)
+                return deepcopy(record)
+            if existing == record:
+                return deepcopy(existing)
+            raise StructureGenerationConflict(
+                "generation write intent changed before completion"
+            )
+
     def inject(self, record: dict[str, Any]) -> None:
         _validate_record(record)
         self._records[record["producer_generation_ref"]] = deepcopy(record)
@@ -684,16 +745,42 @@ class PeeweeTabularStructureRepository:
         from peewee import IntegrityError
 
         _validate_record(record)
-        DB, _Document, _Knowledgebase, Generation, _IndexState, _TableIndex = self._models()
-        existing = Generation.get_or_none(Generation.producer_generation_ref == record["producer_generation_ref"])
-        if existing:
-            existing_data = existing.to_dict()
-            comparable = {key: existing_data.get(key) for key in record}
-            if comparable != record:
-                raise StructureGenerationConflict("generation identity already exists with different metadata")
-            return existing_data
+        DB, Document, _Knowledgebase, Generation, _IndexState, _TableIndex = self._models()
         try:
             with DB.atomic():
+                document = (
+                    Document.select()
+                    .where(
+                        Document.id == record["document_id"],
+                        Document.kb_id == record["kb_id"],
+                    )
+                    .for_update()
+                    .get_or_none()
+                )
+                if document is None or not self.is_authorized(
+                    record["tenant_id"],
+                    record["kb_id"],
+                    record["document_id"],
+                ):
+                    raise PermissionError("authorization scope rejected")
+                from common.constants import TaskStatus
+
+                if document.run == TaskStatus.CANCEL.value:
+                    raise StructureSnapshotChanged(
+                        "document is canceled for deletion"
+                    )
+                existing = Generation.get_or_none(
+                    Generation.producer_generation_ref
+                    == record["producer_generation_ref"]
+                )
+                if existing:
+                    existing_data = existing.to_dict()
+                    comparable = {key: existing_data.get(key) for key in record}
+                    if comparable != record:
+                        raise StructureGenerationConflict(
+                            "generation identity already exists with different metadata"
+                        )
+                    return existing_data
                 Generation.create(**record)
         except IntegrityError:
             existing = Generation.get_by_id(record["producer_generation_ref"]).to_dict()
@@ -702,6 +789,120 @@ class PeeweeTabularStructureRepository:
                 raise StructureGenerationConflict("generation identity already exists with different metadata")
             return existing
         return Generation.get_by_id(record["producer_generation_ref"]).to_dict()
+
+    def begin_write(self, record: dict[str, Any]) -> dict[str, Any]:
+        _validate_record(record)
+        if record["status"] != "writing":
+            raise ValueError("generation write intent status is invalid")
+        DB, Document, _Knowledgebase, Generation, _IndexState, _TableIndex = self._models()
+        with DB.atomic():
+            document = (
+                Document.select()
+                .where(
+                    Document.id == record["document_id"],
+                    Document.kb_id == record["kb_id"],
+                )
+                .for_update()
+                .get_or_none()
+            )
+            if document is None or not self.is_authorized(
+                record["tenant_id"],
+                record["kb_id"],
+                record["document_id"],
+            ):
+                raise PermissionError("authorization scope rejected")
+            from common.constants import TaskStatus
+
+            if document.run == TaskStatus.CANCEL.value:
+                raise StructureSnapshotChanged(
+                    "document is canceled for deletion"
+                )
+            existing = Generation.get_or_none(
+                Generation.producer_generation_ref
+                == record["producer_generation_ref"]
+            )
+            if existing is not None:
+                existing_data = existing.to_dict()
+                comparable_fields = {
+                    "producer_generation_ref",
+                    "tenant_id",
+                    "kb_id",
+                    "document_id",
+                    "projection_version",
+                    "producer_schema_version",
+                    "source_sha256",
+                    "row_count",
+                }
+                if any(
+                    existing_data.get(key) != record.get(key)
+                    for key in comparable_fields
+                ):
+                    raise StructureGenerationConflict(
+                        "generation identity already exists with different metadata"
+                    )
+                return existing_data
+            Generation.create(**record)
+        return Generation.get_by_id(
+            record["producer_generation_ref"]
+        ).to_dict()
+
+    def complete_write(self, record: dict[str, Any]) -> dict[str, Any]:
+        _validate_record(record)
+        if record["status"] != "shadow":
+            raise ValueError("completed generation status is invalid")
+        DB, Document, _Knowledgebase, Generation, _IndexState, _TableIndex = self._models()
+        with DB.atomic():
+            document = (
+                Document.select()
+                .where(
+                    Document.id == record["document_id"],
+                    Document.kb_id == record["kb_id"],
+                )
+                .for_update()
+                .get_or_none()
+            )
+            if document is None or not self.is_authorized(
+                record["tenant_id"],
+                record["kb_id"],
+                record["document_id"],
+            ):
+                raise PermissionError("authorization scope rejected")
+            from common.constants import TaskStatus
+
+            if document.run == TaskStatus.CANCEL.value:
+                raise StructureSnapshotChanged(
+                    "document is canceled for deletion"
+                )
+            existing = Generation.get_or_none(
+                Generation.producer_generation_ref
+                == record["producer_generation_ref"]
+            )
+            if existing is None:
+                raise StructureSnapshotMissing(
+                    "generation write intent is missing"
+                )
+            existing_data = existing.to_dict()
+            if existing.status == "writing":
+                updated = (
+                    Generation.update(**record)
+                    .where(
+                        Generation.producer_generation_ref
+                        == record["producer_generation_ref"],
+                        Generation.status == "writing",
+                    )
+                    .execute()
+                )
+                if updated != 1:
+                    raise StructureSnapshotChanged(
+                        "generation write intent changed before completion"
+                    )
+            elif any(existing_data.get(key) != value for key, value in record.items()):
+                raise StructureGenerationConflict(
+                    "generation write intent changed before completion"
+                )
+        return Generation.get_by_id(
+            record["producer_generation_ref"]
+        ).to_dict()
 
     def get(self, producer_generation_ref: str) -> dict[str, Any] | None:
         _DB, _Document, _Knowledgebase, Generation, _IndexState, _TableIndex = self._models()
@@ -739,6 +940,12 @@ class PeeweeTabularStructureRepository:
             )
             if document.kb_id != dataset_id or not self.is_authorized(tenant_id, dataset_id, document_id):
                 raise PermissionError("authorization scope rejected")
+            from common.constants import TaskStatus
+
+            if document.run == TaskStatus.CANCEL.value:
+                raise StructureSnapshotChanged(
+                    "document is canceled for deletion"
+                )
             active_rows = list(
                 Generation.select().where(
                     Generation.tenant_id == tenant_id,
@@ -812,6 +1019,12 @@ class PeeweeTabularStructureRepository:
             )
             if document.kb_id != dataset_id or not self.is_authorized(tenant_id, dataset_id, document_id):
                 raise PermissionError("authorization scope rejected")
+            from common.constants import TaskStatus
+
+            if document.run == TaskStatus.CANCEL.value:
+                raise StructureSnapshotChanged(
+                    "document is canceled for deletion"
+                )
             active_rows = list(
                 Generation.select().where(
                     Generation.tenant_id == tenant_id,
@@ -997,6 +1210,205 @@ class PeeweeTabularStructureRepository:
             TableIndex.document_id == document_id,
             TableIndex.active == True,  # noqa: E712
         ).execute()
+
+    @classmethod
+    def purge_document_generations(
+        cls,
+        storage,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        document_id: str,
+    ) -> dict[str, int]:
+        """Delete all structure state and immutable objects for one document.
+
+        Generations first enter a non-readable ``deleting`` state under the
+        document lock. Object deletion then happens outside the DB transaction;
+        failures leave the rows as an exact retry ledger. A final locked
+        transaction removes the rows and advances discovery revision.
+        """
+
+        DB, Document, _Knowledgebase, Generation, DatasetIndexState, TableIndex = cls._models()
+        with DB.atomic():
+            document = (
+                Document.select()
+                .where(Document.id == document_id, Document.kb_id == dataset_id)
+                .for_update()
+                .get_or_none()
+            )
+            if document is None or not cls().is_authorized(tenant_id, dataset_id, document_id):
+                raise PermissionError("authorization scope rejected")
+            generations = list(
+                Generation.select().where(
+                    Generation.tenant_id == tenant_id,
+                    Generation.kb_id == dataset_id,
+                    Generation.document_id == document_id,
+                )
+            )
+            generation_refs = [
+                generation.producer_generation_ref for generation in generations
+            ]
+            if generation_refs:
+                Generation.update(status="deleting").where(
+                    Generation.producer_generation_ref.in_(generation_refs),
+                    Generation.tenant_id == tenant_id,
+                    Generation.kb_id == dataset_id,
+                    Generation.document_id == document_id,
+                    Generation.status != "writing",
+                    Generation.status != "parts_deleted",
+                ).execute()
+                TableIndex.update(active=False).where(
+                    TableIndex.tenant_id == tenant_id,
+                    TableIndex.kb_id == dataset_id,
+                    TableIndex.document_id == document_id,
+                ).execute()
+
+        object_count = 0
+        for generation in generations:
+            interrupted_write = (
+                generation.manifest_object_name
+                == tabular_structure_projection_prefix(
+                    document_id,
+                    generation.producer_generation_ref,
+                )
+                and generation.manifest_sha256 == "0" * 64
+                and generation.part_count == 0
+            )
+            if generation.status != "parts_deleted":
+                if generation.status == "writing":
+                    object_count += delete_tabular_structure_projection_prefix(
+                        storage,
+                        bucket=dataset_id,
+                        document_id=document_id,
+                        producer_generation_ref=(
+                            generation.producer_generation_ref
+                        ),
+                        tenant_id=tenant_id,
+                    )
+                else:
+                    object_count += delete_tabular_structure_projection_parts(
+                        storage,
+                        bucket=dataset_id,
+                        document_id=document_id,
+                        producer_generation_ref=(
+                            generation.producer_generation_ref
+                        ),
+                        manifest_object_name=generation.manifest_object_name,
+                        manifest_sha256=generation.manifest_sha256,
+                        expected_part_count=generation.part_count,
+                        tenant_id=tenant_id,
+                    )
+                with DB.atomic():
+                    document = (
+                        Document.select()
+                        .where(
+                            Document.id == document_id,
+                            Document.kb_id == dataset_id,
+                        )
+                        .for_update()
+                        .get_or_none()
+                    )
+                    if document is None:
+                        raise StructureSnapshotChanged(
+                            "document changed during structure generation deletion"
+                        )
+                    expected_status = (
+                        "writing"
+                        if generation.status == "writing"
+                        else "deleting"
+                    )
+                    updated = Generation.update(status="parts_deleted").where(
+                        Generation.producer_generation_ref
+                        == generation.producer_generation_ref,
+                        Generation.tenant_id == tenant_id,
+                        Generation.kb_id == dataset_id,
+                        Generation.document_id == document_id,
+                        Generation.status == expected_status,
+                    ).execute()
+                    if updated != 1:
+                        raise StructureSnapshotChanged(
+                            "structure generation changed during part deletion"
+                        )
+            if generation.status != "writing" and not interrupted_write:
+                object_count += delete_tabular_structure_projection_manifest(
+                    storage,
+                    bucket=dataset_id,
+                    manifest_object_name=generation.manifest_object_name,
+                    tenant_id=tenant_id,
+                )
+
+        with DB.atomic():
+            document = (
+                Document.select()
+                .where(Document.id == document_id, Document.kb_id == dataset_id)
+                .for_update()
+                .get_or_none()
+            )
+            if document is None:
+                raise StructureSnapshotChanged(
+                    "document changed during structure generation deletion"
+                )
+            remaining_generations = list(
+                Generation.select().where(
+                    Generation.tenant_id == tenant_id,
+                    Generation.kb_id == dataset_id,
+                    Generation.document_id == document_id,
+                )
+            )
+            if {
+                generation.producer_generation_ref
+                for generation in remaining_generations
+            } != set(generation_refs) or any(
+                generation.status != "parts_deleted"
+                for generation in remaining_generations
+            ):
+                raise StructureSnapshotChanged(
+                    "structure generation changed during document deletion"
+                )
+            table_index_count = TableIndex.delete().where(
+                TableIndex.tenant_id == tenant_id,
+                TableIndex.kb_id == dataset_id,
+                TableIndex.document_id == document_id,
+            ).execute()
+            state = (
+                DatasetIndexState.select()
+                .where(
+                    DatasetIndexState.tenant_id == tenant_id,
+                    DatasetIndexState.kb_id == dataset_id,
+                )
+                .for_update()
+                .get_or_none()
+            )
+            index_revision = int(state.index_revision) if state is not None else 0
+            if state is not None and (generations or table_index_count):
+                index_revision += 1
+                updated_state = DatasetIndexState.update(
+                    index_revision=index_revision
+                ).where(
+                    DatasetIndexState.tenant_id == tenant_id,
+                    DatasetIndexState.kb_id == dataset_id,
+                    DatasetIndexState.index_revision == state.index_revision,
+                ).execute()
+                if updated_state != 1:
+                    raise StructureSnapshotChanged(
+                        "structure discovery index changed during document deletion"
+                    )
+            generation_count = Generation.delete().where(
+                Generation.tenant_id == tenant_id,
+                Generation.kb_id == dataset_id,
+                Generation.document_id == document_id,
+                Generation.status == "parts_deleted",
+            ).execute()
+            if generation_count != len(generation_refs):
+                raise StructureSnapshotChanged(
+                    "structure generation changed during document deletion"
+                )
+            return {
+                "generation_count": generation_count,
+                "table_index_count": table_index_count,
+                "object_count": object_count,
+                "index_revision": index_revision,
+            }
 
     def list_pending_backfill_datasets(self, limit: int) -> list[dict[str, Any]]:
         _DB, _Document, _Knowledgebase, _Generation, DatasetIndexState, _TableIndex = self._models()
@@ -1216,6 +1628,85 @@ class TabularStructureService:
             raise PermissionError("authorization scope rejected")
 
     @classmethod
+    def persist_shadow_generation(
+        cls,
+        storage,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        document_id: str,
+        projection: dict[str, Any],
+        projection_store,
+        repository=None,
+    ) -> dict[str, Any]:
+        """Persist a resumable write intent before immutable object mutation."""
+
+        from api.db.db_models import DB, Document
+        from common.constants import TaskStatus
+
+        repository = cls._repository(repository)
+        generation_ref = projection["producer_generation_ref"]
+        write_intent = {
+            "producer_generation_ref": generation_ref,
+            "tenant_id": tenant_id,
+            "kb_id": dataset_id,
+            "document_id": document_id,
+            "projection_version": projection["version"],
+            "producer_schema_version": projection["producer_schema_version"],
+            "manifest_object_name": tabular_structure_projection_prefix(
+                document_id,
+                generation_ref,
+            ),
+            "manifest_sha256": "0" * 64,
+            "source_sha256": projection["source_sha256"],
+            "row_count": len(projection["rows"]),
+            "part_count": 0,
+            "status": "writing",
+            "safe_error_code": None,
+            "activated_at": None,
+            "retained_at": None,
+        }
+        intent = repository.begin_write(write_intent)
+        if intent["status"] == "shadow":
+            return _public_generation(intent)
+        if intent["status"] != "writing":
+            raise StructureGenerationConflict(
+                "generation identity is not writable"
+            )
+        with DB.atomic():
+            document = (
+                Document.select(Document.id, Document.kb_id, Document.run)
+                .where(
+                    Document.id == document_id,
+                    Document.kb_id == dataset_id,
+                )
+                .for_update()
+                .get_or_none()
+            )
+            if document is None:
+                raise PermissionError("authorization scope rejected")
+            cls._authorize(repository, tenant_id, dataset_id, document_id)
+            if document.run == TaskStatus.CANCEL.value:
+                raise StructureSnapshotChanged(
+                    "document is canceled for deletion"
+                )
+            receipt = projection_store(
+                storage,
+                bucket=dataset_id,
+                document_id=document_id,
+                projection=projection,
+                tenant_id=tenant_id,
+            )
+            return cls.register_shadow_generation(
+                storage,
+                tenant_id=tenant_id,
+                dataset_id=dataset_id,
+                document_id=document_id,
+                receipt=receipt,
+                repository=repository,
+            )
+
+    @classmethod
     def register_shadow_generation(
         cls,
         storage,
@@ -1257,6 +1748,9 @@ class TabularStructureService:
             "activated_at": None,
             "retained_at": None,
         }
+        existing = repository.get(record["producer_generation_ref"])
+        if existing is not None and existing["status"] == "writing":
+            return _public_generation(repository.complete_write(record))
         return _public_generation(repository.add_shadow(record))
 
     @classmethod

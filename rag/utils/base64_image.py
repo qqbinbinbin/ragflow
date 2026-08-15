@@ -24,16 +24,14 @@ from PIL import Image
 
 from common.misc_utils import thread_pool_exec
 from rag.utils.lazy_image import open_image_for_processing
+from rag.utils.storage_composite_id import parse_storage_composite_id
 
 test_image_base64 = "iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAA6ElEQVR4nO3QwQ3AIBDAsIP9d25XIC+EZE8QZc18w5l9O+AlZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBWYFZgVmBT+IYAHHLHkdEgAAAABJRU5ErkJggg=="
 test_image = base64.b64decode(test_image_base64)
 
 
-async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str = "imagetemps"):
-    import logging
-    from io import BytesIO
-    from rag.svr.task_executor_limiter import minio_limiter
-
+async def image_to_binary(d: dict) -> bytes | None:
+    """Remove and encode a chunk image without writing external state."""
     if "image" not in d:
         return
     if not d["image"]:
@@ -72,7 +70,13 @@ async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str
                 except Exception:
                     pass
 
-    jpeg_binary = await thread_pool_exec(encode_image)
+    return await thread_pool_exec(encode_image)
+
+
+async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str = "imagetemps"):
+    from rag.svr.task_executor_limiter import minio_limiter
+
+    jpeg_binary = await image_to_binary(d)
     if jpeg_binary is None:
         return
 
@@ -80,24 +84,6 @@ async def image2id(d: dict, storage_put_func: partial, objname: str, bucket: str
         await thread_pool_exec(lambda: storage_put_func(bucket=bucket, fnm=objname, binary=jpeg_binary))
 
     d["img_id"] = f"{bucket}-{objname}"
-
-
-def parse_storage_composite_id(composite_id: str) -> tuple[str, str] | None:
-    """Split a ``{bucket}-{object_key}`` storage ID on the first hyphen only.
-
-    ``image2id`` stores ``img_id`` as ``f"{bucket}-{objname}"``. The object key
-    may contain additional hyphens (e.g. ``page-1.jpg``).
-
-    Args:
-        composite_id: Composite storage identifier.
-
-    Returns:
-        ``(bucket, object_key)`` when valid, otherwise ``None``.
-    """
-    parts = composite_id.split("-", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1] or composite_id.endswith("-"):
-        return None
-    return parts[0], parts[1]
 
 
 def id2image(image_id: str | None, storage_get_func: partial):

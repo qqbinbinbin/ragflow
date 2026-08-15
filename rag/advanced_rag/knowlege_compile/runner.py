@@ -516,6 +516,7 @@ async def run_structure_compile_over_batches(
                     compile_kwd,
                     compilation_template_id=template_id,
                     structure_kind=structure_kind,
+                    owner_document_id=doc_id,
                 )
             except TaskCanceledException:
                 raise

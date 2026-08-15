@@ -1,4 +1,5 @@
 import hashlib
+import ast
 import uuid
 from pathlib import Path
 
@@ -176,8 +177,15 @@ def test_structure_publication_is_shadow_first_and_idempotent():
             pass
 
         @staticmethod
-        def register_shadow_generation(storage, **kwargs):
-            calls.append(("shadow", storage, kwargs["receipt"]))
+        def persist_shadow_generation(storage, **kwargs):
+            receipt = kwargs["projection_store"](
+                storage,
+                bucket=kwargs["dataset_id"],
+                document_id=kwargs["document_id"],
+                projection=kwargs["projection"],
+                tenant_id=kwargs["tenant_id"],
+            )
+            calls.append(("persist", storage, receipt))
             return {"status": "shadow"}
 
         @classmethod
@@ -213,8 +221,25 @@ def test_structure_publication_is_shadow_first_and_idempotent():
 
     assert first["status"] == second["status"] == "active"
     assert [item[0] for item in calls] == [
-        "build", "store", "shadow", "activate",
+        "build", "store", "persist", "activate",
     ]
+
+
+def test_structure_runtime_uses_one_guarded_store_and_registration_entrypoint():
+    runtime_path = Path(runtime.__file__)
+    source = runtime_path.read_text(encoding="utf-8")
+    module = __import__("ast").parse(source)
+    builder = next(
+        node
+        for node in module.body
+        if isinstance(node, __import__("ast").FunctionDef)
+        and node.name == "build_tabular_structure_shadow_from_source"
+    )
+    builder_source = __import__("ast").get_source_segment(source, builder)
+
+    assert builder_source is not None
+    assert "service.persist_shadow_generation(" in builder_source
+    assert "service.register_shadow_generation(" not in builder_source
 
 
 def test_explicit_receipt_publication_binds_identity_and_reaches_the_producer():
@@ -246,8 +271,14 @@ def test_explicit_receipt_publication_binds_identity_and_reaches_the_producer():
             raise Service.StructureSnapshotMissing()
 
         @staticmethod
-        def register_shadow_generation(*_args, **_kwargs):
-            return None
+        def persist_shadow_generation(storage, **kwargs):
+            return kwargs["projection_store"](
+                storage,
+                bucket=kwargs["dataset_id"],
+                document_id=kwargs["document_id"],
+                projection=kwargs["projection"],
+                tenant_id=kwargs["tenant_id"],
+            )
 
         @staticmethod
         def activate_generation(*_args, **_kwargs):
@@ -274,7 +305,11 @@ def test_explicit_receipt_publication_binds_identity_and_reaches_the_producer():
         },
     )
 
-    assert result["producer_generation_ref"] == expected_generation_ref
+    assert result == {
+        "status": "active",
+        "producer_generation_ref": expected_generation_ref,
+        "row_count": 0,
+    }
     assert builder_calls == [
         {
             "producer_generation_ref": expected_generation_ref,
@@ -329,8 +364,14 @@ def test_publication_without_a_receipt_does_not_infer_adr044_identity():
             raise Service.StructureSnapshotMissing()
 
         @staticmethod
-        def register_shadow_generation(*_args, **_kwargs):
-            return None
+        def persist_shadow_generation(storage, **kwargs):
+            return kwargs["projection_store"](
+                storage,
+                bucket=kwargs["dataset_id"],
+                document_id=kwargs["document_id"],
+                projection=kwargs["projection"],
+                tenant_id=kwargs["tenant_id"],
+            )
 
         @staticmethod
         def activate_generation(*_args, **_kwargs):
@@ -356,7 +397,11 @@ def test_publication_without_a_receipt_does_not_infer_adr044_identity():
         },
     )
 
-    assert result["producer_generation_ref"] == generation_ref
+    assert result == {
+        "status": "active",
+        "producer_generation_ref": generation_ref,
+        "row_count": 0,
+    }
     assert builder_calls == [{"producer_generation_ref": generation_ref}]
 
 
@@ -383,7 +428,7 @@ def test_concurrent_shadow_registration_accepts_an_already_active_generation():
             return {"producer_generation_ref": generation_ref}
 
         @staticmethod
-        def register_shadow_generation(*_args, **_kwargs):
+        def persist_shadow_generation(*_args, **_kwargs):
             raise RuntimeError("concurrent generation state changed")
 
     result = publish_tabular_structure_generation(
@@ -416,6 +461,25 @@ def test_legacy_and_refactored_executors_call_the_same_runtime_hook():
         assert '"progress": 1.0' in source
 
 
+def test_task_executor_never_downgrades_to_the_legacy_mutation_path():
+    repo_root = Path(__file__).resolve().parents[2]
+    executor_path = repo_root / "rag" / "svr" / "task_executor.py"
+    source = executor_path.read_text(encoding="utf-8")
+    module = ast.parse(source)
+    handle_task = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle_task"
+    )
+    method_source = ast.get_source_segment(source, handle_task)
+
+    assert method_source is not None
+    assert 'run_mode != "0"' in method_source
+    assert "unsupported TE_RUN_MODE" in method_source
+    assert "do_handle_task(task)" not in method_source
+    assert method_source.count("TaskManager.run_refactored_task(") == 1
+
+
 def test_structure_only_build_publishes_from_source_without_parse_tasks():
     calls = []
     generation_ref = structure_generation_ref("document-1", b"workbook")
@@ -433,8 +497,15 @@ def test_structure_only_build_publishes_from_source_without_parse_tasks():
             raise cls.StructureSnapshotMissing()
 
         @classmethod
-        def register_shadow_generation(cls, storage, **kwargs):
-            calls.append(("register", storage, kwargs))
+        def persist_shadow_generation(cls, storage, **kwargs):
+            calls.append(("persist", storage, kwargs))
+            return kwargs["projection_store"](
+                storage,
+                bucket=kwargs["dataset_id"],
+                document_id=kwargs["document_id"],
+                projection=kwargs["projection"],
+                tenant_id=kwargs["tenant_id"],
+            )
 
         @classmethod
         def activate_generation(cls, storage, **kwargs):
@@ -467,7 +538,7 @@ def test_structure_only_build_publishes_from_source_without_parse_tasks():
         "producer_generation_ref": generation_ref,
         "row_count": 1,
     }
-    assert [call[0] for call in calls] == ["register", "activate"]
+    assert [call[0] for call in calls] == ["persist", "activate"]
     assert calls[-1][2]["expected_active_generation_ref"] is None
 
 
@@ -494,8 +565,14 @@ def test_explicit_receipt_structure_build_passes_the_receipt_to_the_producer():
             raise Service.StructureSnapshotMissing()
 
         @staticmethod
-        def register_shadow_generation(*_args, **_kwargs):
-            return None
+        def persist_shadow_generation(storage, **kwargs):
+            return kwargs["projection_store"](
+                storage,
+                bucket=kwargs["dataset_id"],
+                document_id=kwargs["document_id"],
+                projection=kwargs["projection"],
+                tenant_id=kwargs["tenant_id"],
+            )
 
         @staticmethod
         def activate_generation(*_args, **_kwargs):
@@ -524,7 +601,11 @@ def test_explicit_receipt_structure_build_passes_the_receipt_to_the_producer():
         },
     )
 
-    assert result["producer_generation_ref"] == generation_ref
+    assert result == {
+        "status": "active",
+        "producer_generation_ref": generation_ref,
+        "row_count": 0,
+    }
     assert builder_calls == [
         {
             "producer_generation_ref": generation_ref,

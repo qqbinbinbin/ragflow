@@ -142,6 +142,20 @@ def _versioned_digest(kind: str, *parts: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def tabular_structure_projection_prefix(
+    document_id: str,
+    producer_generation_ref: str,
+) -> str:
+    if not isinstance(document_id, str) or not document_id:
+        raise ValueError("document_id is required")
+    _validate_generation_ref(producer_generation_ref)
+    document_ref = _versioned_digest("tabular-structure-document/v1", document_id)
+    return (
+        f"_fuxi/tabular-structure/v1/{document_ref}/"
+        f"{producer_generation_ref}/"
+    )
+
+
 def _table_ref(
     source_sha256: str,
     sheet_ordinal: int,
@@ -5092,8 +5106,10 @@ def store_tabular_structure_projection(
         raise ValueError("bucket and document_id are required")
     parts = partition_tabular_structure_projection(projection, rows_per_part=rows_per_part)
     generation_ref = projection["producer_generation_ref"]
-    document_ref = _versioned_digest("tabular-structure-document/v1", document_id)
-    prefix = f"_fuxi/tabular-structure/v1/{document_ref}/{generation_ref}"
+    prefix = tabular_structure_projection_prefix(
+        document_id,
+        generation_ref,
+    ).removesuffix("/")
     manifest_parts = []
 
     for part in parts:
@@ -5150,6 +5166,228 @@ def _decode_snapshot_json(payload: bytes, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise StructureSnapshotChanged(f"{label} payload is invalid")
     return value
+
+
+def list_tabular_structure_projection_objects(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    manifest_object_name: str,
+    manifest_sha256: str,
+    expected_part_count: int | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the exact immutable object names recorded by one generation.
+
+    Deletion cannot use a dataset-wide prefix scan because buckets may contain
+    multiple documents and generations. The manifest is the authoritative,
+    digest-bound inventory; only names that pass the document/generation scope
+    checks are returned.
+    """
+
+    if not bucket or not document_id or not manifest_object_name:
+        raise StructureSnapshotMissing("structure snapshot identity is missing")
+    _validate_generation_ref(producer_generation_ref)
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256 or ""):
+        raise StructureSnapshotChanged("manifest digest is invalid")
+    document_ref = _versioned_digest("tabular-structure-document/v1", document_id)
+    expected_prefix = f"_fuxi/tabular-structure/v1/{document_ref}/{producer_generation_ref}/"
+    expected_manifest_name = f"{expected_prefix}manifest-{manifest_sha256}.json"
+    if manifest_object_name != expected_manifest_name:
+        raise StructureSnapshotChanged("manifest document scope changed")
+
+    manifest_payload = _get_immutable_object(storage, bucket, manifest_object_name, tenant_id)
+    if hashlib.sha256(manifest_payload).hexdigest() != manifest_sha256:
+        raise StructureSnapshotChanged("manifest digest changed")
+    manifest = _decode_snapshot_json(manifest_payload, "manifest")
+    expected_manifest_fields = {
+        "version",
+        "producer_schema_version",
+        "producer_generation_ref",
+        "structure_algorithm_version",
+        "enumeration_rule_version",
+        "source_sha256",
+        "row_count",
+        "tables",
+        "parts",
+    }
+    if set(manifest) != expected_manifest_fields:
+        raise StructureSnapshotChanged("manifest schema changed")
+    if manifest["producer_generation_ref"] != producer_generation_ref:
+        raise StructureSnapshotChanged("manifest generation changed")
+    if not isinstance(manifest["parts"], list):
+        raise StructureSnapshotChanged("manifest parts changed")
+    if expected_part_count is not None and (
+        not isinstance(expected_part_count, int)
+        or isinstance(expected_part_count, bool)
+        or expected_part_count < 0
+        or len(manifest["parts"]) != expected_part_count
+    ):
+        raise StructureSnapshotChanged("generation part count changed")
+
+    part_object_names: list[str] = []
+    expected_offset = 0
+    for expected_part_number, part_manifest in enumerate(manifest["parts"], start=1):
+        expected_part_fields = {"part_number", "object_name", "row_offset", "row_count", "sha256"}
+        if not isinstance(part_manifest, dict) or set(part_manifest) != expected_part_fields:
+            raise StructureSnapshotChanged("part manifest changed")
+        part_sha256 = part_manifest["sha256"]
+        if (
+            part_manifest["part_number"] != expected_part_number
+            or part_manifest["row_offset"] != expected_offset
+            or not isinstance(part_manifest["row_count"], int)
+            or isinstance(part_manifest["row_count"], bool)
+            or part_manifest["row_count"] < 0
+            or not isinstance(part_manifest["object_name"], str)
+            or not isinstance(part_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", part_sha256)
+        ):
+            raise StructureSnapshotChanged("part manifest changed")
+        expected_part_name = f"{expected_prefix}part-{expected_part_number:06d}-{part_sha256}.json"
+        if part_manifest["object_name"] != expected_part_name:
+            raise StructureSnapshotChanged("part document scope changed")
+        part_object_names.append(expected_part_name)
+        expected_offset += part_manifest["row_count"]
+
+    if (
+        not isinstance(manifest["row_count"], int)
+        or isinstance(manifest["row_count"], bool)
+        or manifest["row_count"] < 0
+        or expected_offset != manifest["row_count"]
+    ):
+        raise StructureSnapshotChanged("manifest row count changed")
+    return {
+        "manifest_object_name": manifest_object_name,
+        "part_object_names": part_object_names,
+        "object_names": [*part_object_names, manifest_object_name],
+    }
+
+
+def _strict_delete_projection_object(
+    storage,
+    *,
+    bucket: str,
+    object_name: str,
+    tenant_id: str | None,
+) -> None:
+    strict_delete = getattr(storage, "rm_strict", None)
+    if not callable(strict_delete):
+        raise RuntimeError("storage backend does not support strict object deletion")
+    _storage_call(strict_delete, bucket, object_name, tenant_id=tenant_id)
+
+
+def delete_tabular_structure_projection_prefix(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    tenant_id: str | None = None,
+) -> int:
+    """Strictly remove one interrupted generation using its exact scope."""
+
+    strict_delete_prefix = getattr(storage, "rm_prefix_strict", None)
+    if not callable(strict_delete_prefix):
+        raise RuntimeError(
+            "storage backend does not support strict prefix deletion"
+        )
+    prefix = tabular_structure_projection_prefix(
+        document_id,
+        producer_generation_ref,
+    )
+    result = _storage_call(
+        strict_delete_prefix,
+        bucket,
+        prefix,
+        tenant_id=tenant_id,
+    )
+    if not isinstance(result, int) or isinstance(result, bool) or result < 0:
+        raise RuntimeError("strict prefix deletion returned an invalid result")
+    return result
+
+
+def delete_tabular_structure_projection_parts(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    manifest_object_name: str,
+    manifest_sha256: str,
+    expected_part_count: int | None = None,
+    tenant_id: str | None = None,
+) -> int:
+    """Delete the digest-bound parts while retaining the manifest retry ledger."""
+
+    inventory = list_tabular_structure_projection_objects(
+        storage,
+        bucket=bucket,
+        document_id=document_id,
+        producer_generation_ref=producer_generation_ref,
+        manifest_object_name=manifest_object_name,
+        manifest_sha256=manifest_sha256,
+        expected_part_count=expected_part_count,
+        tenant_id=tenant_id,
+    )
+    for object_name in inventory["part_object_names"]:
+        _strict_delete_projection_object(
+            storage,
+            bucket=bucket,
+            object_name=object_name,
+            tenant_id=tenant_id,
+        )
+    return len(inventory["part_object_names"])
+
+
+def delete_tabular_structure_projection_manifest(
+    storage,
+    *,
+    bucket: str,
+    manifest_object_name: str,
+    tenant_id: str | None = None,
+) -> int:
+    """Idempotently delete the manifest after parts deletion is durable."""
+
+    _strict_delete_projection_object(
+        storage,
+        bucket=bucket,
+        object_name=manifest_object_name,
+        tenant_id=tenant_id,
+    )
+    return 1
+
+
+def delete_tabular_structure_projection_objects(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    manifest_object_name: str,
+    manifest_sha256: str,
+    expected_part_count: int | None = None,
+    tenant_id: str | None = None,
+) -> int:
+    """Delete one exact generation projection, parts before its manifest."""
+
+    deleted = delete_tabular_structure_projection_parts(
+        storage,
+        bucket=bucket,
+        document_id=document_id,
+        producer_generation_ref=producer_generation_ref,
+        manifest_object_name=manifest_object_name,
+        manifest_sha256=manifest_sha256,
+        expected_part_count=expected_part_count,
+        tenant_id=tenant_id,
+    )
+    return deleted + delete_tabular_structure_projection_manifest(
+        storage,
+        bucket=bucket,
+        manifest_object_name=manifest_object_name,
+        tenant_id=tenant_id,
+    )
 
 
 def _load_tabular_structure_projection_for_contracts(

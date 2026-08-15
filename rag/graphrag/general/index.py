@@ -45,6 +45,9 @@ from rag.graphrag.phase_markers import (
 )
 from rag.graphrag.utils import (
     GraphChange,
+    _insert_chunks_sync,
+    _insert_chunks_with_retry_sync,
+    _source_document_ids,
     chunk_id,
     does_graph_contains,
     get_graph,
@@ -800,17 +803,21 @@ async def generate_subgraph(
     }
     cid = chunk_id(chunk)
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before saving subgraph for doc {doc_id}.", callback)
+    index_name = search.index_name(tenant_id)
+
+    def replace_subgraph():
+        settings.docStoreConn.delete(
+            {"knowledge_graph_kwd": "subgraph", "source_id": doc_id},
+            index_name,
+            kb_id,
+        )
+        _insert_chunks_sync([{"id": cid, **chunk}], index_name, kb_id)
+
     await thread_pool_exec(
-        settings.docStoreConn.delete,
-        {"knowledge_graph_kwd": "subgraph", "source_id": doc_id},
-        search.index_name(tenant_id),
+        DocumentService.execute_document_store_write,
+        [doc_id],
         kb_id,
-    )
-    await thread_pool_exec(
-        settings.docStoreConn.insert,
-        [{"id": cid, **chunk}],
-        search.index_name(tenant_id),
-        kb_id,
+        replace_subgraph,
     )
     now = asyncio.get_running_loop().time()
     callback(msg=f"generated subgraph for doc {doc_id} in {now - start:.2f} seconds.")
@@ -968,48 +975,64 @@ async def extract_community(
 
     new_ids: set[str] = {c["id"] for c in chunks}
 
-    # Snapshot existing community_report ids BEFORE inserting so we can
-    # delete exactly the stale set afterwards.  If the search fails we fall
-    # back to the prior delete-everything-then-insert behaviour rather than
-    # leaving an inconsistent mix.
-    old_ids: list[str] = []
-    try:
+    # Snapshot existing community_report ids before replacing them so the
+    # guarded write can prune only stale rows after all new rows are present.
+    existing_fields = {}
+    offset = 0
+    page_size = 1000
+    while True:
         existing_res = await thread_pool_exec(
             settings.docStoreConn.search,
-            ["id"],
+            ["id", "source_id"],
             [],
             {"knowledge_graph_kwd": ["community_report"]},
             [],
             OrderByExpr(),
-            0,
-            10000,
+            offset,
+            page_size,
             search.index_name(tenant_id),
             [kb_id],
         )
-        existing_fields = settings.docStoreConn.get_fields(existing_res, ["id"])
-        old_ids = list(existing_fields.keys())
-    except Exception:
-        logging.exception("Failed to enumerate existing community reports for kb %s; falling back to delete-then-insert.", kb_id)
-        await thread_pool_exec(settings.docStoreConn.delete, {"knowledge_graph_kwd": "community_report", "kb_id": kb_id}, search.index_name(tenant_id), kb_id)
-        old_ids = []
+        page = settings.docStoreConn.get_fields(
+            existing_res,
+            ["id", "source_id"],
+        )
+        existing_fields.update(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    old_ids = list(existing_fields.keys())
 
-    await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert community reports")
-
-    # Now that all new reports are persisted, prune stale rows.  Anything in
-    # old_ids that is not also in new_ids is no longer current (community
-    # composition changed across runs).  A failure here just leaves stale
-    # rows; the new rows are already in place.
     stale_ids = [i for i in old_ids if i not in new_ids]
-    if stale_ids:
-        try:
-            await thread_pool_exec(
-                settings.docStoreConn.delete,
+    index_name = search.index_name(tenant_id)
+    document_ids = _source_document_ids(
+        [*chunks, *existing_fields.values()],
+        additional_document_ids=doc_ids,
+    )
+
+    def replace_community_reports():
+        for offset in range(0, len(chunks), 64):
+            _insert_chunks_with_retry_sync(
+                chunks[offset : offset + 64],
+                index_name,
+                kb_id,
+                offset=offset,
+                total=len(chunks),
+                label="Insert community report batch",
+            )
+        if stale_ids:
+            settings.docStoreConn.delete(
                 {"knowledge_graph_kwd": ["community_report"], "id": stale_ids},
-                search.index_name(tenant_id),
+                index_name,
                 kb_id,
             )
-        except Exception:
-            logging.exception("Failed to prune %d stale community reports for kb %s", len(stale_ids), kb_id)
+
+    await thread_pool_exec(
+        DocumentService.execute_document_store_write,
+        document_ids,
+        kb_id,
+        replace_community_reports,
+    )
 
     _has_cancel_and_exit(task_id, f"Task {task_id} cancelled after community indexing.", callback)
     await cleanup_checkpoints(tenant_id, kb_id, COMMUNITY_CHECKPOINT)

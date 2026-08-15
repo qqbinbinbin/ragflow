@@ -68,6 +68,23 @@ _STRUCT_MERGE_LOCK_TIMEOUT_S = 60
 _STRUCT_MERGE_LOCK_BLOCKING_TIMEOUT_S = 5
 
 
+async def _guarded_document_store_write(
+    document_ids,
+    kb_id: str,
+    write_operation,
+    *args,
+):
+    from api.db.services.document_service import DocumentService
+
+    return await thread_pool_exec(
+        DocumentService.execute_document_store_write,
+        document_ids,
+        kb_id,
+        write_operation,
+        *args,
+    )
+
+
 def _struct_merge_lock_key(kb_id: str, compilation_template_id: str | None) -> str:
     """Per-(kb, template) lock so different templates can merge in parallel."""
     return f"struct_merge:{kb_id}:{compilation_template_id or ''}"
@@ -1351,6 +1368,11 @@ async def _struct_doc_storage_dedup_batch(
     from rag.nlp import search as _rag_search
 
     index = _rag_search.index_name(tenant_id)
+    owner_document_ids = sorted(
+        {str(doc["doc_id"]) for doc in docs if doc.get("doc_id")}
+    )
+    if not owner_document_ids:
+        raise ValueError("structure document-store write requires a document owner")
 
     def _raise_if_canceled() -> None:
         if callable(cancel_check) and cancel_check():
@@ -1562,7 +1584,14 @@ async def _struct_doc_storage_dedup_batch(
         if not batch:
             continue
         try:
-            await thread_pool_exec(settings.docStoreConn.insert, batch, index, kb_id)
+            await _guarded_document_store_write(
+                owner_document_ids,
+                kb_id,
+                settings.docStoreConn.insert,
+                batch,
+                index,
+                kb_id,
+            )
             updated_in_batch = sum(1 for doc in batch if any(doc is job.get("rebuilt") for job in updated_jobs))
             updated += updated_in_batch
             inserted += len(batch) - updated_in_batch
@@ -1647,11 +1676,25 @@ async def _struct_doc_storage_dedup_batch(
                 vectors = await _struct_embed(embd_mdl, [_struct_payload_description(payload) for _, payload in batch])
                 rewritten = [_struct_rebuild_doc_storage_doc(payload, base, vector, base.get("source_chunk_ids") or [], preserve_id=True) for (base, payload), vector in zip(batch, vectors)]
                 if rewritten:
-                    await thread_pool_exec(settings.docStoreConn.insert, rewritten, index, kb_id)
+                    await _guarded_document_store_write(
+                        owner_document_ids,
+                        kb_id,
+                        settings.docStoreConn.insert,
+                        rewritten,
+                        index,
+                        kb_id,
+                    )
                     existing_relation_updates += len(rewritten)
         rewritten_inserts = [await _struct_rewrite_relation_doc(doc, entity_aliases, embd_mdl) if doc.get("knowledge_graph_kwd") == "relation" else doc for doc in inserts]
         if rewritten_inserts != inserts:
-            await thread_pool_exec(settings.docStoreConn.insert, rewritten_inserts, index, kb_id)
+            await _guarded_document_store_write(
+                owner_document_ids,
+                kb_id,
+                settings.docStoreConn.insert,
+                rewritten_inserts,
+                index,
+                kb_id,
+            )
         for job in merged_jobs:
             if job["old_doc"].get("knowledge_graph_kwd") != "relation":
                 continue
@@ -1660,7 +1703,14 @@ async def _struct_doc_storage_dedup_batch(
             vector = await _struct_reembed_payload(job["payload"], embd_mdl)
             if vector is not None:
                 rewritten = _struct_rebuild_doc_storage_doc(job["payload"], job["old_doc"], vector, job["chunk_ids"], preserve_id=True)
-                await thread_pool_exec(settings.docStoreConn.insert, [rewritten], index, kb_id)
+                await _guarded_document_store_write(
+                    owner_document_ids,
+                    kb_id,
+                    settings.docStoreConn.insert,
+                    [rewritten],
+                    index,
+                    kb_id,
+                )
     return inserted, updated + existing_relation_updates
 
 
@@ -2007,7 +2057,9 @@ async def cleanup_timeline_isolated_entities(
 
     orphan_ids = [row_id for row_id, row in rows.items() if row.get("knowledge_graph_kwd") == "entity" and _struct_entity_name(row).casefold() not in connected_names]
     if orphan_ids:
-        await thread_pool_exec(
+        await _guarded_document_store_write(
+            doc_id,
+            kb_id,
             settings.docStoreConn.delete,
             {"id": orphan_ids},
             index,
@@ -2058,7 +2110,9 @@ async def _struct_upsert_graph_json(
         row["compilation_template_ids"] = [compilation_template_id]
     old = await thread_pool_exec(settings.docStoreConn.get, row_id, index, [kb_id])
     if old:
-        await thread_pool_exec(
+        await _guarded_document_store_write(
+            doc_id,
+            kb_id,
             settings.docStoreConn.update,
             {"id": row_id},
             {k: v for k, v in row.items() if k != "id"},
@@ -2066,7 +2120,14 @@ async def _struct_upsert_graph_json(
             kb_id,
         )
     else:
-        await thread_pool_exec(settings.docStoreConn.insert, [row], index, kb_id)
+        await _guarded_document_store_write(
+            doc_id,
+            kb_id,
+            settings.docStoreConn.insert,
+            [row],
+            index,
+            kb_id,
+        )
 
 
 async def rebuild_structure_graph_json(
@@ -2120,6 +2181,7 @@ async def _struct_upsert_dataset_graph_json(
     compile_kwd: str,
     compilation_template_id: str | None = None,
     structure_kind: str | None = None,
+    owner_document_id: str | None = None,
 ) -> None:
     from common import settings
     from rag.nlp import search as _rag_search
@@ -2148,8 +2210,18 @@ async def _struct_upsert_dataset_graph_json(
     if structure_kind:
         row["compilation_template_kind_kwd"] = str(structure_kind)
     old = await thread_pool_exec(settings.docStoreConn.get, row_id, index, [kb_id])
+    async def _write(operation, *args):
+        if owner_document_id:
+            return await _guarded_document_store_write(
+                owner_document_id,
+                kb_id,
+                operation,
+                *args,
+            )
+        return await thread_pool_exec(operation, *args)
+
     if old:
-        await thread_pool_exec(
+        await _write(
             settings.docStoreConn.update,
             {"id": row_id},
             {k: v for k, v in row.items() if k != "id"},
@@ -2157,7 +2229,7 @@ async def _struct_upsert_dataset_graph_json(
             kb_id,
         )
     else:
-        await thread_pool_exec(settings.docStoreConn.insert, [row], index, kb_id)
+        await _write(settings.docStoreConn.insert, [row], index, kb_id)
 
 
 async def rebuild_dataset_structure_graph_json(
@@ -2166,6 +2238,7 @@ async def rebuild_dataset_structure_graph_json(
     compile_kwd: str,
     compilation_template_id: str | None = None,
     structure_kind: str | None = None,
+    owner_document_id: str | None = None,
 ) -> dict:
     """Rebuild and persist the KB-wide (dataset) structure graph for one
     (compile_kwd, template_id) pair.
@@ -2193,6 +2266,7 @@ async def rebuild_dataset_structure_graph_json(
         compile_kwd,
         compilation_template_id,
         structure_kind=structure_kind,
+        owner_document_id=owner_document_id,
     )
     return graph
 

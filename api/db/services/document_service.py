@@ -43,6 +43,57 @@ class DocumentService(CommonService):
     model = Document
 
     @classmethod
+    @DB.connection_context()
+    def document_deletion_owns_cleanup(cls, document_id: str) -> bool:
+        """Return whether document deletion owns all remaining external cleanup."""
+
+        document = (
+            cls.model.select(cls.model.run, cls.model.status)
+            .where(cls.model.id == document_id)
+            .get_or_none()
+        )
+        if document is None:
+            return True
+        return (
+            document.run == TaskStatus.CANCEL.value
+            and document.status == StatusEnum.INVALID.value
+        )
+
+    @classmethod
+    @DB.connection_context()
+    def execute_document_store_write(
+        cls,
+        document_ids,
+        dataset_id,
+        write_operation,
+        *args,
+        **kwargs,
+    ):
+        """Serialize one document-store mutation with document deletion."""
+
+        if isinstance(document_ids, str):
+            document_ids = [document_ids]
+        scoped_document_ids = sorted({str(value) for value in document_ids if value})
+        if not scoped_document_ids:
+            raise ValueError("document-store write requires a document scope")
+
+        with DB.atomic():
+            documents = list(
+                cls.model.select(cls.model.id, cls.model.kb_id, cls.model.run)
+                .where(cls.model.id.in_(scoped_document_ids))
+                .order_by(cls.model.id)
+                .for_update()
+            )
+            if {document.id for document in documents} != set(scoped_document_ids):
+                raise LookupError("document is unavailable for document-store write")
+            for document in documents:
+                if document.kb_id != dataset_id:
+                    raise PermissionError("document-store write scope rejected")
+                if document.run == TaskStatus.CANCEL.value:
+                    raise RuntimeError("document is canceled for deletion")
+            return write_operation(*args, **kwargs)
+
+    @classmethod
     def get_cls_model_fields(cls):
         return [
             cls.model.id,
@@ -454,107 +505,277 @@ class DocumentService(CommonService):
         return Document(**doc)
 
     @classmethod
+    def cleanup_knowledge_graph_products(cls, doc, tenant_id):
+        """Strictly remove one document from KB-scoped graph products.
+
+        The shared graph row keeps ``doc.id`` as the retry anchor until all
+        document-owned graph rows and resulting orphans have been removed.
+        Every mutation is followed by a read-side postcondition so a lost
+        response is accepted only when the requested state is already durable.
+        """
+
+        index = search.index_name(tenant_id)
+        graph_types = ["graph"]
+        derived_types = ["entity", "relation", "subgraph", "community_report"]
+
+        def search_rows(condition, fields):
+            rows = {}
+            offset = 0
+            page_size = 1000
+            while True:
+                result = settings.docStoreConn.search(
+                    fields,
+                    [],
+                    condition,
+                    [],
+                    OrderByExpr(),
+                    offset,
+                    page_size,
+                    index,
+                    [doc.kb_id],
+                )
+                page = settings.docStoreConn.get_fields(result, fields) or {}
+                rows.update(page)
+                if len(page) < page_size:
+                    break
+                offset += page_size
+            return rows
+
+        def strict_update(condition, new_value, postcondition, message):
+            operation_error = None
+            try:
+                updated = settings.docStoreConn.update(
+                    condition,
+                    new_value,
+                    index,
+                    doc.kb_id,
+                )
+                if updated is False:
+                    operation_error = RuntimeError(message)
+            except Exception as exc:
+                operation_error = exc
+            if postcondition():
+                return
+            if operation_error is not None:
+                raise operation_error
+            raise RuntimeError(message)
+
+        def strict_delete(condition, postcondition, message):
+            operation_error = None
+            try:
+                settings.docStoreConn.delete_strict(
+                    condition,
+                    index,
+                    doc.kb_id,
+                )
+            except Exception as exc:
+                operation_error = exc
+            if postcondition():
+                return
+            if operation_error is not None:
+                raise operation_error
+            raise RuntimeError(message)
+
+        graph_source_condition = {
+            "kb_id": doc.kb_id,
+            "knowledge_graph_kwd": graph_types,
+            "source_id": doc.id,
+        }
+        derived_source_condition = {
+            "kb_id": doc.kb_id,
+            "knowledge_graph_kwd": derived_types,
+            "source_id": doc.id,
+        }
+        graph_sources = search_rows(graph_source_condition, ["source_id"])
+        derived_sources = search_rows(
+            derived_source_condition,
+            ["source_id"],
+        )
+        if not graph_sources and not derived_sources:
+            return
+
+        strict_update(
+            {
+                "kb_id": doc.kb_id,
+                "knowledge_graph_kwd": graph_types,
+            },
+            {"removed_kwd": "Y"},
+            lambda: all(
+                row.get("removed_kwd") == "Y"
+                for row in search_rows(
+                    {
+                        "kb_id": doc.kb_id,
+                        "knowledge_graph_kwd": graph_types,
+                    },
+                    ["removed_kwd"],
+                ).values()
+            ),
+            "strict knowledge graph marker cleanup failed",
+        )
+
+        sole_owner_ids = []
+        shared_ids = []
+        for row_id, row in derived_sources.items():
+            raw_sources = row.get("source_id")
+            if isinstance(raw_sources, str):
+                sources = [raw_sources] if raw_sources else []
+            elif isinstance(raw_sources, list):
+                sources = [
+                    source
+                    for source in raw_sources
+                    if isinstance(source, str) and source
+                ]
+            else:
+                sources = []
+            if any(source != doc.id for source in sources):
+                shared_ids.append(row_id)
+            else:
+                sole_owner_ids.append(row_id)
+
+        for offset in range(0, len(sole_owner_ids), 1000):
+            batch_ids = sole_owner_ids[offset : offset + 1000]
+            condition = {
+                "kb_id": doc.kb_id,
+                "id": batch_ids,
+            }
+            strict_delete(
+                condition,
+                lambda condition=condition: not search_rows(condition, ["id"]),
+                "strict knowledge graph sole-owner cleanup failed",
+            )
+
+        for offset in range(0, len(shared_ids), 1000):
+            batch_ids = shared_ids[offset : offset + 1000]
+            condition = {
+                "kb_id": doc.kb_id,
+                "id": batch_ids,
+                "source_id": doc.id,
+            }
+            strict_update(
+                condition,
+                {"remove": {"source_id": doc.id}},
+                lambda condition=condition: not search_rows(
+                    condition,
+                    ["source_id"],
+                ),
+                "strict knowledge graph shared-source cleanup failed",
+            )
+
+        sole_owner_graph_ids = []
+        shared_graph_ids = []
+        for row_id, row in graph_sources.items():
+            raw_sources = row.get("source_id")
+            if isinstance(raw_sources, str):
+                sources = [raw_sources] if raw_sources else []
+            elif isinstance(raw_sources, list):
+                sources = [
+                    source
+                    for source in raw_sources
+                    if isinstance(source, str) and source
+                ]
+            else:
+                sources = []
+            if any(source != doc.id for source in sources):
+                shared_graph_ids.append(row_id)
+            else:
+                sole_owner_graph_ids.append(row_id)
+
+        for offset in range(0, len(sole_owner_graph_ids), 1000):
+            batch_ids = sole_owner_graph_ids[offset : offset + 1000]
+            condition = {
+                "kb_id": doc.kb_id,
+                "id": batch_ids,
+            }
+            strict_delete(
+                condition,
+                lambda condition=condition: not search_rows(condition, ["id"]),
+                "strict knowledge graph sole-owner anchor cleanup failed",
+            )
+
+        for offset in range(0, len(shared_graph_ids), 1000):
+            batch_ids = shared_graph_ids[offset : offset + 1000]
+            condition = {
+                "kb_id": doc.kb_id,
+                "id": batch_ids,
+                "source_id": doc.id,
+            }
+            strict_update(
+                condition,
+                {"remove": {"source_id": doc.id}},
+                lambda condition=condition: not search_rows(
+                    condition,
+                    ["source_id"],
+                ),
+                "strict knowledge graph shared anchor cleanup failed",
+            )
+
+    @classmethod
     @DB.connection_context()
-    def remove_document(cls, doc, tenant_id):
-        from api.db.services.task_service import TaskService, cancel_all_task_of
+    def remove_document(
+        cls,
+        doc,
+        tenant_id,
+        *,
+        strict_cleanup=None,
+        final_db_cleanup=None,
+    ):
+        expected_tenant_id = tenant_id
+        knowledgebase = Knowledgebase.get_or_none(Knowledgebase.id == doc.kb_id)
+        if knowledgebase is None:
+            raise LookupError("Knowledgebase not found which is supposed to be there")
+        if knowledgebase.tenant_id != expected_tenant_id:
+            raise PermissionError("document tenant scope mismatch")
 
-        if not cls.delete_document_and_update_kb_counts(doc.id):
-            return True
+        def strict_document_cleanup(chunk_index_exists: bool):
+            if strict_cleanup is not None:
+                strict_cleanup()
 
-        chunk_index_name = search.index_name(tenant_id)
-        chunk_index_exists = settings.docStoreConn.index_exist(chunk_index_name, doc.kb_id)
-
-        # Cancel all running tasks first using preset function in task_service.py --- set cancel flag in Redis
-        try:
-            cancel_all_task_of(doc.id)
-            logging.info(f"Cancelled all tasks for document {doc.id}")
-        except Exception as e:
-            logging.warning(f"Failed to cancel tasks for document {doc.id}: {e}")
-
-        # Delete tasks from database
-        try:
-            TaskService.filter_delete([Task.doc_id == doc.id])
-        except Exception as e:
-            logging.warning(f"Failed to delete tasks for document {doc.id}: {e}")
-
-        # Delete chunk images (non-critical, log and continue)
-        try:
-            if chunk_index_exists:
-                cls.delete_chunk_images(doc, tenant_id)
-        except Exception as e:
-            logging.warning(f"Failed to delete chunk images for document {doc.id}: {e}")
-
-        # Delete thumbnail (non-critical, log and continue)
-        try:
             if doc.thumbnail and not doc.thumbnail.startswith(IMG_BASE64_PREFIX):
-                if settings.STORAGE_IMPL.obj_exist(doc.kb_id, doc.thumbnail):
-                    settings.STORAGE_IMPL.rm(doc.kb_id, doc.thumbnail)
-        except Exception as e:
-            logging.warning(f"Failed to delete thumbnail for document {doc.id}: {e}")
+                settings.STORAGE_IMPL.rm_strict(
+                    doc.kb_id,
+                    doc.thumbnail,
+                    expected_tenant_id,
+                )
 
-        # Delete chunks from doc store - this is critical, log errors
-        try:
-            settings.docStoreConn.delete({"doc_id": doc.id}, chunk_index_name, doc.kb_id)
-        except Exception as e:
-            logging.error(f"Failed to delete chunks from doc store for document {doc.id}: {e}")
-
-        # Ref-counted cleanup of wiki/artifact products this doc fed into
-        # (non-critical, log and continue). A product shared by other docs
-        # survives; one this doc solely owned is removed.
-        try:
             if chunk_index_exists:
-                cls.remove_artifact_products(doc, tenant_id)
-        except Exception as e:
-            logging.warning(f"Failed to clean up artifact products for document {doc.id}: {e}")
+                cls.remove_artifact_products(doc, expected_tenant_id, strict=True)
 
-        # Prune this doc's line from the KB's tree-kind navigation
-        # markdown (best-effort — the markdown is a downstream artifact,
-        # and failure here must not block the document delete).
-        try:
             from rag.advanced_rag.knowlege_compile.dataset_nav import (
                 remove_dataset_nav_doc_sync,
             )
 
-            remove_dataset_nav_doc_sync(tenant_id, doc.kb_id, doc.id)
-        except Exception as e:
-            logging.warning(
-                f"Failed to prune dataset_nav for document {doc.id}: {e}",
+            remove_dataset_nav_doc_sync(
+                expected_tenant_id,
+                doc.kb_id,
+                doc.id,
+                strict=True,
             )
 
-        # Delete document metadata (non-critical, log and continue)
-        try:
-            DocMetadataService.delete_document_metadata(doc.id, doc.kb_id, tenant_id)
-        except Exception as e:
-            logging.warning(f"Failed to delete metadata for document {doc.id}: {e}")
+            DocMetadataService.delete_document_metadata(
+                doc.id,
+                doc.kb_id,
+                expected_tenant_id,
+                strict=True,
+            )
 
-        # Cleanup knowledge graph references (non-critical, log and continue)
-        try:
             if chunk_index_exists:
-                graph_source = settings.docStoreConn.get_fields(
-                    settings.docStoreConn.search(["source_id"], [], {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, [], OrderByExpr(), 0, 1, chunk_index_name, [doc.kb_id]),
-                    ["source_id"],
+                cls.cleanup_knowledge_graph_products(
+                    doc,
+                    expected_tenant_id,
                 )
-                if len(graph_source) > 0 and doc.id in list(graph_source.values())[0]["source_id"]:
-                    settings.docStoreConn.update(
-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "source_id": doc.id},
-                        {"remove": {"source_id": doc.id}},
-                        chunk_index_name,
-                        doc.kb_id,
-                    )
-                    settings.docStoreConn.update({"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, {"removed_kwd": "Y"}, chunk_index_name, doc.kb_id)
-                    settings.docStoreConn.delete(
-                        {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["entity", "relation", "graph", "subgraph", "community_report"], "must_not": {"exists": "source_id"}},
-                        chunk_index_name,
-                        doc.kb_id,
-                    )
-        except Exception as e:
-            logging.warning(f"Failed to cleanup knowledge graph for document {doc.id}: {e}")
 
-        return True
+        return cls.delete_document_and_update_kb_counts(
+            doc.id,
+            strict_cleanup=strict_document_cleanup,
+            final_db_cleanup=final_db_cleanup,
+        ) or True
 
     @classmethod
     @DB.connection_context()
     def delete_chunk_images(cls, doc, tenant_id):
+        from rag.utils.storage_composite_id import parse_storage_composite_id
+
+        strict_remove = getattr(settings.STORAGE_IMPL, "rm_strict", None)
         page = 0
         page_size = 1000
         while True:
@@ -562,13 +783,26 @@ class DocumentService(CommonService):
             chunk_ids = settings.docStoreConn.get_doc_ids(chunks)
             if not chunk_ids:
                 break
+            image_fields = settings.docStoreConn.get_fields(chunks, ["img_id"])
+            image_objects = set()
             for cid in chunk_ids:
-                if settings.STORAGE_IMPL.obj_exist(doc.kb_id, cid):
-                    settings.STORAGE_IMPL.rm(doc.kb_id, cid)
+                image_id = image_fields.get(cid, {}).get("img_id")
+                if not image_id:
+                    continue
+                parsed = parse_storage_composite_id(image_id)
+                if parsed is None:
+                    raise ValueError("document chunk image reference is invalid")
+                image_objects.add(parsed)
+            if image_objects and not callable(strict_remove):
+                raise RuntimeError(
+                    "storage backend does not support strict chunk image deletion"
+                )
+            for bucket, object_name in sorted(image_objects):
+                strict_remove(bucket, object_name, tenant_id)
             page += 1
 
     @classmethod
-    def remove_artifact_products(cls, doc, tenant_id):
+    def remove_artifact_products(cls, doc, tenant_id, *, strict=False):
         """Reference-counted cleanup of KB-scoped wiki/artifact products
         in the doc store when a document is deleted.
 
@@ -591,11 +825,27 @@ class DocumentService(CommonService):
         )
 
         index = search.index_name(tenant_id)
-        if not settings.docStoreConn.index_exist(index, doc.kb_id):
+        index_exists = settings.docStoreConn.index_exist
+        if strict:
+            index_exists = getattr(
+                settings.docStoreConn,
+                "index_exist_strict",
+                None,
+            )
+            if not callable(index_exists):
+                raise RuntimeError(
+                    "document store does not support strict index existence checks"
+                )
+        if not index_exists(index, doc.kb_id):
             return
 
         # 1. Per-doc MAP resume rows are keyed by the real doc_id.
-        settings.docStoreConn.delete(
+        delete_operation = (
+            settings.docStoreConn.delete_strict
+            if strict
+            else settings.docStoreConn.delete
+        )
+        delete_operation(
             {"compile_kwd": [WIKI_MAP_COMPILE_KWD], "doc_id": doc.id},
             index,
             doc.kb_id,
@@ -646,7 +896,7 @@ class DocumentService(CommonService):
 
         # Drop rows this document solely owned (delete by id in batches).
         for i in range(0, len(sole_owner_ids), page_size):
-            settings.docStoreConn.delete(
+            delete_operation(
                 {"id": sole_owner_ids[i : i + page_size]},
                 index,
                 doc.kb_id,
@@ -657,12 +907,33 @@ class DocumentService(CommonService):
         # list-remove is safe; any sole-owner rows already deleted above are
         # simply not matched.
         if shared_seen:
-            settings.docStoreConn.update(
+            updated = settings.docStoreConn.update(
                 {"compile_kwd": derived_kwds, "source_doc_ids": doc.id},
                 {"remove": {"source_doc_ids": doc.id}},
                 index,
                 doc.kb_id,
             )
+            if strict and not updated:
+                raise RuntimeError("strict artifact ownership cleanup failed")
+            if strict:
+                remaining = settings.docStoreConn.search(
+                    ["id"],
+                    [],
+                    {
+                        "compile_kwd": derived_kwds,
+                        "source_doc_ids": [doc.id],
+                    },
+                    [],
+                    OrderByExpr(),
+                    0,
+                    1,
+                    index,
+                    [doc.kb_id],
+                )
+                if settings.docStoreConn.get_fields(remaining, ["id"]):
+                    raise RuntimeError(
+                        "strict artifact ownership cleanup failed"
+                    )
 
     @classmethod
     @DB.connection_context()
@@ -799,12 +1070,21 @@ class DocumentService(CommonService):
     @classmethod
     @retry_deadlock_operation()
     @DB.connection_context()
-    def delete_document_and_update_kb_counts(cls, doc_id) -> bool:
-        """Atomically delete the document row and update KB counters.
+    def delete_document_and_update_kb_counts(
+        cls,
+        doc_id,
+        *,
+        strict_cleanup=None,
+        final_db_cleanup=None,
+    ) -> bool:
+        """Strictly clean external state, then delete document-local rows.
 
         Returns True if the document was deleted by this call, False if it was
         already deleted by a concurrent request (idempotent).
         """
+        from api.db.services.tabular_structure_service import PeeweeTabularStructureRepository
+        from api.db.services.task_service import TaskService, cancel_all_task_of
+
         with DB.atomic():
             doc = (
                 cls.model.select(
@@ -812,6 +1092,8 @@ class DocumentService(CommonService):
                     cls.model.kb_id,
                     cls.model.token_num,
                     cls.model.chunk_num,
+                    cls.model.run,
+                    cls.model.status,
                 )
                 .where(cls.model.id == doc_id)
                 .for_update()
@@ -819,23 +1101,93 @@ class DocumentService(CommonService):
             )
             if doc is None:
                 return False
-            from api.db.services.tabular_structure_service import PeeweeTabularStructureRepository
-
             knowledgebase = Knowledgebase.get_or_none(Knowledgebase.id == doc.kb_id)
-            if knowledgebase is not None:
-                PeeweeTabularStructureRepository.deactivate_document_index(
-                    knowledgebase.tenant_id,
-                    doc.kb_id,
-                    doc.id,
+            if knowledgebase is None:
+                raise LookupError("Knowledgebase not found which is supposed to be there")
+            tenant_id = knowledgebase.tenant_id
+
+            if doc.run != TaskStatus.CANCEL.value:
+                (
+                    cls.model.update(
+                        run=TaskStatus.CANCEL.value,
+                        status=StatusEnum.INVALID.value,
+                    )
+                    .where(cls.model.id == doc.id)
+                    .execute()
                 )
-            deleted = cls.model.delete().where(cls.model.id == doc_id).execute()
+            elif doc.status != StatusEnum.INVALID.value:
+                (
+                    cls.model.update(status=StatusEnum.INVALID.value)
+                    .where(cls.model.id == doc.id)
+                    .execute()
+                )
+
+        cancel_all_task_of(doc.id)
+
+        strict_index_exists = getattr(
+            settings.docStoreConn,
+            "index_exist_strict",
+            None,
+        )
+        if not callable(strict_index_exists):
+            raise RuntimeError(
+                "document store does not support strict index existence checks"
+            )
+        chunk_index_exists = strict_index_exists(
+            search.index_name(tenant_id),
+            doc.kb_id,
+        )
+        if chunk_index_exists:
+            # Retain ordinary chunks until their referenced image objects have
+            # been enumerated and strictly removed.
+            cls.delete_chunk_images(doc, tenant_id)
+            settings.docStoreConn.delete_strict(
+                {"doc_id": doc.id},
+                search.index_name(tenant_id),
+                doc.kb_id,
+            )
+        PeeweeTabularStructureRepository.purge_document_generations(
+            settings.STORAGE_IMPL,
+            tenant_id=tenant_id,
+            dataset_id=doc.kb_id,
+            document_id=doc.id,
+        )
+        if strict_cleanup is not None:
+            strict_cleanup(chunk_index_exists)
+
+        with DB.atomic():
+            current = (
+                cls.model.select(
+                    cls.model.id,
+                    cls.model.kb_id,
+                    cls.model.token_num,
+                    cls.model.chunk_num,
+                    cls.model.run,
+                    cls.model.status,
+                )
+                .where(cls.model.id == doc_id)
+                .for_update()
+                .get_or_none()
+            )
+            if current is None:
+                return False
+            if current.kb_id != doc.kb_id:
+                raise RuntimeError("document knowledgebase changed during deletion")
+            if current.run != TaskStatus.CANCEL.value:
+                raise RuntimeError("document deletion gate changed during deletion")
+            if current.status != StatusEnum.INVALID.value:
+                raise RuntimeError("document deletion intent changed during deletion")
+            if final_db_cleanup is not None:
+                final_db_cleanup()
+            TaskService.filter_delete([Task.doc_id == current.id])
+            deleted = cls.model.delete().where(cls.model.id == current.id).execute()
             if not deleted:
                 return False
             Knowledgebase.update(
-                token_num=Knowledgebase.token_num - doc.token_num,
-                chunk_num=Knowledgebase.chunk_num - doc.chunk_num,
+                token_num=Knowledgebase.token_num - current.token_num,
+                chunk_num=Knowledgebase.chunk_num - current.chunk_num,
                 doc_num=Knowledgebase.doc_num - 1,
-            ).where(Knowledgebase.id == doc.kb_id).execute()
+            ).where(Knowledgebase.id == current.kb_id).execute()
         return True
 
     @classmethod

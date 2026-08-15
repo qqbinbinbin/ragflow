@@ -87,10 +87,49 @@ class OpenDALStorage:
         self._operator.delete(f"{bucket}/{fnm}")
         self._operator.__init__()
 
+    def rm_strict(self, bucket, fnm, tenant_id=None):
+        object_name = f"{bucket}/{fnm}"
+        self._operator.delete(object_name)
+        if self._operator.exists(object_name):
+            raise OSError("strict object deletion was incomplete")
+
+    @staticmethod
+    def _entry_path(entry, prefix):
+        if isinstance(entry, str):
+            path = entry
+        else:
+            path = getattr(entry, "path", None)
+            if callable(path):
+                path = path()
+        if not isinstance(path, str):
+            raise TypeError("OpenDAL scan returned an entry without a path")
+        if path.startswith(prefix):
+            return path
+        return f"{prefix}{path.lstrip('/')}"
+
+    def _scan_prefix_strict(self, prefix):
+        return [
+            path
+            for entry in self._operator.scan(prefix)
+            if (path := self._entry_path(entry, prefix)).startswith(prefix)
+        ]
+
+    def rm_prefix_strict(self, bucket, prefix, tenant_id=None):
+        object_prefix = f"{bucket}/{prefix}"
+        object_names = self._scan_prefix_strict(object_prefix)
+        for object_name in object_names:
+            self._operator.delete(object_name)
+        if self._scan_prefix_strict(object_prefix):
+            raise OSError("strict object prefix deletion was incomplete")
+        return len(object_names)
+
     def scan(self, bucket, fnm, tenant_id=None):
         return self._operator.scan(f"{bucket}/{fnm}")
 
     def obj_exist(self, bucket, fnm, tenant_id=None):
+        return self._operator.exists(f"{bucket}/{fnm}")
+
+    def obj_exist_strict(self, bucket, fnm, tenant_id=None):
         return self._operator.exists(f"{bucket}/{fnm}")
 
     def init_db_config(self):

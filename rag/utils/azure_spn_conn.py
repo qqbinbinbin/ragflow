@@ -18,6 +18,7 @@ import logging
 import os
 import time
 from common.decorator import singleton
+from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import ClientSecretCredential, AzureAuthorityHosts
 from azure.storage.filedatalake import FileSystemClient
 from common import settings
@@ -80,14 +81,46 @@ class RAGFlowAzureSpnBlob:
                 return None
         return None
 
-    def rm(self, bucket, fnm):
+    def rm(self, bucket, fnm, tenant_id=None):
         blob = f"{bucket}/{fnm}"
         try:
             self.conn.delete_file(f"{blob}")
         except Exception:
             logging.exception(f"Fail rm {blob}")
 
-    def get(self, bucket, fnm):
+    def rm_strict(self, bucket, fnm, tenant_id=None):
+        blob = f"{bucket}/{fnm}"
+        try:
+            self.conn.delete_file(blob)
+        except ResourceNotFoundError:
+            pass
+        if self.conn.get_file_client(blob).exists():
+            raise OSError("strict object deletion was incomplete")
+
+    def _list_prefix_strict(self, prefix):
+        list_path = prefix.rstrip("/")
+        try:
+            return [
+                path.name
+                for path in self.conn.get_paths(path=list_path, recursive=True)
+                if not path.is_directory and path.name.startswith(prefix)
+            ]
+        except ResourceNotFoundError:
+            return []
+
+    def rm_prefix_strict(self, bucket, prefix, tenant_id=None):
+        blob_prefix = f"{bucket}/{prefix}"
+        object_names = self._list_prefix_strict(blob_prefix)
+        for object_name in object_names:
+            try:
+                self.conn.delete_file(object_name)
+            except ResourceNotFoundError:
+                pass
+        if self._list_prefix_strict(blob_prefix):
+            raise OSError("strict object prefix deletion was incomplete")
+        return len(object_names)
+
+    def get(self, bucket, fnm, tenant_id=None):
         blob = f"{bucket}/{fnm}"
         for _ in range(1):
             try:
@@ -100,7 +133,7 @@ class RAGFlowAzureSpnBlob:
                 time.sleep(1)
         return None
 
-    def obj_exist(self, bucket, fnm):
+    def obj_exist(self, bucket, fnm, tenant_id=None):
         blob = f"{bucket}/{fnm}"
         try:
             client = self.conn.get_blob_client(f"{blob}")
@@ -108,6 +141,10 @@ class RAGFlowAzureSpnBlob:
         except Exception:
             logging.exception(f"Fail put {blob}")
         return False
+
+    def obj_exist_strict(self, bucket, fnm, tenant_id=None):
+        blob = f"{bucket}/{fnm}"
+        return self.conn.get_file_client(blob).exists()
 
     def get_presigned_url(self, bucket, fnm, expires):
         f_path = f"{bucket}/{fnm}"

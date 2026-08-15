@@ -115,6 +115,24 @@ class EncryptedStorageWrapper:
         """
         return self.storage_impl.rm(bucket, fnm, tenant_id)
 
+    def rm_strict(self, bucket, fnm, tenant_id=None):
+        strict_delete = getattr(self.storage_impl, "rm_strict", None)
+        if not callable(strict_delete):
+            raise RuntimeError("storage backend does not support strict object deletion")
+        return strict_delete(bucket, fnm, tenant_id)
+
+    def rm_prefix_strict(self, bucket, prefix, tenant_id=None):
+        strict_delete_prefix = getattr(
+            self.storage_impl,
+            "rm_prefix_strict",
+            None,
+        )
+        if not callable(strict_delete_prefix):
+            raise RuntimeError(
+                "storage backend does not support strict prefix deletion"
+            )
+        return strict_delete_prefix(bucket, prefix, tenant_id)
+
     def obj_exist(self, bucket, fnm, tenant_id=None):
         """
         Check if object exists (same as original storage implementation, no decryption needed)
@@ -128,6 +146,14 @@ class EncryptedStorageWrapper:
             Whether the object exists
         """
         return self.storage_impl.obj_exist(bucket, fnm, tenant_id)
+
+    def obj_exist_strict(self, bucket, fnm, tenant_id=None):
+        strict_exists = getattr(self.storage_impl, "obj_exist_strict", None)
+        if not callable(strict_exists):
+            raise RuntimeError(
+                "storage backend does not support strict object existence checks"
+            )
+        return strict_exists(bucket, fnm, tenant_id)
 
     def health(self):
         """

@@ -19,6 +19,7 @@ import json
 import time
 
 import copy
+from elasticsearch import NotFoundError
 from elasticsearch_dsl import UpdateByQuery, Q, Search
 from elastic_transport import ConnectionTimeout
 from common.decorator import singleton
@@ -66,6 +67,12 @@ class ESConnection(ESConnectionBase):
 
     def _es_search_once(self, index_names: list[str], query: dict, track_total_hits: bool):
         return self.es.search(index=index_names, body=query, timeout="600s", track_total_hits=track_total_hits)
+
+    def index_exist_strict(self, index_name: str, knowledgebase_id: str = None) -> bool:
+        """Check index existence without converting backend errors into absence."""
+
+        del knowledgebase_id
+        return bool(self.es.indices.exists(index=index_name))
 
     def _search_with_search_after(self, index_names: list[str], query: dict, offset: int, limit: int):
         q_base = copy.deepcopy(query)
@@ -562,6 +569,81 @@ class ESConnection(ESConnectionBase):
                 if re.search(r"(not_found)", str(e), re.IGNORECASE):
                     return 0
         return 0
+
+    def delete_strict(self, condition: dict, index_name: str, knowledgebase_id: str) -> int:
+        """Delete matching rows without converting backend failures into zero."""
+
+        assert "_id" not in condition
+        condition["kb_id"] = knowledgebase_id
+        bool_query = Q("bool")
+        if "id" in condition:
+            chunk_ids = condition["id"]
+            if not isinstance(chunk_ids, list):
+                chunk_ids = [chunk_ids]
+            if chunk_ids:
+                bool_query.filter.append(Q("ids", values=chunk_ids))
+        for key, value in condition.items():
+            if key == "id":
+                continue
+            if key == "exists":
+                bool_query.filter.append(Q("exists", field=value))
+            elif key == "must_not" and isinstance(value, dict):
+                for nested_key, nested_value in value.items():
+                    if nested_key == "exists":
+                        bool_query.must_not.append(Q("exists", field=nested_value))
+            elif isinstance(value, list):
+                bool_query.must.append(Q("terms", **{key: value}))
+            elif isinstance(value, (str, int)):
+                bool_query.must.append(Q("term", **{key: value}))
+            elif value is not None:
+                raise TypeError("Condition value must be int, str or list.")
+        qry = Q("match_all") if not bool_query.filter and not bool_query.must and not bool_query.must_not else bool_query
+
+        last_error = None
+        for _ in range(ATTEMPT_TIME):
+            try:
+                result = self.es.delete_by_query(
+                    index=index_name,
+                    body=Search().query(qry).to_dict(),
+                    refresh=True,
+                )
+                deleted = result.get("deleted") if isinstance(result, dict) else None
+                total = result.get("total") if isinstance(result, dict) else None
+                noops = result.get("noops", 0) if isinstance(result, dict) else None
+                timed_out = result.get("timed_out", False) if isinstance(result, dict) else None
+                failures = result.get("failures", []) if isinstance(result, dict) else None
+                version_conflicts = result.get("version_conflicts", 0) if isinstance(result, dict) else None
+                complete = (
+                    isinstance(deleted, int)
+                    and not isinstance(deleted, bool)
+                    and deleted >= 0
+                    and timed_out is False
+                    and failures == []
+                    and version_conflicts == 0
+                    and isinstance(noops, int)
+                    and not isinstance(noops, bool)
+                    and noops == 0
+                    and (
+                        total is None
+                        or (
+                            isinstance(total, int)
+                            and not isinstance(total, bool)
+                            and total >= 0
+                            and deleted == total
+                        )
+                    )
+                )
+                if not complete:
+                    raise RuntimeError("strict delete incomplete")
+                return deleted
+            except NotFoundError:
+                return 0
+            except ConnectionTimeout as exc:
+                last_error = exc
+                self.logger.exception("ES request timeout during strict delete")
+                self._connect()
+        assert last_error is not None
+        raise last_error
 
     """
     Helper functions for search result

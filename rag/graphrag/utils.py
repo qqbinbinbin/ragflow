@@ -27,6 +27,7 @@ import numpy as np
 import xxhash
 from networkx.readwrite import json_graph
 
+from api.db.services.document_service import DocumentService
 from common.misc_utils import get_uuid
 from common.connection_utils import timeout
 from common.asyncio_utils import LoopLocalSemaphore
@@ -48,6 +49,97 @@ chat_limiter = LoopLocalSemaphore(int(os.environ.get("MAX_CONCURRENT_CHATS", 10)
 # GRAPHRAG_INSERT_BULK_SIZE and GRAPHRAG_INSERT_CONCURRENCY.
 _INSERT_BULK_SIZE = max(1, int(os.environ.get("GRAPHRAG_INSERT_BULK_SIZE", 64)))
 _INSERT_CONCURRENCY = max(1, int(os.environ.get("GRAPHRAG_INSERT_CONCURRENCY", 4)))
+
+
+def _source_document_ids(chunks, *, additional_document_ids=()):
+    document_ids = set()
+    for value in additional_document_ids:
+        if not isinstance(value, str) or not value:
+            raise ValueError("GraphRAG write has an invalid source document ID")
+        document_ids.add(value)
+    for chunk in chunks:
+        sources = chunk.get("source_id", [])
+        if isinstance(sources, str):
+            sources = [sources]
+        if not isinstance(sources, (list, tuple, set)):
+            raise ValueError("GraphRAG write has an invalid source document scope")
+        if not sources:
+            raise ValueError("GraphRAG write chunk requires a source document")
+        for source in sources:
+            if not isinstance(source, str) or not source:
+                raise ValueError("GraphRAG write has an invalid source document ID")
+            document_ids.add(source)
+    if not document_ids:
+        raise ValueError("GraphRAG write requires at least one source document")
+    return sorted(document_ids)
+
+
+def _insert_chunks_sync(chunks, index_name, kb_id):
+    result = settings.docStoreConn.insert(chunks, index_name, kb_id)
+    if result:
+        raise RuntimeError(
+            "Insert chunk error: "
+            f"{result}, please check log file and Elasticsearch/Infinity status!"
+        )
+
+
+def _insert_chunks_with_retry_sync(
+    chunks,
+    index_name,
+    kb_id,
+    *,
+    offset,
+    total,
+    label,
+):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            _insert_chunks_sync(chunks, index_name, kb_id)
+            return
+        except Exception as error:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2**attempt
+            logging.warning(
+                "%s at offset %s/%s attempt %s failed: %s, retrying in %ss",
+                label,
+                offset,
+                total,
+                attempt + 1,
+                error,
+                wait,
+            )
+            time.sleep(wait)
+
+
+def _load_graph_write_source_ids(tenant_id, kb_id):
+    fields = ["source_id"]
+    rows = []
+    offset = 0
+    page_size = 1000
+    while True:
+        result = settings.docStoreConn.search(
+            fields,
+            [],
+            {"knowledge_graph_kwd": ["graph", "subgraph"]},
+            [],
+            OrderByExpr(),
+            offset,
+            page_size,
+            search.index_name(tenant_id),
+            [kb_id],
+        )
+        page = list(
+            settings.docStoreConn.get_fields(result, fields).values()
+        )
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    if not rows:
+        return []
+    return _source_document_ids(rows)
 
 
 async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, label="Insert chunks"):
@@ -72,38 +164,28 @@ async def insert_chunks_bounded(chunks, tenant_id, kb_id, *, callback=None, labe
     async def _one(offset: int) -> None:
         batch = chunks[offset : offset + _INSERT_BULK_SIZE]
         timeout_s = 3 if enable_timeout_assertion else 30000000
-        max_retries = 3
+        document_ids = _source_document_ids(batch)
+
+        def insert_batch():
+            _insert_chunks_with_retry_sync(
+                batch,
+                search.index_name(tenant_id),
+                kb_id,
+                offset=offset,
+                total=total,
+                label=label,
+            )
+
         async with sem:
-            for attempt in range(max_retries):
-                try:
-                    result = await asyncio.wait_for(
-                        thread_pool_exec(
-                            settings.docStoreConn.insert,
-                            batch,
-                            search.index_name(tenant_id),
-                            kb_id,
-                        ),
-                        timeout=timeout_s,
-                    )
-                    if result:
-                        raise Exception(f"Insert chunk error: {result}, please check log file and Elasticsearch/Infinity status!")
-                    break
-                except asyncio.TimeoutError:
-                    if attempt < max_retries - 1:
-                        wait = 2**attempt
-                        logging.warning(f"Insert batch at offset {offset}/{total} attempt {attempt + 1} timed out, retrying in {wait}s")
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait = 2**attempt
-                        logging.warning(f"Insert batch at offset {offset}/{total} attempt {attempt + 1} failed: {e}, retrying in {wait}s")
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
+            await asyncio.wait_for(
+                thread_pool_exec(
+                    DocumentService.execute_document_store_write,
+                    document_ids,
+                    kb_id,
+                    insert_batch,
+                ),
+                timeout=timeout_s,
+            )
         if callback:
             async with progress_lock:
                 progress["done"] += len(batch)
@@ -700,59 +782,98 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
         callback(msg=f"set_graph converted graph change to {len(chunks)} chunks in {now - start:.2f}s.")
     start = now
 
-    # All new chunks are ready.  Now delete old data and insert the new data.
-    # Deleting only after chunks are built ensures that a crash during embedding
-    # generation above does not destroy the old graph/subgraph checkpoints.
-    await thread_pool_exec(settings.docStoreConn.delete, {"knowledge_graph_kwd": ["graph", "subgraph"]}, search.index_name(tenant_id), kb_id)
+    index_name = search.index_name(tenant_id)
+    existing_document_ids = await thread_pool_exec(
+        _load_graph_write_source_ids,
+        tenant_id,
+        kb_id,
+    )
+    document_ids = _source_document_ids(
+        chunks,
+        additional_document_ids=[
+            *graph.graph.get("source_id", []),
+            *existing_document_ids,
+        ],
+    )
 
-    if change.removed_nodes:
-        BATCH_SIZE = 100
-        sorted_nodes = sorted(change.removed_nodes)
-        for i in range(0, len(sorted_nodes), BATCH_SIZE):
-            batch = sorted_nodes[i : i + BATCH_SIZE]
-            await thread_pool_exec(settings.docStoreConn.delete, {"knowledge_graph_kwd": ["entity"], "entity_kwd": batch}, search.index_name(tenant_id), kb_id)
+    def replace_graph_chunks():
+        settings.docStoreConn.delete(
+            {"knowledge_graph_kwd": ["graph", "subgraph"]},
+            index_name,
+            kb_id,
+        )
 
-    if change.removed_edges:
+        if change.removed_nodes:
+            batch_size = 100
+            sorted_nodes = sorted(change.removed_nodes)
+            for offset in range(0, len(sorted_nodes), batch_size):
+                settings.docStoreConn.delete(
+                    {
+                        "knowledge_graph_kwd": ["entity"],
+                        "entity_kwd": sorted_nodes[offset : offset + batch_size],
+                    },
+                    index_name,
+                    kb_id,
+                )
 
-        async def del_edges(from_node, to_node):
+        for from_node, to_node in change.removed_edges:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    async with chat_limiter:
-                        await thread_pool_exec(
-                            settings.docStoreConn.delete, {"knowledge_graph_kwd": ["relation"], "from_entity_kwd": from_node, "to_entity_kwd": to_node}, search.index_name(tenant_id), kb_id
-                        )
-                    return
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait = 2**attempt
-                        logging.warning(f"del_edges({from_node}, {to_node}) attempt {attempt + 1} failed: {e}, retrying in {wait}s")
-                        await asyncio.sleep(wait)
-                    else:
+                    settings.docStoreConn.delete(
+                        {
+                            "knowledge_graph_kwd": ["relation"],
+                            "from_entity_kwd": from_node,
+                            "to_entity_kwd": to_node,
+                        },
+                        index_name,
+                        kb_id,
+                    )
+                    break
+                except Exception as error:
+                    if attempt == max_retries - 1:
                         raise
+                    wait = 2**attempt
+                    logging.warning(
+                        "del_edges(%s, %s) attempt %s failed: %s, retrying in %ss",
+                        from_node,
+                        to_node,
+                        attempt + 1,
+                        error,
+                        wait,
+                    )
+                    time.sleep(wait)
 
-        tasks = []
-        for from_node, to_node in change.removed_edges:
-            tasks.append(asyncio.create_task(del_edges(from_node, to_node)))
+        for offset in range(0, len(chunks), _INSERT_BULK_SIZE):
+            batch = chunks[offset : offset + _INSERT_BULK_SIZE]
+            _insert_chunks_with_retry_sync(
+                batch,
+                index_name,
+                kb_id,
+                offset=offset,
+                total=len(chunks),
+                label="Insert graph batch",
+            )
 
-        try:
-            await asyncio.gather(*tasks, return_exceptions=False)
-        except Exception as e:
-            logging.error(f"Error while deleting edges: {e}")
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+    # Hold every source-document row lock across the complete graph replace so
+    # deletion cannot interleave between the old snapshot delete and new writes.
+    await thread_pool_exec(
+        DocumentService.execute_document_store_write,
+        document_ids,
+        kb_id,
+        replace_graph_chunks,
+    )
 
-    del_now = asyncio.get_running_loop().time()
-    if callback:
-        callback(msg=f"set_graph removed {len(change.removed_nodes)} nodes and {len(change.removed_edges)} edges from index in {del_now - start:.2f}s.")
-    start = del_now
-
-    await insert_chunks_bounded(chunks, tenant_id, kb_id, callback=callback, label="Insert chunks")
     now = asyncio.get_running_loop().time()
     if callback:
-        callback(msg=f"set_graph added/updated {len(change.added_updated_nodes)} nodes and {len(change.added_updated_edges)} edges from index in {now - start:.2f}s.")
+        callback(
+            msg=(
+                "set_graph replaced graph chunks and applied "
+                f"{len(change.added_updated_nodes)} node / "
+                f"{len(change.added_updated_edges)} edge updates in "
+                f"{now - start:.2f}s."
+            )
+        )
 
 
 def is_continuous_subsequence(subseq, seq):

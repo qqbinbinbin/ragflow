@@ -307,6 +307,10 @@ class OSConnection(DocStoreConnection):
                 break
         return False
 
+    def index_exist_strict(self, index_name: str, knowledgebase_id: str = None) -> bool:
+        del knowledgebase_id
+        return bool(self.os.indices.exists(index=index_name))
+
     """
     CRUD operations
     """
@@ -748,6 +752,83 @@ class OSConnection(DocStoreConnection):
                 if re.search(r"(not_found)", str(e), re.IGNORECASE):
                     return 0
         return 0
+
+    def delete_strict(self, condition: dict, index_name: str, knowledgebase_id: str) -> int:
+        assert "_id" not in condition
+        condition = dict(condition)
+        condition["kb_id"] = knowledgebase_id
+
+        bool_query = Q("bool")
+        if "id" in condition:
+            chunk_ids = condition["id"]
+            if not isinstance(chunk_ids, list):
+                chunk_ids = [chunk_ids]
+            if chunk_ids:
+                bool_query.filter.append(Q("ids", values=chunk_ids))
+
+        for key, value in condition.items():
+            if key == "id":
+                continue
+            if key == "exists":
+                bool_query.filter.append(Q("exists", field=value))
+            elif key == "must_not" and isinstance(value, dict):
+                for nested_key, nested_value in value.items():
+                    if nested_key == "exists":
+                        bool_query.must_not.append(Q("exists", field=nested_value))
+            elif isinstance(value, list):
+                bool_query.must.append(Q("terms", **{key: value}))
+            elif isinstance(value, (str, int)):
+                bool_query.must.append(Q("term", **{key: value}))
+            elif value is not None:
+                raise TypeError("Condition value must be int, str or list.")
+
+        query = Q("match_all") if not bool_query.filter and not bool_query.must and not bool_query.must_not else bool_query
+        body = Search().query(query).to_dict()
+        try:
+            result = self.os.delete_by_query(
+                index=index_name,
+                body=body,
+                refresh=True,
+            )
+        except NotFoundError:
+            return 0
+
+        deleted = result.get("deleted") if isinstance(result, dict) else None
+        total = result.get("total") if isinstance(result, dict) else None
+        noops = result.get("noops", 0) if isinstance(result, dict) else None
+        timed_out = result.get("timed_out", False) if isinstance(result, dict) else None
+        failures = result.get("failures", []) if isinstance(result, dict) else None
+        version_conflicts = result.get("version_conflicts", 0) if isinstance(result, dict) else None
+        complete = (
+            isinstance(deleted, int)
+            and not isinstance(deleted, bool)
+            and deleted >= 0
+            and timed_out is False
+            and failures == []
+            and version_conflicts == 0
+            and isinstance(noops, int)
+            and not isinstance(noops, bool)
+            and noops == 0
+            and (
+                total is None
+                or (
+                    isinstance(total, int)
+                    and not isinstance(total, bool)
+                    and total >= 0
+                    and deleted == total
+                )
+            )
+        )
+        if not complete:
+            raise RuntimeError("strict delete incomplete")
+
+        readback = self.os.count(index=index_name, body=body)
+        remaining = readback.get("count") if isinstance(readback, dict) else None
+        if not isinstance(remaining, int) or isinstance(remaining, bool) or remaining < 0:
+            raise RuntimeError("strict delete readback invalid")
+        if remaining != 0:
+            raise RuntimeError("strict delete readback found remaining rows")
+        return deleted
 
     """
     Helper functions for search result

@@ -789,8 +789,19 @@ class RaptorService:
             "content_with_weight": json.dumps(graph, ensure_ascii=False),
             "available_int": 0,
         }
+        async def _write(operation, *args):
+            if doc_id == GRAPH_RAPTOR_FAKE_DOC_ID:
+                return await thread_pool_exec(operation, *args)
+            return await thread_pool_exec(
+                DocumentService.execute_document_store_write,
+                doc_id,
+                ctx.kb_id,
+                operation,
+                *args,
+            )
+
         try:
-            await thread_pool_exec(
+            await _write(
                 settings.docStoreConn.delete,
                 {"compile_kwd": "raptor_graph", "doc_id": [doc_id]},
                 index_nm,
@@ -803,7 +814,7 @@ class RaptorService:
                 doc_id,
             )
         try:
-            await thread_pool_exec(
+            await _write(
                 settings.docStoreConn.insert,
                 [row],
                 index_nm,

@@ -144,19 +144,13 @@ def build_tabular_structure_shadow_from_source(
     if adr044_conversion_receipt is not None:
         builder_kwargs["adr044_conversion_receipt"] = adr044_conversion_receipt
     projection = projection_builder(filename, binary, **builder_kwargs)
-    receipt = projection_store(
-        storage,
-        bucket=dataset_id,
-        document_id=document_id,
-        projection=projection,
-        tenant_id=tenant_id,
-    )
-    service.register_shadow_generation(
+    service.persist_shadow_generation(
         storage,
         tenant_id=tenant_id,
         dataset_id=dataset_id,
         document_id=document_id,
-        receipt=receipt,
+        projection=projection,
+        projection_store=projection_store,
     )
     return {
         "status": "shadow",

@@ -96,6 +96,29 @@ class RAGFlowGCS:
         except Exception:
             logging.exception(f"Fail to remove {bucket}/{fnm}:")
 
+    def rm_strict(self, bucket, fnm, tenant_id=None):
+        bucket_obj = self.client.bucket(self.bucket_name)
+        blob_path = self._get_blob_path(bucket, fnm)
+        blob = bucket_obj.blob(blob_path)
+        try:
+            blob.delete()
+        except NotFound:
+            pass
+        if blob.exists():
+            raise OSError("strict object deletion was incomplete")
+
+    def rm_prefix_strict(self, bucket, prefix, tenant_id=None):
+        blob_prefix = self._get_blob_path(bucket, prefix)
+        blobs = list(self.client.list_blobs(self.bucket_name, prefix=blob_prefix))
+        for blob in blobs:
+            try:
+                blob.delete()
+            except NotFound:
+                pass
+        if list(self.client.list_blobs(self.bucket_name, prefix=blob_prefix)):
+            raise OSError("strict object prefix deletion was incomplete")
+        return len(blobs)
+
     def get(self, bucket, filename, tenant_id=None):
         # RENAMED PARAMETER: bucket_name -> bucket
         for _ in range(1):
@@ -123,6 +146,11 @@ class RAGFlowGCS:
         except Exception:
             logging.exception(f"obj_exist {bucket}/{filename} got exception")
             return False
+
+    def obj_exist_strict(self, bucket, filename, tenant_id=None):
+        bucket_obj = self.client.bucket(self.bucket_name)
+        blob_path = self._get_blob_path(bucket, filename)
+        return bucket_obj.blob(blob_path).exists()
 
     def bucket_exists(self, bucket):
         # RENAMED PARAMETER: bucket_name -> bucket

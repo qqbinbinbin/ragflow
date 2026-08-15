@@ -189,6 +189,10 @@ class DocStoreConnection(ABC):
         """
         raise NotImplementedError("Not implemented")
 
+    def index_exist_strict(self, index_name: str, dataset_id: str = None) -> bool:
+        """Check index existence without converting backend errors to absence."""
+        raise NotImplementedError("Strict index existence is not implemented")
+
     """
     CRUD operations
     """
@@ -240,6 +244,10 @@ class DocStoreConnection(ABC):
         Delete rows with given conjunctive equivalent filtering condition
         """
         raise NotImplementedError("Not implemented")
+
+    def delete_strict(self, condition: dict, index_name: str, dataset_id: str) -> int:
+        """Delete rows without converting backend failures to zero."""
+        raise NotImplementedError("Strict delete is not implemented")
 
     """
     Helper functions for search result

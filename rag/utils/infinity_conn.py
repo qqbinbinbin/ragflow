@@ -103,6 +103,21 @@ class InfinityConnection(InfinityConnectionBase):
         tokens[0] = field
         return "^".join(tokens)
 
+    def index_exist_strict(self, index_name: str, knowledgebase_id: str = None) -> bool:
+        table_name = index_name if index_name.startswith("ragflow_doc_meta_") else f"{index_name}_{knowledgebase_id}"
+        inf_conn = self.connPool.get_conn()
+        try:
+            database = inf_conn.get_database(self.dbName)
+            try:
+                database.get_table(table_name)
+            except InfinityException as exc:
+                if exc.error_code == ErrorCode.TABLE_NOT_EXIST:
+                    return False
+                raise
+            return True
+        finally:
+            self.connPool.release_conn(inf_conn)
+
     """
     CRUD operations
     """
@@ -675,6 +690,31 @@ class InfinityConnection(InfinityConnectionBase):
         finally:
             self.connPool.release_conn(inf_conn)
         return True
+
+    def delete_strict(self, condition: dict, index_name: str, knowledgebase_id: str) -> int:
+        table_name = index_name if index_name.startswith("ragflow_doc_meta_") else f"{index_name}_{knowledgebase_id}"
+        inf_conn = self.connPool.get_conn()
+        try:
+            database = inf_conn.get_database(self.dbName)
+            try:
+                table = database.get_table(table_name)
+            except InfinityException as exc:
+                if exc.error_code == ErrorCode.TABLE_NOT_EXIST:
+                    return 0
+                raise
+
+            row_filter = self.equivalent_condition_to_str(dict(condition), table)
+            result = table.delete(row_filter)
+            deleted = getattr(result, "deleted_rows", None)
+            if not isinstance(deleted, int) or isinstance(deleted, bool) or deleted < 0:
+                raise RuntimeError("strict delete returned an invalid row count")
+
+            remaining, _ = table.output(["id"]).filter(row_filter).to_df()
+            if not remaining.empty:
+                raise RuntimeError("strict delete readback found remaining rows")
+            return deleted
+        finally:
+            self.connPool.release_conn(inf_conn)
 
     def adjust_chunk_pagerank_fea(
         self,

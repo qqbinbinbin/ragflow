@@ -39,6 +39,7 @@ from rag.nlp import rag_tokenizer
 from rag.svr.task_executor_refactor.task_context import TaskContext
 
 from api.db.services.doc_metadata_service import DocMetadataService
+from api.db.services.document_service import DocumentService
 from api.db.services.llm_service import LLMBundle
 from api.db.joint_services.tenant_model_service import resolve_model_config
 from rag.prompts.generator import gen_metadata, keyword_extraction, question_proposal, content_tagging
@@ -848,6 +849,9 @@ async def rechunk_doc_by_tree(
 
     try:
         await thread_pool_exec(
+            DocumentService.execute_document_store_write,
+            ctx.doc_id,
+            ctx.kb_id,
             settings.docStoreConn.insert,
             merged_rows,
             index_nm,
@@ -873,6 +877,9 @@ async def rechunk_doc_by_tree(
         for cid in src_ids:
             try:
                 await thread_pool_exec(
+                    DocumentService.execute_document_store_write,
+                    ctx.doc_id,
+                    ctx.kb_id,
                     settings.docStoreConn.update,
                     {"id": cid},
                     {

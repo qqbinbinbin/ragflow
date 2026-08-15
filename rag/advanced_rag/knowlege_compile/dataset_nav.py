@@ -122,7 +122,13 @@ def _vec_field(dim: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _store_get(tenant_id: str, kb_id: str, row_id: str) -> dict | None:
+async def _store_get(
+    tenant_id: str,
+    kb_id: str,
+    row_id: str,
+    *,
+    strict: bool = False,
+) -> dict | None:
     from common import settings
 
     index = _index_name(tenant_id)
@@ -137,6 +143,8 @@ async def _store_get(tenant_id: str, kb_id: str, row_id: str) -> dict | None:
             or None
         )
     except Exception:
+        if strict:
+            raise
         return None
 
 
@@ -216,8 +224,16 @@ async def _store_knn(
     return list(results.values())
 
 
-async def _store_upsert(tenant_id: str, kb_id: str, doc: dict) -> None:
+async def _store_upsert(
+    tenant_id: str,
+    kb_id: str,
+    doc: dict,
+    *,
+    owner_document_id: str | None = None,
+    strict: bool = False,
+) -> None:
     from common import settings
+    from api.db.services.document_service import DocumentService
 
     index = _index_name(tenant_id)
     row_id = doc.get("id", "")
@@ -227,36 +243,66 @@ async def _store_upsert(tenant_id: str, kb_id: str, doc: dict) -> None:
         index,
         [kb_id],
     )
+    async def _write(operation, *args):
+        if owner_document_id:
+            return await thread_pool_exec(
+                DocumentService.execute_document_store_write,
+                owner_document_id,
+                kb_id,
+                operation,
+                *args,
+            )
+        return await thread_pool_exec(operation, *args)
+
     if existing:
         upd = {k: v for k, v in doc.items() if k != "id"}
-        await thread_pool_exec(
+        result = await _write(
             settings.docStoreConn.update,
             {"id": row_id},
             upd,
             index,
             kb_id,
         )
+        if strict and result is False:
+            raise RuntimeError("strict dataset nav update failed")
     else:
-        await thread_pool_exec(
+        errors = await _write(
             settings.docStoreConn.insert,
             [doc],
             index,
             kb_id,
         )
+        if strict and errors:
+            raise RuntimeError(
+                f"strict dataset nav insert failed: {errors}"
+            )
 
 
-async def _store_delete(tenant_id: str, kb_id: str, row_id: str) -> None:
+async def _store_delete(
+    tenant_id: str,
+    kb_id: str,
+    row_id: str,
+    *,
+    strict: bool = False,
+) -> None:
     from common import settings
 
     index = _index_name(tenant_id)
     try:
+        delete_operation = (
+            settings.docStoreConn.delete_strict
+            if strict
+            else settings.docStoreConn.delete
+        )
         await thread_pool_exec(
-            settings.docStoreConn.delete,
+            delete_operation,
             {"id": [row_id]},
             index,
             kb_id,
         )
     except Exception:
+        if strict:
+            raise
         pass
 
 
@@ -624,7 +670,12 @@ async def upsert_dataset_nav_doc(
                     new_emb = await _embed(embd_mdl, new_desc)
                     if _vector_len(new_emb) > 0:
                         cluster_row[_vec_field(len(new_emb))] = new_emb
-                await _store_upsert(tenant_id, kb_id, cluster_row)
+                await _store_upsert(
+                    tenant_id,
+                    kb_id,
+                    cluster_row,
+                    owner_document_id=doc_id,
+                )
 
             # Upsert nav_doc under the cluster
             depth = cluster_row.get("depth_int", 1) + 1 if cluster_row else 2
@@ -637,7 +688,12 @@ async def upsert_dataset_nav_doc(
                 embd_mdl,
                 doc_embedding,
             )
-            await _store_upsert(tenant_id, kb_id, nav_doc_row)
+            await _store_upsert(
+                tenant_id,
+                kb_id,
+                nav_doc_row,
+                owner_document_id=doc_id,
+            )
 
             # Check fanout — if the cluster now has too many children, trigger split
             await _maybe_split_cluster(
@@ -646,6 +702,7 @@ async def upsert_dataset_nav_doc(
                 best_name,
                 embd_mdl,
                 chat_mdl,
+                owner_document_id=doc_id,
             )
 
         elif best_name and sim >= _MIN_SIM:
@@ -673,7 +730,12 @@ async def upsert_dataset_nav_doc(
             )
             if embd_mdl and _vector_len(doc_embedding) > 0:
                 new_cluster[_vec_field(len(doc_embedding))] = doc_embedding
-            await _store_upsert(tenant_id, kb_id, new_cluster)
+            await _store_upsert(
+                tenant_id,
+                kb_id,
+                new_cluster,
+                owner_document_id=doc_id,
+            )
 
             nav_doc_row = _make_nav_doc_row(
                 kb_id,
@@ -684,7 +746,12 @@ async def upsert_dataset_nav_doc(
                 embd_mdl,
                 doc_embedding,
             )
-            await _store_upsert(tenant_id, kb_id, nav_doc_row)
+            await _store_upsert(
+                tenant_id,
+                kb_id,
+                nav_doc_row,
+                owner_document_id=doc_id,
+            )
         else:
             # ── Create root-level new cluster ──
             root_title, new_desc = await _llm_create_summary(chat_mdl, [summary])
@@ -700,7 +767,12 @@ async def upsert_dataset_nav_doc(
             )
             if embd_mdl and _vector_len(doc_embedding) > 0:
                 new_cluster[_vec_field(len(doc_embedding))] = doc_embedding
-            await _store_upsert(tenant_id, kb_id, new_cluster)
+            await _store_upsert(
+                tenant_id,
+                kb_id,
+                new_cluster,
+                owner_document_id=doc_id,
+            )
 
             nav_doc_row = _make_nav_doc_row(
                 kb_id,
@@ -711,7 +783,12 @@ async def upsert_dataset_nav_doc(
                 embd_mdl,
                 doc_embedding,
             )
-            await _store_upsert(tenant_id, kb_id, nav_doc_row)
+            await _store_upsert(
+                tenant_id,
+                kb_id,
+                nav_doc_row,
+                owner_document_id=doc_id,
+            )
 
     except Exception:
         logging.exception(
@@ -730,6 +807,8 @@ async def remove_dataset_nav_doc(
     tenant_id: str,
     kb_id: str,
     doc_id: str,
+    *,
+    strict: bool = False,
 ) -> None:
     """Remove a document from the nav clustering tree.
 
@@ -748,91 +827,191 @@ async def remove_dataset_nav_doc(
         await lock.spin_acquire()
     except Exception:
         logging.exception("dataset_nav: lock acquire failed for kb=%s", kb_id)
+        if strict:
+            raise
         return
 
     try:
-        # 1. Find and delete the nav_doc row
+        # Keep the nav_doc row as the retry anchor until the parent chain is
+        # durably detached. The ancestor path lives in its existing JSON
+        # payload so a response-loss retry never depends on an already deleted
+        # cluster to rediscover the next parent.
         doc_row_id = _nav_doc_id(doc_id)
-        doc_row = await _store_get(tenant_id, kb_id, doc_row_id)
+        doc_row = await _store_get(
+            tenant_id,
+            kb_id,
+            doc_row_id,
+            strict=strict,
+        )
         if not doc_row:
             return
-        parent_name = doc_row.get("parent_kwd", "")
-        await _store_delete(tenant_id, kb_id, doc_row_id)
+        try:
+            payload = json.loads(doc_row.get("content_with_weight") or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        cleanup_path = payload.get("delete_parent_path")
+        if not isinstance(cleanup_path, list) or not all(
+            isinstance(name, str) for name in cleanup_path
+        ):
+            cleanup_path = []
+            parent_name = doc_row.get("parent_kwd", "")
+            visited = set()
+            while parent_name and parent_name != "root":
+                if parent_name in visited:
+                    raise RuntimeError("dataset nav parent cycle detected")
+                visited.add(parent_name)
+                cleanup_path.append(parent_name)
+                cluster_row = await _store_get(
+                    tenant_id,
+                    kb_id,
+                    _nav_cluster_id(kb_id, parent_name),
+                    strict=strict,
+                )
+                if not cluster_row:
+                    break
+                parent_name = cluster_row.get("parent_kwd", "")
+            payload["delete_parent_path"] = cleanup_path
+            doc_row["content_with_weight"] = json.dumps(
+                payload,
+                ensure_ascii=False,
+            )
+            await _store_upsert(
+                tenant_id,
+                kb_id,
+                doc_row,
+                strict=strict,
+            )
+            persisted_doc_row = await _store_get(
+                tenant_id,
+                kb_id,
+                doc_row_id,
+                strict=strict,
+            )
+            if strict and (
+                not persisted_doc_row
+                or persisted_doc_row.get("content_with_weight")
+                != doc_row["content_with_weight"]
+            ):
+                raise RuntimeError("strict dataset nav delete intent was not durable")
 
-        # 2. Remove doc_id from the parent cluster's doc_ids_kwd
-        if parent_name and parent_name != "root":
-            cluster_id = _nav_cluster_id(kb_id, parent_name)
-            cluster_row = await _store_get(tenant_id, kb_id, cluster_id)
-            if cluster_row:
-                doc_ids = cluster_row.get("doc_ids_kwd") or []
-                if doc_id in doc_ids:
-                    doc_ids.remove(doc_id)
-                if not doc_ids:
-                    # Cluster is empty — delete it
-                    await _store_delete(tenant_id, kb_id, cluster_id)
-                    # Recurse: check grandparent
-                    grandparent = cluster_row.get("parent_kwd", "")
-                    if grandparent and grandparent != "root":
-                        await _cleanup_empty_cluster(
-                            tenant_id,
-                            kb_id,
-                            grandparent,
-                        )
-                else:
-                    cluster_row["doc_ids_kwd"] = doc_ids
-                    cluster_row["doc_count_int"] = len(doc_ids)
-                    await _store_upsert(tenant_id, kb_id, cluster_row)
+        for cluster_name in cleanup_path:
+            cluster_id = _nav_cluster_id(kb_id, cluster_name)
+            cluster_row = await _store_get(
+                tenant_id,
+                kb_id,
+                cluster_id,
+                strict=strict,
+            )
+            if not cluster_row:
+                continue
+            doc_ids = [
+                value
+                for value in (cluster_row.get("doc_ids_kwd") or [])
+                if value != doc_id
+            ]
+            children = await _store_search(
+                tenant_id,
+                kb_id,
+                {
+                    "kb_id": [kb_id],
+                    "compile_kwd": [_COMPILE_KWD],
+                    "parent_kwd": [cluster_name],
+                },
+                ["id"],
+                limit=100,
+            )
+            child_ids = {
+                child.get("id")
+                for child in children
+                if child.get("id") != doc_row_id
+            }
+            if not doc_ids and not child_ids:
+                await _store_delete(
+                    tenant_id,
+                    kb_id,
+                    cluster_id,
+                    strict=strict,
+                )
+                continue
+            if doc_ids != (cluster_row.get("doc_ids_kwd") or []):
+                cluster_row["doc_ids_kwd"] = doc_ids
+                cluster_row["doc_count_int"] = len(doc_ids)
+                await _store_upsert(
+                    tenant_id,
+                    kb_id,
+                    cluster_row,
+                    strict=strict,
+                )
+                persisted_cluster = await _store_get(
+                    tenant_id,
+                    kb_id,
+                    cluster_id,
+                    strict=strict,
+                )
+                if strict and (
+                    not persisted_cluster
+                    or doc_id in (persisted_cluster.get("doc_ids_kwd") or [])
+                    or persisted_cluster.get("doc_count_int") != len(doc_ids)
+                ):
+                    raise RuntimeError("strict dataset nav parent detach was not durable")
+
+        await _store_delete(tenant_id, kb_id, doc_row_id, strict=strict)
     except Exception:
         logging.exception(
             "dataset_nav: remove failed for kb=%s doc=%s",
             kb_id,
             doc_id,
         )
+        if strict:
+            raise
     finally:
         try:
             lock.release()
         except Exception:
             logging.exception("dataset_nav: lock release failed for kb=%s", kb_id)
+            if strict:
+                raise
 
 
 async def _cleanup_empty_cluster(
     tenant_id: str,
     kb_id: str,
     cluster_name: str,
+    *,
+    strict: bool = False,
 ) -> None:
     """Recursively remove a cluster if it has no doc children and no direct doc descendants."""
     cluster_id = _nav_cluster_id(kb_id, cluster_name)
-    cluster = await _store_get(tenant_id, kb_id, cluster_id)
+    cluster = await _store_get(
+        tenant_id,
+        kb_id,
+        cluster_id,
+        strict=strict,
+    )
     if not cluster:
         return
-    # Check direct children (nav_cluster)
-    from common import settings
-    from common.doc_store.doc_store_base import OrderByExpr
-
-    index = _index_name(tenant_id)
     child_cond = {
         "kb_id": [kb_id],
         "compile_kwd": [_COMPILE_KWD],
         "parent_kwd": [cluster_name],
     }
-    res = await thread_pool_exec(
-        settings.docStoreConn.search,
-        ["id"],
-        [],
+    children = await _store_search(
+        tenant_id,
+        kb_id,
         child_cond,
-        [],
-        OrderByExpr(),
-        0,
-        100,
-        index,
-        [kb_id],
+        ["id"],
+        limit=100,
     )
-    children = settings.docStoreConn.get_fields(res, ["id"]) if res else {}
     if not children and not cluster.get("doc_ids_kwd"):
         grandparent = cluster.get("parent_kwd", "")
-        await _store_delete(tenant_id, kb_id, cluster_id)
         if grandparent and grandparent != "root":
-            await _cleanup_empty_cluster(tenant_id, kb_id, grandparent)
+            await _cleanup_empty_cluster(
+                tenant_id,
+                kb_id,
+                grandparent,
+                strict=strict,
+            )
+        await _store_delete(tenant_id, kb_id, cluster_id, strict=strict)
 
 
 async def _maybe_split_cluster(
@@ -841,6 +1020,7 @@ async def _maybe_split_cluster(
     cluster_name: str,
     embd_mdl,
     chat_mdl,
+    owner_document_id: str | None = None,
 ) -> None:
     """If a cluster exceeds fanout or doc count, split children via AHC."""
     from common import settings
@@ -959,7 +1139,12 @@ async def _maybe_split_cluster(
             doc_ids,
             group_emb,
         )
-        await _store_upsert(tenant_id, kb_id, new_cluster)
+        await _store_upsert(
+            tenant_id,
+            kb_id,
+            new_cluster,
+            owner_document_id=owner_document_id,
+        )
 
         # Reparent children to new split cluster
         for kn in kid_names:
@@ -969,7 +1154,12 @@ async def _maybe_split_cluster(
             if row:
                 row["parent_kwd"] = group_name
                 row["depth_int"] = depth + 1
-                await _store_upsert(tenant_id, kb_id, row)
+                await _store_upsert(
+                    tenant_id,
+                    kb_id,
+                    row,
+                    owner_document_id=owner_document_id,
+                )
 
 
 async def search_dataset_nav(
@@ -1088,13 +1278,20 @@ def remove_dataset_nav_doc_sync(
     tenant_id: str,
     kb_id: str,
     doc_id: str,
+    *,
+    strict: bool = False,
 ) -> None:
     """Sync wrapper around ``remove_dataset_nav_doc``."""
     try:
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(
-                remove_dataset_nav_doc(tenant_id, kb_id, doc_id),
+                remove_dataset_nav_doc(
+                    tenant_id,
+                    kb_id,
+                    doc_id,
+                    strict=strict,
+                ),
             )
         finally:
             loop.close()
@@ -1104,3 +1301,5 @@ def remove_dataset_nav_doc_sync(
             kb_id,
             doc_id,
         )
+        if strict:
+            raise

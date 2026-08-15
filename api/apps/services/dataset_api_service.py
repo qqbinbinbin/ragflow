@@ -172,30 +172,13 @@ async def delete_datasets(tenant_id: str, ids: list = None, delete_all: bool = F
     errors = []
     success_count = 0
     for kb_id, kb in kb_id_instance_pairs:
-        for doc in DocumentService.query(kb_id=kb_id):
-            if not DocumentService.remove_document(doc, tenant_id):
-                errors.append(f"Remove document '{doc.id}' error for dataset '{kb_id}'")
-                continue
-            f2d = File2DocumentService.get_by_document_id(doc.id)
-            if f2d:
-                FileService.filter_delete(
-                    [
-                        File.source_type == FileSource.KNOWLEDGEBASE,
-                        File.id == f2d[0].file_id,
-                    ]
-                )
-            else:
-                # Normal uploads create a File2Document row via FileService.add_file_from_kb.
-                # A missing row usually means stale/partial data (e.g. link removed earlier,
-                # failed post-insert file linkage, or legacy rows). Deletion still proceeds.
-                logging.warning(
-                    "delete_datasets: document %s in dataset %s has no File2Document row; skipping linked file delete",
-                    doc.id,
-                    kb_id,
-                )
-            File2DocumentService.delete_by_document_id(doc.id)
-        FileService.filter_delete([File.source_type == FileSource.KNOWLEDGEBASE, File.type == "folder", File.name == kb.name])
-
+        doc_ids = [doc.id for doc in DocumentService.query(kb_id=kb_id)]
+        document_errors = FileService.delete_docs(doc_ids, tenant_id)
+        if document_errors:
+            errors.append(
+                f"Remove documents error for dataset '{kb_id}': {document_errors}"
+            )
+            continue
         # Drop index for this dataset
         try:
             from rag.nlp import search
@@ -204,10 +187,12 @@ async def delete_datasets(tenant_id: str, ids: list = None, delete_all: bool = F
             settings.docStoreConn.delete_idx(idxnm, kb_id)
         except Exception as e:
             errors.append(f"Failed to drop index for dataset {kb_id}: {e}")
+            continue
 
         if not KnowledgebaseService.delete_by_id(kb_id):
             errors.append(f"Delete dataset error for {kb_id}")
             continue
+        FileService.filter_delete([File.source_type == FileSource.KNOWLEDGEBASE, File.type == "folder", File.name == kb.name])
         success_count += 1
 
     if not errors:

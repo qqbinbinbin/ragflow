@@ -19,6 +19,7 @@ import os
 import time
 from io import BytesIO
 from common.decorator import singleton
+from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import ContainerClient
 from common import settings
 
@@ -61,13 +62,34 @@ class RAGFlowAzureSasBlob:
                 self.__open__()
                 time.sleep(1)
 
-    def rm(self, bucket, fnm):
+    def rm(self, bucket, fnm, tenant_id=None):
         try:
             self.conn.delete_blob(f"{bucket}/{fnm}")
         except Exception:
             logging.exception(f"Fail rm {bucket}/{fnm}")
 
-    def get(self, bucket, fnm):
+    def rm_strict(self, bucket, fnm, tenant_id=None):
+        blob_name = f"{bucket}/{fnm}"
+        try:
+            self.conn.delete_blob(blob_name)
+        except ResourceNotFoundError:
+            pass
+        if self.conn.get_blob_client(blob_name).exists():
+            raise OSError("strict object deletion was incomplete")
+
+    def rm_prefix_strict(self, bucket, prefix, tenant_id=None):
+        blob_prefix = f"{bucket}/{prefix}"
+        blobs = list(self.conn.list_blobs(name_starts_with=blob_prefix))
+        for blob in blobs:
+            try:
+                self.conn.delete_blob(blob.name)
+            except ResourceNotFoundError:
+                pass
+        if list(self.conn.list_blobs(name_starts_with=blob_prefix)):
+            raise OSError("strict object prefix deletion was incomplete")
+        return len(blobs)
+
+    def get(self, bucket, fnm, tenant_id=None):
         blob_name = f"{bucket}/{fnm}"
         for _ in range(1):
             try:
@@ -79,13 +101,17 @@ class RAGFlowAzureSasBlob:
                 time.sleep(1)
         return None
 
-    def obj_exist(self, bucket, fnm):
+    def obj_exist(self, bucket, fnm, tenant_id=None):
         blob_name = f"{bucket}/{fnm}"
         try:
             return self.conn.get_blob_client(f"{blob_name}").exists()
         except Exception:
             logging.exception(f"Fail put {blob_name}")
         return False
+
+    def obj_exist_strict(self, bucket, fnm, tenant_id=None):
+        blob_name = f"{bucket}/{fnm}"
+        return self.conn.get_blob_client(blob_name).exists()
 
     def get_presigned_url(self, bucket, fnm, expires):
         blob_name = f"{bucket}/{fnm}"

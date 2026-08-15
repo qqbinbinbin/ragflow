@@ -151,6 +151,7 @@ class TaskHandler:
         """
         self._task_context = ctx
         self._billing_hook = billing_hook
+        self._chunk_service: ChunkService | None = None
 
     @staticmethod
     def _is_standard_chunking_task(task_type: str) -> bool:
@@ -186,22 +187,17 @@ class TaskHandler:
             if self._task_context.has_canceled_func(task_id):
                 if self._is_standard_chunking_task(self._task_context.task_type):
                     abort_doc_chunking_counter(task_doc_id)
-                    try:
-                        exists = await thread_pool_exec(
-                            settings.docStoreConn.index_exist,
-                            search.index_name(task_tenant_id),
+                    if (
+                        self._chunk_service is not None
+                        and not await thread_pool_exec(
+                            DocumentService.document_deletion_owns_cleanup,
+                            task_doc_id,
+                        )
+                    ):
+                        await self._chunk_service.rollback_task_writes(
+                            task_tenant_id,
                             task_dataset_id,
                         )
-                        if exists:
-                            ret = await thread_pool_exec(
-                                settings.docStoreConn.delete,
-                                {"doc_id": task_doc_id},
-                                search.index_name(task_tenant_id),
-                                task_dataset_id,
-                            )
-                            self._task_context.recording_context.save_func_return_value("docStoreConn.delete", ret)
-                    except Exception as e:
-                        logging.exception(f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
 
     @timeout(60 * 60 * 3, 1)
     async def handle(self) -> None:
@@ -563,6 +559,7 @@ class TaskHandler:
         # Build chunks
         start_ts = timer()
         chunk_service = ChunkService(ctx=ctx)
+        self._chunk_service = chunk_service
 
         # Get storage binary
         bucket, name = File2DocumentService.get_storage_address(doc_id=ctx.doc_id)
@@ -620,8 +617,6 @@ class TaskHandler:
         # Insert chunks
         chunk_count = len(set([chunk["id"] for chunk in chunks]))
         start_ts = timer()
-
-        chunk_service = ChunkService(ctx=ctx)
 
         if ctx.has_canceled_func(task_id):
             abort_doc_chunking_counter(task_doc_id)

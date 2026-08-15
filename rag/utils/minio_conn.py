@@ -166,6 +166,26 @@ class RAGFlowMinio:
 
     @use_default_bucket
     @use_prefix_path
+    def rm_strict(self, bucket, fnm, tenant_id=None):
+        self.conn.remove_object(bucket, fnm)
+        if self._obj_exist_strict(bucket, fnm):
+            raise OSError("strict object deletion was incomplete")
+
+    @use_default_bucket
+    @use_prefix_path
+    def rm_prefix_strict(self, bucket, prefix, tenant_id=None):
+        objects = list(self.conn.list_objects(bucket, prefix=prefix, recursive=True))
+        for obj in objects:
+            self.conn.remove_object(bucket, obj.object_name)
+        remaining = list(
+            self.conn.list_objects(bucket, prefix=prefix, recursive=True)
+        )
+        if remaining:
+            raise OSError("strict object prefix deletion was incomplete")
+        return len(objects)
+
+    @use_default_bucket
+    @use_prefix_path
     def get(self, bucket, filename, tenant_id=None):
         for _ in range(1):
             try:
@@ -193,6 +213,22 @@ class RAGFlowMinio:
         except Exception:
             logging.exception(f"obj_exist {bucket}/{filename} got exception")
             return False
+
+    @use_default_bucket
+    @use_prefix_path
+    def obj_exist_strict(self, bucket, filename, tenant_id=None):
+        return self._obj_exist_strict(bucket, filename)
+
+    def _obj_exist_strict(self, bucket, filename):
+        if not self.conn.bucket_exists(bucket):
+            return False
+        try:
+            self.conn.stat_object(bucket, filename)
+            return True
+        except S3Error as exc:
+            if exc.code in ["NoSuchKey", "NoSuchBucket", "ResourceNotFound"]:
+                return False
+            raise
 
     @use_default_bucket
     def bucket_exists(self, bucket):

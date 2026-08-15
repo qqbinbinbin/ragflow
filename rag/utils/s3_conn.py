@@ -154,6 +154,49 @@ class RAGFlowS3:
         except Exception:
             logging.exception(f"Fail rm {bucket}/{fnm}")
 
+    @staticmethod
+    def _is_not_found_error(error):
+        return error.response.get("Error", {}).get("Code") in {
+            "404",
+            "NoSuchBucket",
+            "NoSuchKey",
+            "NotFound",
+        }
+
+    def _obj_exist_strict(self, bucket, fnm):
+        try:
+            self.conn[0].head_object(Bucket=bucket, Key=fnm)
+            return True
+        except ClientError as error:
+            if self._is_not_found_error(error):
+                return False
+            raise
+
+    def _list_prefix_strict(self, bucket, prefix):
+        paginator = self.conn[0].get_paginator("list_objects_v2")
+        return [
+            item["Key"]
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+            for item in page.get("Contents", [])
+        ]
+
+    @use_prefix_path
+    @use_default_bucket
+    def rm_strict(self, bucket, fnm, *args, **kwargs):
+        self.conn[0].delete_object(Bucket=bucket, Key=fnm)
+        if self._obj_exist_strict(bucket, fnm):
+            raise OSError("strict object deletion was incomplete")
+
+    @use_prefix_path
+    @use_default_bucket
+    def rm_prefix_strict(self, bucket, prefix, *args, **kwargs):
+        object_names = self._list_prefix_strict(bucket, prefix)
+        for object_name in object_names:
+            self.conn[0].delete_object(Bucket=bucket, Key=object_name)
+        if self._list_prefix_strict(bucket, prefix):
+            raise OSError("strict object prefix deletion was incomplete")
+        return len(object_names)
+
     @use_prefix_path
     @use_default_bucket
     def get(self, bucket, fnm, *args, **kwargs):
@@ -179,6 +222,11 @@ class RAGFlowS3:
                 return False
             else:
                 raise
+
+    @use_prefix_path
+    @use_default_bucket
+    def obj_exist_strict(self, bucket, fnm, *args, **kwargs):
+        return self._obj_exist_strict(bucket, fnm)
 
     @use_prefix_path
     @use_default_bucket

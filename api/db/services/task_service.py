@@ -672,6 +672,12 @@ def has_canceled(task_id):
             return True
     except Exception as e:
         logging.exception(e)
+    try:
+        if TaskService.do_cancel(task_id):
+            logging.info(f"Task: {task_id} has been canceled by document state")
+            return True
+    except Exception as e:
+        logging.exception(e)
     return False
 
 

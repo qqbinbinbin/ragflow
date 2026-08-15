@@ -50,8 +50,16 @@ def _stub(monkeypatch, name, **attrs):
     return mod
 
 
-def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
+def _load_delete_datasets_module(
+    monkeypatch,
+    *,
+    f2d_rows,
+    file_filter_delete,
+    delete_idx=None,
+    delete_kb=None,
+):
     f2d_delete = MagicMock()
+    delete_docs = MagicMock(return_value="")
     kb = SimpleNamespace(id="kb-1", tenant_id="tenant-1", name="test-kb")
     doc = SimpleNamespace(id="doc-1")
 
@@ -72,17 +80,21 @@ def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
             delete_by_document_id=f2d_delete,
         ),
     )
+    delete_kb = delete_kb or MagicMock(return_value=True)
     _stub(
         monkeypatch,
         "api.db.services.file_service",
-        FileService=SimpleNamespace(filter_delete=file_filter_delete),
+        FileService=SimpleNamespace(
+            delete_docs=delete_docs,
+            filter_delete=file_filter_delete,
+        ),
     )
     _stub(
         monkeypatch,
         "api.db.services.knowledgebase_service",
         KnowledgebaseService=SimpleNamespace(
             get_or_none=lambda id, tenant_id: kb,
-            delete_by_id=lambda kb_id: True,
+            delete_by_id=delete_kb,
             query=lambda **kwargs: [],
         ),
         validate_dataset_embedding_models=lambda kbs: None,
@@ -112,6 +124,11 @@ def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
     )
     _stub(
         monkeypatch,
+        "api.db.services.tenant_model_service",
+        TenantModelService=SimpleNamespace(),
+    )
+    _stub(
+        monkeypatch,
         "api.db.joint_services.tenant_model_service",
         get_model_config_from_provider_instance=MagicMock(),
         resolve_model_config=MagicMock(),
@@ -128,7 +145,9 @@ def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
     _stub(
         monkeypatch,
         "common.settings",
-        docStoreConn=SimpleNamespace(delete_idx=lambda *_args, **_kwargs: None),
+        docStoreConn=SimpleNamespace(
+            delete_idx=delete_idx or (lambda *_args, **_kwargs: None)
+        ),
     )
     _stub(
         monkeypatch,
@@ -156,10 +175,21 @@ def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
         LLMType=SimpleNamespace(),
         ModelTypeBinary=_StubModelTypeBinary,
     )
+    rag_nlp = _stub(monkeypatch, "rag.nlp")
+    rag_nlp.__path__ = []
     _stub(
         monkeypatch,
         "rag.nlp.search",
         index_name=lambda tenant_id: f"idx-{tenant_id}",
+    )
+    advanced_rag = _stub(monkeypatch, "rag.advanced_rag")
+    advanced_rag.__path__ = []
+    knowledge_compile = _stub(monkeypatch, "rag.advanced_rag.knowlege_compile")
+    knowledge_compile.__path__ = []
+    _stub(
+        monkeypatch,
+        "rag.advanced_rag.knowlege_compile.wiki",
+        WIKI_PAGE_COMPILE_KWD="wiki_page",
     )
 
     repo_root = Path(__file__).resolve().parents[5]
@@ -168,14 +198,14 @@ def _load_delete_datasets_module(monkeypatch, *, f2d_rows, file_filter_delete):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "test_delete_datasets_module", module)
     spec.loader.exec_module(module)
-    return module, f2d_delete
+    return module, f2d_delete, delete_docs, delete_kb
 
 
 @pytest.mark.asyncio
 async def test_delete_datasets_skips_file_delete_when_no_file2document(monkeypatch):
     """Documents without a File2Document row must not crash dataset deletion."""
     file_filter_delete = MagicMock(return_value=0)
-    module, f2d_delete = _load_delete_datasets_module(
+    module, f2d_delete, delete_docs, _delete_kb = _load_delete_datasets_module(
         monkeypatch,
         f2d_rows=[],
         file_filter_delete=file_filter_delete,
@@ -185,15 +215,16 @@ async def test_delete_datasets_skips_file_delete_when_no_file2document(monkeypat
 
     assert ok is True
     assert result == {"success_count": 1}
+    delete_docs.assert_called_once_with(["doc-1"], "tenant-1")
     file_filter_delete.assert_called_once()
-    f2d_delete.assert_called_once_with("doc-1")
+    f2d_delete.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_delete_datasets_deletes_linked_file_when_file2document_exists(monkeypatch):
     f2d_row = SimpleNamespace(file_id="file-1")
     file_filter_delete = MagicMock(side_effect=[1, 0])
-    module, _f2d_delete = _load_delete_datasets_module(
+    module, f2d_delete, delete_docs, _delete_kb = _load_delete_datasets_module(
         monkeypatch,
         f2d_rows=[f2d_row],
         file_filter_delete=file_filter_delete,
@@ -203,4 +234,34 @@ async def test_delete_datasets_deletes_linked_file_when_file2document_exists(mon
 
     assert ok is True
     assert result == {"success_count": 1}
-    assert file_filter_delete.call_count == 2
+    delete_docs.assert_called_once_with(["doc-1"], "tenant-1")
+    f2d_delete.assert_not_called()
+    assert file_filter_delete.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_datasets_preserves_kb_and_folder_when_index_drop_fails(
+    monkeypatch,
+):
+    file_filter_delete = MagicMock(return_value=0)
+    delete_kb = MagicMock(return_value=True)
+
+    def reject_index_drop(*_args, **_kwargs):
+        raise RuntimeError("index backend unavailable")
+
+    module, _f2d_delete, delete_docs, delete_kb = _load_delete_datasets_module(
+        monkeypatch,
+        f2d_rows=[],
+        file_filter_delete=file_filter_delete,
+        delete_idx=reject_index_drop,
+        delete_kb=delete_kb,
+    )
+
+    ok, result = await module.delete_datasets("tenant-1", ids=["kb-1"])
+
+    assert ok is False
+    assert "Successfully deleted 0 datasets" in result
+    assert "index backend unavailable" in result
+    delete_docs.assert_called_once_with(["doc-1"], "tenant-1")
+    file_filter_delete.assert_not_called()
+    delete_kb.assert_not_called()

@@ -29,7 +29,7 @@ import xxhash
 from peewee import fn
 
 from api.db import KNOWLEDGEBASE_FOLDER_NAME, SKILLS_FOLDER_NAME, FileType
-from api.db.db_models import DB, Document, File, File2Document, Knowledgebase, Task
+from api.db.db_models import DB, Document, File, File2Document, Knowledgebase
 from api.db.services import duplicate_name
 from api.db.services.common_service import CommonService
 from api.db.services.document_service import DocumentService
@@ -38,7 +38,6 @@ from common.misc_utils import get_uuid
 from common.ssrf_guard import assert_url_is_safe
 from common.constants import TaskStatus, FileSource, ParserType, MAXIMUM_PAGE_NUMBER
 from api.db.services.knowledgebase_service import KnowledgebaseService
-from api.db.services.task_service import TaskService
 from api.utils.file_utils import filename_type, read_potential_broken_pdf, thumbnail_img, sanitize_path
 from rag.llm.cv_model import GptV4
 from common import settings
@@ -685,23 +684,50 @@ class FileService(CommonService):
                 e, doc = DocumentService.get_by_id(doc_id)
                 if not e:
                     raise Exception("Document not found!")
-                tenant_id = DocumentService.get_tenant_id(doc_id)
-                if not tenant_id:
+                document_tenant_id = DocumentService.get_tenant_id(doc_id)
+                if not document_tenant_id:
                     raise Exception("Tenant not found!")
+                if document_tenant_id != tenant_id:
+                    raise PermissionError("document tenant scope mismatch")
 
-                b, n = File2DocumentService.get_storage_address(doc_id=doc_id)
+                document_links = File2DocumentService.get_by_document_id(doc_id)
+                linked_file = None
+                owns_original = False
+                if document_links:
+                    linked_file = File.get_by_id(document_links[0].file_id)
+                    file_links = File2DocumentService.get_by_file_id(linked_file.id)
+                    owns_original = (
+                        linked_file.source_type == FileSource.KNOWLEDGEBASE
+                        and len(file_links) == 1
+                        and file_links[0].document_id == doc_id
+                    )
 
-                TaskService.filter_delete([Task.doc_id == doc_id])
-                if not DocumentService.remove_document(doc, tenant_id):
+                def delete_exclusive_original():
+                    if not owns_original:
+                        return
+                    b, n = File2DocumentService.get_storage_address(doc_id=doc_id)
+                    settings.STORAGE_IMPL.rm_strict(b, n, tenant_id)
+
+                def delete_file_projection():
+                    File2DocumentService.delete_by_document_id(doc_id)
+                    if linked_file is None or not owns_original:
+                        return
+                    deleted_file_count = FileService.filter_delete(
+                        [
+                            File.source_type == FileSource.KNOWLEDGEBASE,
+                            File.id == linked_file.id,
+                        ]
+                    )
+                    if deleted_file_count != 1:
+                        raise RuntimeError("exclusive document file delete count mismatch")
+
+                if not DocumentService.remove_document(
+                    doc,
+                    tenant_id,
+                    strict_cleanup=delete_exclusive_original,
+                    final_db_cleanup=delete_file_projection,
+                ):
                     raise Exception("Database error (Document removal)!")
-
-                f2d = File2DocumentService.get_by_document_id(doc_id)
-                deleted_file_count = 0
-                if f2d:
-                    deleted_file_count = FileService.filter_delete([File.source_type == FileSource.KNOWLEDGEBASE, File.id == f2d[0].file_id])
-                File2DocumentService.delete_by_document_id(doc_id)
-                if deleted_file_count > 0:
-                    settings.STORAGE_IMPL.rm(b, n)
 
                 doc_parser = doc.parser_id
                 if doc_parser == ParserType.TABLE:

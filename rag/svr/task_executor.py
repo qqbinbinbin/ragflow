@@ -1765,23 +1765,14 @@ async def handle_task():
         CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
         run_mode = os.environ.get("TE_RUN_MODE", "0")
         logging.info(f"TE_RUN_MODE is {run_mode}")
+        if run_mode != "0":
+            raise RuntimeError(
+                f"unsupported TE_RUN_MODE={run_mode}; document mutation consistency requires TE_RUN_MODE=0"
+            )
 
-        # Check if dry-run comparison is enabled via environment variable
-        if run_mode == "1":  # dry run mode - compare
-            set_recording_context(RecordingContext())
-            await do_handle_task(task)  # original execution
-            # dry run mode
-            logging.info(f"-----dry run task:{task_id}, {task.get('name', '')}, doc id:{task.get('doc_id', '')}")
-            await TaskManager.dry_run_task(task, get_recording_context(), chat_limiter, minio_limiter, chunk_limiter, embed_limiter, kg_limiter, set_progress, has_canceled)
-        elif run_mode == "0":  # use refactor-ed version
-            # switch to refactor-ed version
-            logging.info(f"-----run refactor-ed task executor:{task_id}, {task.get('name', '')}, doc id:{task.get('doc_id', '')}")
-            set_recording_context(NullRecordingContext())
-            await TaskManager.run_refactored_task(task, chat_limiter, minio_limiter, chunk_limiter, embed_limiter, kg_limiter, set_progress, has_canceled)
-        else:  # original version
-            logging.info(f"-----run original task executor:{task_id}, {task.get('name', '')}, doc id:{task.get('doc_id', '')}")
-            set_recording_context(NullRecordingContext())
-            await do_handle_task(task)
+        logging.info(f"-----run refactor-ed task executor:{task_id}, {task.get('name', '')}, doc id:{task.get('doc_id', '')}")
+        set_recording_context(NullRecordingContext())
+        await TaskManager.run_refactored_task(task, chat_limiter, minio_limiter, chunk_limiter, embed_limiter, kg_limiter, set_progress, has_canceled)
 
         DONE_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)

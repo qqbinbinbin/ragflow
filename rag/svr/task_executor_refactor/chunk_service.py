@@ -17,7 +17,7 @@
 Chunk Service Module.
 
 Provides [`ChunkService`](rag/svr/task_executor_refactor/chunk_service.py:50) for document chunking,
-post-processing (keywords, questions, metadata, tags), MinIO upload, and chunk insertion into document store.
+post-processing (keywords, questions, metadata, tags), image staging, and guarded persistence.
 
 This module orchestrates the chunk building pipeline by delegating to:
 - [`chunk_builder`](rag/svr/task_executor_refactor/chunk_builder.py): Parser selection and document chunking
@@ -28,7 +28,6 @@ import asyncio
 import copy
 import logging
 from datetime import datetime
-from functools import partial
 from timeit import default_timer as timer
 from typing import Any, Dict, List
 
@@ -40,9 +39,10 @@ from common.misc_utils import thread_pool_exec
 from common.float_utils import normalize_overlapped_percent
 from rag.nlp import search
 from rag.svr.task_executor_refactor.task_context import TaskContext
-from rag.utils.base64_image import image2id
+from rag.utils.base64_image import image_to_binary
 
 from api.db.services.task_service import TaskService
+from api.db.services.document_service import DocumentService
 from rag.svr.task_executor_refactor.constants import GRAPH_RAPTOR_FAKE_DOC_ID
 
 # Re-export for backward compatibility
@@ -65,7 +65,7 @@ class ChunkService:
 
     This service handles:
     - Document chunking via parser modules (delegated to chunk_builder)
-    - MinIO upload of chunk images
+    - Transactionally guarded persistence of chunk images
     - Keyword extraction (delegated to chunk_post_processor)
     - Question generation (delegated to chunk_post_processor)
     - Metadata generation (delegated to chunk_post_processor)
@@ -86,6 +86,9 @@ class ChunkService:
             ctx: TaskContext containing task configuration and execution resources.
         """
         self._task_context = ctx
+        self._pending_images: dict[str, bytes] = {}
+        self._persisted_chunk_ids: set[str] = set()
+        self._persisted_image_ids: set[str] = set()
 
     @timeout(60 * 80, 1)
     async def build_chunks(
@@ -98,7 +101,7 @@ class ChunkService:
         1. File size validation
         2. Parser selection and chunking (delegated to chunk_builder)
         3. Outline extraction (delegated to chunk_builder)
-        4. MinIO upload
+        4. Chunk image staging
         5. Post-processing (delegated to chunk_post_processor)
 
         Args:
@@ -141,7 +144,7 @@ class ChunkService:
         # Extract outline (delegated)
         await extract_outline(cks, ctx)
 
-        # Prepare docs and upload to MinIO
+        # Prepare docs and stage image bytes for the guarded ES write.
         docs = await self._prepare_docs_and_upload(cks)
 
         # Record docs after prep
@@ -177,7 +180,7 @@ class ChunkService:
         return docs
 
     async def _prepare_docs_and_upload(self, cks: List[Dict]) -> List[Dict]:
-        """Prepare docs and upload images to MinIO."""
+        """Prepare docs and stage images without mutating object storage."""
         ctx = self._task_context
         docs = []
         doc = {"doc_id": ctx.doc_id, "kb_id": str(ctx.kb_id)}
@@ -187,7 +190,7 @@ class ChunkService:
         st = timer()
 
         @timeout(60)
-        async def upload_to_minio(document, chunk):
+        async def prepare_document(document, chunk):
             try:
                 d = copy.deepcopy(document)
                 d.update(chunk)
@@ -205,7 +208,10 @@ class ChunkService:
                     docs.append(d)
                     return
 
-                await image2id(d, partial(settings.STORAGE_IMPL.put, tenant_id=ctx.tenant_id), d["id"], ctx.kb_id)
+                image_binary = await image_to_binary(d)
+                if image_binary is not None:
+                    self._pending_images[d["id"]] = image_binary
+                    d["img_id"] = f"{ctx.kb_id}-{d['id']}"
                 docs.append(d)
             except Exception:
                 logging.exception("Saving image of chunk {}/{}/{} got exception".format(ctx.location, ctx.name, d["id"]))
@@ -213,7 +219,7 @@ class ChunkService:
 
         tasks = []
         for ck in cks:
-            tasks.append(asyncio.create_task(upload_to_minio(doc, ck)))
+            tasks.append(asyncio.create_task(prepare_document(doc, ck)))
         try:
             await asyncio.gather(*tasks, return_exceptions=False)
         except Exception as e:
@@ -326,7 +332,15 @@ class ChunkService:
         if self._task_context.write_interceptor:
             return self._task_context.write_interceptor.intercept("docStoreConn.delete")
         else:
-            return await thread_pool_exec(settings.docStoreConn.delete, condition, index_name, task_dataset_id)
+            return await thread_pool_exec(
+                DocumentService.execute_document_store_write,
+                self._task_context.doc_id,
+                task_dataset_id,
+                settings.docStoreConn.delete,
+                condition,
+                index_name,
+                task_dataset_id,
+            )
 
     async def _intercept_doc_store_insert(self, chunks: list, index_name: str, task_dataset_id: str) -> Any:
         if self._task_context.write_interceptor:
@@ -334,7 +348,102 @@ class ChunkService:
                 return self._task_context.write_interceptor.intercept("docStoreConn.insert", [])
             return self._task_context.write_interceptor.intercept("docStoreConn.insert")
         else:
-            return await thread_pool_exec(settings.docStoreConn.insert, chunks, index_name, task_dataset_id)
+            document_ids = sorted(
+                {
+                    str(chunk["doc_id"])
+                    for chunk in chunks
+                    if chunk.get("doc_id")
+                    and chunk["doc_id"] != GRAPH_RAPTOR_FAKE_DOC_ID
+                }
+            )
+            if not document_ids:
+                return await thread_pool_exec(
+                    settings.docStoreConn.insert,
+                    chunks,
+                    index_name,
+                    task_dataset_id,
+                )
+            def insert_with_pending_images():
+                pending_images = [
+                    (chunk["id"], binary)
+                    for chunk in chunks
+                    if (binary := self._pending_images.get(chunk.get("id")))
+                    is not None
+                ]
+                strict_exists = None
+                strict_remove = None
+                if pending_images:
+                    strict_exists = getattr(
+                        settings.STORAGE_IMPL,
+                        "obj_exist_strict",
+                        None,
+                    )
+                    strict_remove = getattr(
+                        settings.STORAGE_IMPL,
+                        "rm_strict",
+                        None,
+                    )
+                    if not callable(strict_exists) or not callable(strict_remove):
+                        raise RuntimeError(
+                            "storage backend does not support strict chunk image lifecycle"
+                        )
+                rollback_objects = []
+                new_image_objects = []
+                try:
+                    for object_name, binary in pending_images:
+                        existed = strict_exists(
+                            task_dataset_id,
+                            object_name,
+                            self._task_context.tenant_id,
+                        )
+                        if not existed:
+                            # Register before PUT because a lost response can mean
+                            # that the object exists even though PUT raised.
+                            rollback_objects.append(object_name)
+                            new_image_objects.append(object_name)
+                        settings.STORAGE_IMPL.put(
+                            task_dataset_id,
+                            object_name,
+                            binary,
+                            self._task_context.tenant_id,
+                        )
+                        if not strict_exists(
+                            task_dataset_id,
+                            object_name,
+                            self._task_context.tenant_id,
+                        ):
+                            raise OSError("chunk image write was not persisted")
+                    result = settings.docStoreConn.insert(
+                        chunks,
+                        index_name,
+                        task_dataset_id,
+                    )
+                    if result:
+                        raise RuntimeError(str(result))
+                except Exception:
+                    for object_name in reversed(rollback_objects):
+                        strict_remove(
+                            task_dataset_id,
+                            object_name,
+                            self._task_context.tenant_id,
+                        )
+                    raise
+                self._persisted_chunk_ids.update(
+                    str(chunk["id"])
+                    for chunk in chunks
+                    if chunk.get("id")
+                )
+                self._persisted_image_ids.update(new_image_objects)
+                for chunk in chunks:
+                    self._pending_images.pop(chunk.get("id"), None)
+                return result
+
+            return await thread_pool_exec(
+                DocumentService.execute_document_store_write,
+                document_ids,
+                task_dataset_id,
+                insert_with_pending_images,
+            )
 
     async def _insert_main_chunks(
         self,
@@ -422,27 +531,56 @@ class ChunkService:
         chunk_ids: List[str],
     ):
         """Roll back an insertion by deleting chunks and images."""
-        await self._intercept_doc_store_delete({"id": chunk_ids}, search.index_name(task_tenant_id), task_dataset_id)
+        scoped_chunk_ids = {
+            str(chunk_id) for chunk_id in chunk_ids if chunk_id
+        }
+        self._persisted_chunk_ids.update(scoped_chunk_ids)
+        await self.rollback_task_writes(task_tenant_id, task_dataset_id)
 
-        # Delete associated images
-        tasks = []
-        for chunk_id in chunk_ids:
-            tasks.append(asyncio.create_task(self._delete_image(task_dataset_id, chunk_id)))
+    async def rollback_task_writes(
+        self,
+        task_tenant_id: str,
+        task_dataset_id: str,
+    ) -> None:
+        """Strictly remove only chunks and new images written by this task."""
 
-        try:
-            await asyncio.gather(*tasks, return_exceptions=False)
-        except Exception as e:
-            logging.error(f"delete_image failed: {e}")
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+        chunk_ids = sorted(self._persisted_chunk_ids)
+        image_ids = sorted(self._persisted_image_ids)
+        if not chunk_ids and not image_ids:
+            return
 
-    async def _delete_image(self, kb_id: str, chunk_id: str):
-        """Delete a chunk's image from storage."""
-        try:
-            async with self._task_context.minio_limiter:
-                settings.STORAGE_IMPL.delete(kb_id, chunk_id)
-        except Exception:
-            logging.exception(f"Deleting image of chunk {chunk_id} got exception")
-            raise
+        def rollback():
+            if image_ids:
+                strict_remove = getattr(settings.STORAGE_IMPL, "rm_strict", None)
+                strict_exists = getattr(
+                    settings.STORAGE_IMPL,
+                    "obj_exist_strict",
+                    None,
+                )
+                if not callable(strict_remove) or not callable(strict_exists):
+                    raise RuntimeError(
+                        "storage backend does not support strict chunk image rollback"
+                    )
+                for object_name in image_ids:
+                    strict_remove(
+                        task_dataset_id,
+                        object_name,
+                        self._task_context.tenant_id,
+                    )
+                    if strict_exists(
+                        task_dataset_id,
+                        object_name,
+                        self._task_context.tenant_id,
+                    ):
+                        raise OSError("chunk image rollback was not persisted")
+
+            if chunk_ids:
+                settings.docStoreConn.delete_strict(
+                    {"id": chunk_ids},
+                    search.index_name(task_tenant_id),
+                    task_dataset_id,
+                )
+
+        await thread_pool_exec(rollback)
+        self._persisted_chunk_ids.difference_update(chunk_ids)
+        self._persisted_image_ids.difference_update(image_ids)

@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from api.db.db_models import DB, Document
 from common import settings
+from common.constants import TaskStatus
 from common.metadata_utils import dedupe_list
 from api.db.db_models import Knowledgebase
 from common.doc_store.doc_store_base import OrderByExpr
@@ -450,67 +451,60 @@ class DocMetadataService:
             True if successful, False otherwise
         """
         try:
-            # Get document with tenant_id
-            doc_query = Document.select(Document, Knowledgebase.tenant_id).join(Knowledgebase, on=(Knowledgebase.id == Document.kb_id)).where(Document.id == doc_id)
+            with DB.atomic():
+                doc = (
+                    Document.select(Document, Knowledgebase.tenant_id)
+                    .join(Knowledgebase, on=(Knowledgebase.id == Document.kb_id))
+                    .where(Document.id == doc_id)
+                    .for_update()
+                    .first()
+                )
+                if not doc:
+                    logging.warning(f"Document {doc_id} not found for metadata update")
+                    return False
+                if doc.run == TaskStatus.CANCEL.value:
+                    logging.info(
+                        "Document %s is canceled for deletion; metadata update rejected",
+                        doc_id,
+                    )
+                    return False
 
-            doc = doc_query.first()
-            if not doc:
-                logging.warning(f"Document {doc_id} not found for metadata update")
-                return False
+                tenant_id = doc.knowledgebase.tenant_id
+                kb_id = doc.kb_id
+                index_name = cls._get_doc_meta_index_name(tenant_id)
+                processed_meta = cls._split_combined_values(meta_fields)
 
-            # Extract fields
-            doc_obj = doc
-            tenant_id = doc.knowledgebase.tenant_id
-            kb_id = doc_obj.kb_id
-            index_name = cls._get_doc_meta_index_name(tenant_id)
+                logging.debug(f"[update_document_metadata] Updating doc_id: {doc_id}, kb_id: {kb_id}, meta_fields: {processed_meta}")
 
-            # Post-process to split combined values
-            processed_meta = cls._split_combined_values(meta_fields)
+                if not settings.DOC_ENGINE_INFINITY and not settings.DOC_ENGINE_OCEANBASE:
+                    index_exists = settings.docStoreConn.index_exist(index_name, "")
+                    if not index_exists:
+                        logging.debug(f"[update_document_metadata] Index {index_name} does not exist, creating and inserting")
+                        result = settings.docStoreConn.create_doc_meta_idx(index_name)
+                        if result is False:
+                            logging.error(f"Failed to create metadata index {index_name}")
+                            return False
+                        return cls.insert_document_metadata(doc_id, processed_meta)
 
-            logging.debug(f"[update_document_metadata] Updating doc_id: {doc_id}, kb_id: {kb_id}, meta_fields: {processed_meta}")
+                    try:
+                        doc_exists = settings.docStoreConn.get(doc_id, index_name, [kb_id])
+                        if doc_exists:
+                            replace_meta_fields = getattr(settings.docStoreConn, "replace_meta_fields", None)
+                            if callable(replace_meta_fields) and replace_meta_fields(index_name, doc_id, processed_meta):
+                                logging.debug(f"Successfully updated metadata for document {doc_id} via {type(settings.docStoreConn).__name__}.replace_meta_fields")
+                                return True
+                            logging.warning(f"replace_meta_fields unavailable or failed on backend {type(settings.docStoreConn).__name__}; falling back to delete+insert")
+                            cls.delete_document_metadata(doc_id, kb_id, tenant_id)
+                            return cls.insert_document_metadata(doc_id, processed_meta)
+                    except Exception as e:
+                        logging.debug(f"Document {doc_id} not found in index, will insert: {e}")
 
-            # For Elasticsearch, use efficient partial update
-            if not settings.DOC_ENGINE_INFINITY and not settings.DOC_ENGINE_OCEANBASE:
-                # Check if index exists first
-                index_exists = settings.docStoreConn.index_exist(index_name, "")
-                if not index_exists:
-                    # Index doesn't exist - create it and insert directly
-                    logging.debug(f"[update_document_metadata] Index {index_name} does not exist, creating and inserting")
-                    result = settings.docStoreConn.create_doc_meta_idx(index_name)
-                    if result is False:
-                        logging.error(f"Failed to create metadata index {index_name}")
-                        return False
+                    logging.debug(f"[update_document_metadata] Document {doc_id} not found, inserting new")
                     return cls.insert_document_metadata(doc_id, processed_meta)
 
-                # Index exists - check if document exists
-                try:
-                    doc_exists = settings.docStoreConn.get(doc_id, index_name, [kb_id])
-                    if doc_exists:
-                        # Document exists - replace meta_fields entirely.
-                        # Using update with a `doc` body would deep-merge the meta_fields
-                        # object and retain old keys that should be removed, so we delegate
-                        # to a backend-provided scripted assignment that fully overwrites it.
-                        replace_meta_fields = getattr(settings.docStoreConn, "replace_meta_fields", None)
-                        if callable(replace_meta_fields) and replace_meta_fields(index_name, doc_id, processed_meta):
-                            logging.debug(f"Successfully updated metadata for document {doc_id} via {type(settings.docStoreConn).__name__}.replace_meta_fields")
-                            return True
-                        logging.warning(f"replace_meta_fields unavailable or failed on backend {type(settings.docStoreConn).__name__}; falling back to delete+insert")
-                        # Mirror the Infinity fallback below so a failed scripted
-                        # replace still guarantees full overwrite semantics rather
-                        # than leaking through the "document not found" branch.
-                        cls.delete_document_metadata(doc_id, kb_id, tenant_id)
-                        return cls.insert_document_metadata(doc_id, processed_meta)
-                except Exception as e:
-                    logging.debug(f"Document {doc_id} not found in index, will insert: {e}")
-
-                # Document doesn't exist - insert new
-                logging.debug(f"[update_document_metadata] Document {doc_id} not found, inserting new")
+                logging.debug(f"[update_document_metadata] Using delete+insert method for doc_id: {doc_id}")
+                cls.delete_document_metadata(doc_id, kb_id, tenant_id)
                 return cls.insert_document_metadata(doc_id, processed_meta)
-
-            # For Infinity or as fallback: use delete+insert
-            logging.debug(f"[update_document_metadata] Using delete+insert method for doc_id: {doc_id}")
-            cls.delete_document_metadata(doc_id, kb_id, tenant_id)
-            return cls.insert_document_metadata(doc_id, processed_meta)
 
         except Exception as e:
             logging.error(f"Error updating metadata for document {doc_id}: {e}")
@@ -518,7 +512,14 @@ class DocMetadataService:
 
     @classmethod
     @DB.connection_context()
-    def delete_document_metadata(cls, doc_id: str, kb_id: str, tenant_id: str = None) -> bool:
+    def delete_document_metadata(
+        cls,
+        doc_id: str,
+        kb_id: str,
+        tenant_id: str = None,
+        *,
+        strict: bool = False,
+    ) -> bool:
         """
         Delete document metadata from ES/Infinity.
         Also drops the metadata table if it becomes empty (efficiently).
@@ -545,6 +546,32 @@ class DocMetadataService:
 
             index_name = cls._get_doc_meta_index_name(tenant_id)
             logging.debug(f"[delete_document_metadata] Deleting doc_id: {doc_id}, kb_id: {kb_id}, index: {index_name}")
+
+            if strict:
+                strict_index_exists = getattr(
+                    settings.docStoreConn,
+                    "index_exist_strict",
+                    None,
+                )
+                strict_delete = getattr(
+                    settings.docStoreConn,
+                    "delete_strict",
+                    None,
+                )
+                if not callable(strict_index_exists):
+                    raise RuntimeError(
+                        "document store does not support strict index existence checks"
+                    )
+                if not callable(strict_delete):
+                    raise RuntimeError(
+                        "document store does not support strict metadata deletion"
+                    )
+                if not strict_index_exists(index_name, ""):
+                    return True
+                deleted_count = strict_delete({"id": doc_id}, index_name, kb_id)
+                if deleted_count not in (0, 1):
+                    raise RuntimeError("strict metadata deletion count mismatch")
+                return True
 
             # Check if metadata table exists before attempting deletion
             # This is the key optimization - no table = no metadata = nothing to delete
@@ -576,13 +603,15 @@ class DocMetadataService:
             deleted_count = settings.docStoreConn.delete(
                 {"id": doc_id},
                 index_name,
-                kb_id,  # Pass actual kb_id (delete() will handle metadata tables correctly)
+                kb_id,
             )
             logging.debug(f"[METADATA DELETE] Deleted count: {deleted_count}")
             return True
 
         except Exception as e:
             logging.error(f"Error deleting metadata for document {doc_id}: {e}")
+            if strict:
+                raise
             return False
 
     @classmethod

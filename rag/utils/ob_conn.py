@@ -24,7 +24,7 @@ from elasticsearch_dsl import Q, Search
 from pydantic import BaseModel
 from pymysql.converters import escape_string
 from pyobvector import ARRAY
-from sqlalchemy import Column, String, Integer, JSON, Double, Row
+from sqlalchemy import Column, String, Integer, JSON, Double, Row, text
 from sqlalchemy.dialects.mysql import LONGTEXT, TEXT
 from sqlalchemy.sql.type_api import TypeEngine
 
@@ -351,6 +351,41 @@ class OBConnection(OBConnectionBase):
             # The index need to be alive after any kb deletion since all kb under this tenant are in one index.
             return
         super().delete_idx(index_name, dataset_id)
+
+    def index_exist_strict(self, index_name: str, dataset_id: str = None) -> bool:
+        table_name = index_name if index_name.startswith("ragflow_doc_meta_") else self.get_table_name(index_name, dataset_id)
+        return bool(self.client.check_table_exists(table_name))
+
+    def delete_strict(self, condition: dict, index_name: str, dataset_id: str) -> int:
+        table_name = index_name if index_name.startswith("ragflow_doc_meta_") else self.get_table_name(index_name, dataset_id)
+        if not self.client.check_table_exists(table_name):
+            return 0
+
+        condition = dict(condition)
+        if not index_name.startswith("ragflow_doc_meta_"):
+            condition[self._get_dataset_id_field()] = dataset_id
+        where_clause = [text(value) for value in self._get_filters(condition)]
+        result = self.client.get(
+            table_name=table_name,
+            ids=None,
+            where_clause=where_clause,
+            output_column_name=["id"],
+        )
+        rows = result.fetchall()
+        if not rows:
+            return 0
+
+        ids = [row[0] for row in rows]
+        self.client.delete(table_name=table_name, ids=ids)
+        remaining = self.client.get(
+            table_name=table_name,
+            ids=None,
+            where_clause=where_clause,
+            output_column_name=["id"],
+        ).fetchall()
+        if remaining:
+            raise RuntimeError("strict delete readback found remaining rows")
+        return len(ids)
 
     """
     Performance monitoring
