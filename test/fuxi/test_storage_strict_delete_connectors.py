@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig, ObjectApiResponse
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -264,6 +265,9 @@ def test_opensearch_strict_delete_propagates_and_confirms_readback():
         "delete_strict",
         {
             "NotFoundError": FakeNotFound,
+            "_response_value": lambda response, key, default=None: response.get(
+                key, default
+            ) if hasattr(response, "get") else default,
             "Q": _FakeQuery,
             "Search": _FakeSearch,
         },
@@ -323,6 +327,48 @@ def test_opensearch_strict_delete_propagates_and_confirms_readback():
     client.indices.exists = lambda **_kwargs: (_ for _ in ()).throw(marker)
     with pytest.raises(RuntimeError, match="opensearch unavailable"):
         index_exist_strict(store, "index-1", "kb-1")
+
+
+def test_opensearch_strict_delete_accepts_sdk_response_objects():
+    delete_strict = _load_method_light(
+        "rag/utils/opensearch_conn.py",
+        "OSConnection",
+        "delete_strict",
+        {
+            "NotFoundError": FakeNotFound,
+            "_response_value": lambda response, key, default=None: response.get(
+                key, default
+            ) if hasattr(response, "get") else default,
+            "Q": _FakeQuery,
+            "Search": _FakeSearch,
+        },
+    )
+    meta = ApiResponseMeta(
+        200,
+        "1.1",
+        HttpHeaders(),
+        0.0,
+        NodeConfig("http", "localhost", 9200),
+    )
+    client = SimpleNamespace(
+        delete_by_query=lambda **_kwargs: ObjectApiResponse(
+            {
+                "deleted": 1,
+                "total": 1,
+                "noops": 0,
+                "timed_out": False,
+                "failures": [],
+                "version_conflicts": 0,
+            },
+            meta,
+        ),
+        count=lambda **_kwargs: ObjectApiResponse({"count": 0}, meta),
+    )
+    store = SimpleNamespace(os=client)
+
+    assert delete_strict(
+        store, {"doc_id": "doc-1"}, "index-1", "kb-1"
+    ) == 1
 
 
 def test_infinity_strict_delete_propagates_and_confirms_readback():

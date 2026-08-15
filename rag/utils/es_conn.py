@@ -32,6 +32,11 @@ ATTEMPT_TIME = 2
 MAX_RESULT_WINDOW = 10000
 SEARCH_AFTER_BATCH_SIZE = 1000
 
+
+def _response_value(response, key, default=None):
+    getter = getattr(response, "get", None)
+    return getter(key, default) if callable(getter) else default
+
 # Single-document atomic pagerank_fea adjust (chunk feedback). Clamps using params.min_w / max_w;
 # removes field at zero for rank_feature compatibility.
 _PAGERANK_FEA_ADJUST_SCRIPT = """
@@ -607,12 +612,12 @@ class ESConnection(ESConnectionBase):
                     body=Search().query(qry).to_dict(),
                     refresh=True,
                 )
-                deleted = result.get("deleted") if isinstance(result, dict) else None
-                total = result.get("total") if isinstance(result, dict) else None
-                noops = result.get("noops", 0) if isinstance(result, dict) else None
-                timed_out = result.get("timed_out", False) if isinstance(result, dict) else None
-                failures = result.get("failures", []) if isinstance(result, dict) else None
-                version_conflicts = result.get("version_conflicts", 0) if isinstance(result, dict) else None
+                deleted = _response_value(result, "deleted")
+                total = _response_value(result, "total")
+                noops = _response_value(result, "noops", 0)
+                timed_out = _response_value(result, "timed_out", False)
+                failures = _response_value(result, "failures", [])
+                version_conflicts = _response_value(result, "version_conflicts", 0)
                 complete = (
                     isinstance(deleted, int)
                     and not isinstance(deleted, bool)

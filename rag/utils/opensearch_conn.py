@@ -33,6 +33,11 @@ from common import settings
 
 ATTEMPT_TIME = 2
 
+
+def _response_value(response, key, default=None):
+    getter = getattr(response, "get", None)
+    return getter(key, default) if callable(getter) else default
+
 _PAGERANK_FEA_ADJUST_SCRIPT = """
 double cur = 0.0;
 if (ctx._source.containsKey(params.pf)) {
@@ -793,12 +798,12 @@ class OSConnection(DocStoreConnection):
         except NotFoundError:
             return 0
 
-        deleted = result.get("deleted") if isinstance(result, dict) else None
-        total = result.get("total") if isinstance(result, dict) else None
-        noops = result.get("noops", 0) if isinstance(result, dict) else None
-        timed_out = result.get("timed_out", False) if isinstance(result, dict) else None
-        failures = result.get("failures", []) if isinstance(result, dict) else None
-        version_conflicts = result.get("version_conflicts", 0) if isinstance(result, dict) else None
+        deleted = _response_value(result, "deleted")
+        total = _response_value(result, "total")
+        noops = _response_value(result, "noops", 0)
+        timed_out = _response_value(result, "timed_out", False)
+        failures = _response_value(result, "failures", [])
+        version_conflicts = _response_value(result, "version_conflicts", 0)
         complete = (
             isinstance(deleted, int)
             and not isinstance(deleted, bool)
@@ -823,7 +828,7 @@ class OSConnection(DocStoreConnection):
             raise RuntimeError("strict delete incomplete")
 
         readback = self.os.count(index=index_name, body=body)
-        remaining = readback.get("count") if isinstance(readback, dict) else None
+        remaining = _response_value(readback, "count")
         if not isinstance(remaining, int) or isinstance(remaining, bool) or remaining < 0:
             raise RuntimeError("strict delete readback invalid")
         if remaining != 0:

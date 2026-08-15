@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig, ObjectApiResponse
 
 from rag.app import tabular_structure
 from test.fuxi.test_table_semantic_rows import _load_table_module
@@ -2514,6 +2515,9 @@ def test_search_document_store_strict_delete_propagates_failures():
         "ATTEMPT_TIME": 2,
         "ConnectionTimeout": TimeoutError,
         "NotFoundError": MissingError,
+        "_response_value": lambda response, key, default=None: response.get(
+            key, default
+        ) if hasattr(response, "get") else default,
         "Q": _FakeQuery,
         "Search": _FakeSearch,
         "logger": MagicMock(),
@@ -2569,6 +2573,50 @@ def test_search_document_store_strict_delete_propagates_failures():
         delete_strict(
             store, {"doc_id": "document-1"}, "tenant-index", "dataset-1"
         )
+
+
+def test_search_document_store_strict_delete_accepts_elasticsearch_mapping_response():
+    namespace = {
+        "ATTEMPT_TIME": 2,
+        "ConnectionTimeout": TimeoutError,
+        "NotFoundError": KeyError,
+        "_response_value": lambda response, key, default=None: response.get(
+            key, default
+        ),
+        "Q": _FakeQuery,
+        "Search": _FakeSearch,
+        "logger": MagicMock(),
+    }
+    delete_strict = _load_class_method(
+        REPO_ROOT / "rag" / "utils" / "es_conn.py",
+        "ESConnection",
+        "delete_strict",
+        namespace,
+    )
+    store = SimpleNamespace(logger=MagicMock(), _connect=MagicMock())
+    client = MagicMock()
+    store.es = client
+    client.delete_by_query.return_value = ObjectApiResponse(
+        {
+            "deleted": 3,
+            "total": 3,
+            "noops": 0,
+            "timed_out": False,
+            "failures": [],
+            "version_conflicts": 0,
+        },
+        ApiResponseMeta(
+            200,
+            "1.1",
+            HttpHeaders(),
+            0.0,
+            NodeConfig("http", "localhost", 9200),
+        ),
+    )
+
+    assert delete_strict(
+        store, {"doc_id": "document-1"}, "tenant-index", "dataset-1"
+    ) == 3
 
 
 def test_search_document_store_strict_index_exists_propagates_failures():
