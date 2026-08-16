@@ -279,6 +279,14 @@ class OwnedConnectionContext:
         if self.opened:
             self.database.close()
 
+    def __call__(self, function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            with OwnedConnectionContext(self.database):
+                return function(*args, **kwargs)
+
+        return wrapped
+
 
 class OwnershipAwareConnectionMixin:
     def connection_context(self):

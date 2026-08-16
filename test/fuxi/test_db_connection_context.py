@@ -1,4 +1,5 @@
 import ast
+from functools import wraps
 from pathlib import Path
 
 
@@ -11,7 +12,7 @@ def _load_owned_connection_context():
         if isinstance(node, ast.ClassDef)
         and node.name == "OwnedConnectionContext"
     )
-    namespace = {"wraps": __import__("functools").wraps}
+    namespace = {"wraps": wraps}
     exec(
         compile(
             ast.Module(body=[class_node], type_ignores=[]),
@@ -64,3 +65,17 @@ def test_connection_context_does_not_close_connection_owned_by_caller():
 
     assert database.close_calls == 0
     assert database.closed is False
+
+
+def test_connection_context_supports_decorator_usage():
+    OwnedConnectionContext = _load_owned_connection_context()
+    database = _FakeDatabase(closed=True)
+
+    @OwnedConnectionContext(database)
+    def read_value():
+        assert database.closed is False
+        return "ok"
+
+    assert read_value() == "ok"
+    assert database.connect_calls == 1
+    assert database.close_calls == 1
