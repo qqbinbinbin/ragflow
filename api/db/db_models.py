@@ -257,7 +257,35 @@ class JsonSerializedField(SerializedField):
         super(JsonSerializedField, self).__init__(serialized_type=SerializedType.JSON, object_hook=object_hook, object_pairs_hook=object_pairs_hook, **kwargs)
 
 
-class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
+class OwnedConnectionContext:
+    """Close a connection only when this context opened it.
+
+    Service methods are nested during strict document deletion. Peewee's
+    default context closes the shared connection from an inner method, which
+    can leave the outer transaction open and fail at response teardown.
+    """
+
+    def __init__(self, database):
+        self.database = database
+        self.opened = False
+
+    def __enter__(self):
+        if self.database.is_closed():
+            self.database.connect()
+            self.opened = True
+        return self.database
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.opened:
+            self.database.close()
+
+
+class OwnershipAwareConnectionMixin:
+    def connection_context(self):
+        return OwnedConnectionContext(self)
+
+
+class RetryingPooledMySQLDatabase(OwnershipAwareConnectionMixin, PooledMySQLDatabase):
     def __init__(self, *args, **kwargs):
         self.max_retries = kwargs.pop("max_retries", 5)
         self.retry_delay = kwargs.pop("retry_delay", 1)
@@ -318,7 +346,7 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
         return None
 
 
-class RetryingPooledPostgresqlDatabase(PooledPostgresqlDatabase):
+class RetryingPooledPostgresqlDatabase(OwnershipAwareConnectionMixin, PooledPostgresqlDatabase):
     def __init__(self, *args, **kwargs):
         self.max_retries = kwargs.pop("max_retries", 5)
         self.retry_delay = kwargs.pop("retry_delay", 1)
@@ -383,7 +411,7 @@ class RetryingPooledPostgresqlDatabase(PooledPostgresqlDatabase):
         return None
 
 
-class RetryingPooledOceanBaseDatabase(PooledMySQLDatabase):
+class RetryingPooledOceanBaseDatabase(OwnershipAwareConnectionMixin, PooledMySQLDatabase):
     """Pooled OceanBase database with retry mechanism.
 
     OceanBase is compatible with MySQL protocol, so we inherit from PooledMySQLDatabase.
