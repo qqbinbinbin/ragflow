@@ -754,10 +754,12 @@ def _worksheet_structure_regions(
     g2_regions = _connected_cell_regions(occupied, tolerance=2)
     split_regions = []
     for members in g2_regions:
-        split_regions.extend(
-            _split_closed_empty_axis_region(parser, worksheet, members)
-            or [members]
-        )
+        split = _split_closed_empty_axis_region(parser, worksheet, members)
+        if split is None:
+            split_regions.append(members)
+            continue
+        for component in split:
+            split_regions.append(component)
     g2_regions = split_regions
     bboxes = [_region_bbox(members) for members in g2_regions]
     unresolved = set(unresolved_formula_coordinates or set())
@@ -2616,6 +2618,142 @@ def _independent_region_is_physically_separated(
     )
 
 
+def _empty_axis_header_row(item: dict[str, Any]) -> int | None:
+    evidence = item.get("structure_evidence")
+    if not evidence or item["table"].get("matched_rule") != "L1-08":
+        return None
+    header_columns = set(evidence.get("headers_by_column", {}))
+    if not header_columns:
+        return None
+    rows = _member_rows(item["members"])
+    header_rows = [
+        row_ordinal
+        for row_ordinal, columns in rows.items()
+        if header_columns.issubset(columns)
+    ]
+    return max(header_rows, default=None)
+
+
+def _is_safe_empty_axis_context_component(
+    candidate: dict[str, Any],
+    *,
+    projected: list[dict[str, Any]],
+    empty_axis: dict[str, Any],
+    empty_axis_header_row: int,
+    source_regions: dict[tuple[int, int], dict[str, Any]],
+) -> bool:
+    """Recognize metadata-only regions before one proven trailing empty axis.
+
+    A region is eligible only when it has no proven total or data row, its
+    structural evidence is incomplete, and it is physically before the empty
+    table header. This keeps uncertain standalone tables fail-closed.
+    """
+
+    if (
+        candidate.get("positive_rule") is not None
+        or candidate["table"].get("source_total_count") is not None
+        or not candidate["members"]
+        or max(row for row, _column in candidate["members"]) >= empty_axis_header_row
+        or any(
+            source_regions[source_region_key].get("unresolved_members")
+            for source_region_key in candidate["source_components"]
+        )
+    ):
+        return False
+
+    evidence = candidate.get("structure_evidence")
+    if evidence is None:
+        return len({row for row, _column in candidate["members"]}) <= 1
+
+    body_rows = set(evidence.get("body_row_ordinals", ()))
+    headers = evidence.get("headers_by_column", {})
+    header_paths = evidence.get("header_paths_by_column", {})
+    has_complete_header = bool(headers) and all(
+        header
+        and not header.startswith("Column_")
+        and header_paths.get(column)
+        for column, header in headers.items()
+    )
+    if body_rows and has_complete_header:
+        candidate_rows = {row for row, _column in candidate["members"]}
+        interleaved_context = any(
+            other is not candidate
+            and other is not empty_axis
+            and candidate_rows
+            & {row for row, _column in other["members"]}
+            and len(other["member_columns"]) > len(candidate["member_columns"])
+            and other["bbox"][2] < empty_axis_header_row
+            for other in projected
+        )
+        if not interleaved_context:
+            return False
+    # A complete header followed by multiple populated rows remains separate
+    # unless row-interleaving evidence proves it is metadata for this object.
+    return True
+
+
+def _merge_unique_empty_axis_context(
+    projected: list[dict[str, Any]],
+    source_regions: dict[tuple[int, int], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach pre-axis metadata to one uniquely proven empty table.
+
+    The source regions remain individually represented in ``source_components``
+    and the emitted event stream, so audit membership closure is preserved.
+    Context-only regions are not emitted as rows because a verified empty table
+    must retain zero projected records.
+    """
+
+    empty_axes = [
+        item
+        for item in projected
+        if item["table"].get("matched_rule") == "L1-08"
+        and item["table"].get("source_total_count") == 0
+    ]
+    if len(empty_axes) != 1:
+        return projected
+    empty_axis = empty_axes[0]
+    header_row = _empty_axis_header_row(empty_axis)
+    evidence = empty_axis.get("structure_evidence")
+    if header_row is None or not evidence:
+        return projected
+    contexts = [
+        candidate
+        for candidate in projected
+        if candidate is not empty_axis
+        and _is_safe_empty_axis_context_component(
+            candidate,
+            projected=projected,
+            empty_axis=empty_axis,
+            empty_axis_header_row=header_row,
+            source_regions=source_regions,
+        )
+    ]
+    if not contexts:
+        return projected
+
+    for context in contexts:
+        # Keep each source component's original set immutable. The union is
+        # the output object's membership, not a rewrite of its source digest.
+        empty_axis["members"] = empty_axis["members"] | context["members"]
+        empty_axis["member_columns"] = (
+            empty_axis["member_columns"] | context["member_columns"]
+        )
+        empty_axis["source_components"].update(context["source_components"])
+        empty_axis["emitted_member_events"].extend(
+            context["emitted_member_events"]
+        )
+        empty_axis["bbox"] = (
+            min(empty_axis["bbox"][0], context["bbox"][0]),
+            min(empty_axis["bbox"][1], context["bbox"][1]),
+            max(empty_axis["bbox"][2], context["bbox"][2]),
+            max(empty_axis["bbox"][3], context["bbox"][3]),
+        )
+
+    context_ids = {id(context) for context in contexts}
+    return [item for item in projected if id(item) not in context_ids]
+
+
 def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dict[str, Any] | None:
     region_worksheet, row_offset = _copy_structure_region(parser, worksheet, region)
     header_rows, populated_rows, _unresolved_rows = _complete_worksheet_rows(region_worksheet)
@@ -4457,6 +4595,8 @@ def _build_tabular_structure_projection_with_audit(
                         positive_rule=None,
                     )
                 )
+
+        projected = _merge_unique_empty_axis_context(projected, source_regions)
 
         changed = True
         while changed:

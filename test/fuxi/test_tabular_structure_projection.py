@@ -3531,6 +3531,88 @@ def test_context_does_not_hide_a_trailing_dense_empty_record_axis(table_parser):
     assert complete[0]["matched_rule"] == "L1-08"
     assert len(complete[0]["ordered_columns"]) == 18
 
+    # The trailing empty axis is the only independently enumerable structure
+    # in this worksheet. Earlier signoff/context regions must not become
+    # same-label sibling candidates and poison downstream completeness.
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["matched_rule"] == "L1-08"
+    assert projection["tables"][0]["source_total_count"] == 0
+
+
+def test_trailing_empty_axis_does_not_absorb_an_independent_complete_table(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "State", "Owner"])
+    sheet.append([1, "Open", "A"])
+    sheet.append([2, "Closed", "B"])
+    sheet.merge_cells("A6:F6")
+    sheet["A6"] = "Anonymous empty register"
+    for column in range(1, 7):
+        sheet.cell(row=7, column=column, value=f"Empty field {column}")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, 0]
+    assert [table["matched_rule"] for table in projection["tables"]] == [
+        "L1-03",
+        "L1-08",
+    ]
+
+
+def test_two_empty_axes_on_one_sheet_remain_separate(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    for title_row, header_row in ((1, 2), (6, 7)):
+        sheet.merge_cells(
+            start_row=title_row,
+            start_column=1,
+            end_row=title_row,
+            end_column=4,
+        )
+        sheet.cell(title_row, 1, f"Anonymous register {title_row}")
+        for column in range(1, 5):
+            sheet.cell(header_row, column, f"Field {title_row}-{column}")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert all(
+        table["matched_rule"] == "L1-08"
+        and table["source_total_count"] == 0
+        for table in projection["tables"]
+    )
+
+
+def test_signoff_after_an_empty_axis_remains_a_separate_unknown(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Anonymous register"
+    for column in range(1, 5):
+        sheet.cell(row=2, column=column, value=f"Field {column}")
+    sheet["A6"] = "Prepared by"
+    sheet["B6"] = "Person"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert projection["tables"][0]["matched_rule"] == "L1-08"
+    assert projection["tables"][0]["source_total_count"] == 0
+    assert projection["tables"][1]["source_total_count"] is None
+
 
 def test_unseparated_multiline_form_still_cannot_claim_a_complete_axis(table_parser):
     workbook = Workbook()
