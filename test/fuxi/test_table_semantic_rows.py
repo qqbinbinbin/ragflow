@@ -5,6 +5,7 @@ from io import BytesIO
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook
 
 
@@ -230,3 +231,34 @@ def test_delayed_header_without_merges_prefers_earliest_consistent_row(monkeypat
         {"Part": "P-2", "Supplier": "South", "Status": "Approved"},
     ]
     assert frames[0].attrs["sheet_context"] == "Supplier register"
+
+
+@pytest.mark.parametrize("header_row", (47, 121))
+def test_header_detection_scans_full_sheet_without_a_fixed_row_window(
+    monkeypatch,
+    header_row,
+):
+    table = _load_table_module(monkeypatch)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Delayed supplier register"
+    for row in range(1, header_row):
+        sheet.cell(row, 1, f"Context {row}")
+    sheet.append(["Part", "Supplier", "Status"])
+    sheet.append(["P-1", "North", "Approved"])
+    sheet.append(["P-2", "South", "Approved"])
+    output = BytesIO()
+    workbook.save(output)
+
+    frames, _tables = table.Excel()(
+        "register.xlsx",
+        binary=output.getvalue(),
+        callback=lambda *_args: None,
+    )
+
+    assert len(frames) == 1
+    assert list(frames[0].columns) == ["Part", "Supplier", "Status"]
+    assert frames[0].to_dict(orient="records") == [
+        {"Part": "P-1", "Supplier": "North", "Status": "Approved"},
+        {"Part": "P-2", "Supplier": "South", "Status": "Approved"},
+    ]

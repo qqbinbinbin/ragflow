@@ -394,6 +394,101 @@ def test_trailing_multilevel_header_after_context_proves_an_empty_axis(table_par
     assert complete[0]["matched_rule"] == "L1-08"
 
 
+@pytest.mark.parametrize("header_row", (3, 20, 47, 121))
+def test_trailing_header_uses_physical_region_coordinates_at_any_offset(
+    table_parser,
+    header_row,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Delayed header"
+    for row in range(1, max(2, header_row - 1)):
+        sheet.cell(row, 1, f"Context {row}")
+    sheet.merge_cells(
+        start_row=header_row,
+        start_column=1,
+        end_row=header_row,
+        end_column=2,
+    )
+    sheet.cell(header_row, 1, "Identity")
+    sheet.cell(header_row + 1, 1, "Code")
+    sheet.cell(header_row + 1, 2, "Description")
+    sheet.cell(header_row + 2, 1, "Type")
+    sheet.cell(header_row + 2, 2, "Requirement")
+
+    worksheet = table_parser._load_excel_to_workbook(
+        BytesIO(_save_workbook(workbook))
+    ).active
+    rows, populated_rows, unresolved_rows = tabular_structure._complete_worksheet_rows(
+        worksheet
+    )
+
+    assert worksheet.max_row == header_row + 2
+    assert len(rows) == header_row + 2
+    assert [row[0].row for row in rows] == list(range(1, header_row + 3))
+    assert populated_rows == [
+        *range(1, max(2, header_row - 1)),
+        header_row,
+        header_row + 1,
+        header_row + 2,
+    ]
+    structure = tabular_structure._trailing_empty_record_axis_structure(
+        table_parser,
+        worksheet,
+        rows,
+        populated_rows,
+        unresolved_rows,
+    )
+
+    assert structure is not None
+    headers, header_paths, header_start, data_start = structure
+    assert headers == ["Identity-Code-Type", "Identity-Description-Requirement"]
+    assert header_paths == [
+        ["Identity", "Code", "Type"],
+        ["Identity", "Description", "Requirement"],
+    ]
+    assert (header_start, data_start) == (header_row - 1, header_row + 2)
+
+
+@pytest.mark.parametrize("header_row", (3, 20, 47, 121))
+def test_projection_handles_trailing_header_at_any_offset(table_parser, header_row):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Delayed header projection"
+    for row in range(1, max(2, header_row - 1)):
+        sheet.cell(row, 1, f"Context {row}")
+    sheet.merge_cells(
+        start_row=header_row,
+        start_column=1,
+        end_row=header_row,
+        end_column=2,
+    )
+    sheet.cell(header_row, 1, "Identity")
+    sheet.cell(header_row + 1, 1, "Code")
+    sheet.cell(header_row + 1, 2, "Description")
+    sheet.cell(header_row + 2, 1, "Type")
+    sheet.cell(header_row + 2, 2, "Requirement")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert [column["header_path"] for column in complete[0]["ordered_columns"]] == [
+        ["Identity", "Code", "Type"],
+        ["Identity", "Description", "Requirement"],
+    ]
+
+
 def test_delayed_signoff_form_is_not_promoted_to_an_empty_record_axis(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -4578,7 +4673,10 @@ def test_large_gap_before_the_first_body_row_also_fails_closed(table_parser):
     assert projection["rows"][0]["row_role_kwd"] == "unknown"
 
 
-def test_complete_projection_only_materializes_a_bounded_header_probe(monkeypatch, table_parser):
+def test_complete_projection_reads_to_the_last_source_row_without_a_fixed_probe(
+    monkeypatch,
+    table_parser,
+):
     workbook = Workbook()
     sheet = workbook.active
     sheet.append(["Code", "Value"])
@@ -4587,12 +4685,16 @@ def test_complete_projection_only_materializes_a_bounded_header_probe(monkeypatc
     sheet.cell(row=20_001, column=2, value=2)
     original_iter_rows = sheet.iter_rows
 
-    def bounded_iter_rows(*args, **kwargs):
-        assert kwargs.get("max_row", 0) <= 20
+    observed_max_rows = []
+
+    def full_source_iter_rows(*args, **kwargs):
+        observed_max_rows.append(kwargs.get("max_row", 0))
         return original_iter_rows(*args, **kwargs)
 
-    monkeypatch.setattr(sheet, "iter_rows", bounded_iter_rows)
+    monkeypatch.setattr(sheet, "iter_rows", full_source_iter_rows)
     monkeypatch.setattr(table_parser, "_load_excel_to_workbook", lambda _source: workbook)
+
+    tabular_structure._complete_worksheet_rows(sheet)
 
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
@@ -4601,6 +4703,7 @@ def test_complete_projection_only_materializes_a_bounded_header_probe(monkeypatc
     )
 
     assert any(row["row_ordinal_int"] == 20_001 for row in projection["rows"])
+    assert max(observed_max_rows) == 20_001
 
 
 def test_uncached_formula_only_row_is_preserved_as_unknown(table_parser):

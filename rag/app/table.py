@@ -194,7 +194,7 @@ class Excel(ExcelParser):
         if not rows:
             return [], 0, 0
 
-        max_scan_rows = min(20, len(rows))
+        max_scan_rows = len(rows)
         max_columns = max((len(row) for row in rows[:max_scan_rows]), default=0)
         candidates = []
         for start in range(max_scan_rows):
@@ -293,7 +293,7 @@ class Excel(ExcelParser):
             scores.append(len(left & right) / len(union) if union else 1.0)
         return sum(scores) / len(scores)
 
-    def _build_headers_for_region(self, ws, rows, start, end):
+    def _build_headers_for_region(self, ws, rows, start, end, *, row_offset=0):
         headers = []
         max_col = max((len(row) for row in rows[start:end]), default=0)
         merged_ranges = list(ws.merged_cells.ranges)
@@ -303,7 +303,12 @@ class Excel(ExcelParser):
                 if col_idx >= len(rows[row_idx]):
                     continue
                 value = rows[row_idx][col_idx].value
-                merged_value = self._get_merged_cell_value(ws, row_idx + 1, col_idx + 1, merged_ranges)
+                merged_value = self._get_merged_cell_value(
+                    ws,
+                    row_idx + 1 + row_offset,
+                    col_idx + 1,
+                    merged_ranges,
+                )
                 if merged_value is not None:
                     value = merged_value
                 if self._is_empty_value(value):
@@ -315,7 +320,7 @@ class Excel(ExcelParser):
             headers.append("-".join(parts) if parts else f"Column_{col_idx + 1}")
         return headers
 
-    def _build_header_paths_for_region(self, ws, rows, start, end):
+    def _build_header_paths_for_region(self, ws, rows, start, end, *, row_offset=0):
         """Return source-backed header segments without parsing their text."""
         paths = []
         max_col = max((len(row) for row in rows[start:end]), default=0)
@@ -324,7 +329,7 @@ class Excel(ExcelParser):
             parts = []
             seen_sources = set()
             for row_idx in range(start, end):
-                row_ordinal = row_idx + 1
+                row_ordinal = row_idx + 1 + row_offset
                 column_ordinal = col_idx + 1
                 merged = next(
                     (

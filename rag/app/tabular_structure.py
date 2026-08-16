@@ -317,14 +317,16 @@ def _source_cell_anchor(row_ordinal: int, column_ordinal: int, merged_ranges):
 
 
 def _complete_worksheet_rows(worksheet):
-    """Return a bounded header probe plus all physically populated row ordinals."""
+    """Return all physical worksheet rows and their source row ordinals."""
 
     if not worksheet.max_row:
         return [], [], []
     cells = getattr(worksheet, "_cells", None)
     if not isinstance(cells, dict):
         raise ValueError("worksheet backend cannot prove complete sparse row coverage")
-    # Snapshot sparse cells before iter_rows materializes empty probe cells.
+    # Snapshot sparse cells before iter_rows materializes empty cells. The
+    # worksheet dimension can include formatting-only rows, so derive the
+    # physical bound from source cells, merges, and unresolved coordinates.
     physical_cells = list(cells.values())
     populated_rows = sorted(
         {
@@ -343,7 +345,17 @@ def _complete_worksheet_rows(worksheet):
             )
         }
     )
-    header_rows = list(worksheet.iter_rows(min_row=1, max_row=min(20, worksheet.max_row)))
+    physical_row_bound = max(
+        (
+            [cell.row for cell in physical_cells]
+            + [merged.max_row for merged in worksheet.merged_cells.ranges]
+            + unresolved_rows
+        ),
+        default=0,
+    )
+    header_rows = list(
+        worksheet.iter_rows(min_row=1, max_row=physical_row_bound)
+    )
     return header_rows, populated_rows, unresolved_rows
 
 
@@ -990,7 +1002,7 @@ def _copy_structure_region(parser, worksheet, region: dict[str, Any]):
 
 def _parse_region_structure(parser, worksheet, rows):
     fallback = parser._parse_sheet_structure(worksheet, rows)
-    max_scan_rows = min(20, len(rows))
+    max_scan_rows = len(rows)
     candidates = []
     merged_ranges = list(worksheet.merged_cells.ranges)
     for start in range(max_scan_rows):
@@ -1318,6 +1330,47 @@ def _header_paths_for_region(parser, worksheet, rows, header_start: int, data_st
     ]
 
 
+def _physical_region_rows(worksheet, header_start: int, data_start: int):
+    """Read only a proven physical region while retaining its source offset."""
+
+    if header_start < 0 or data_start <= header_start:
+        raise ValueError("invalid physical structure region")
+    return list(
+        worksheet.iter_rows(
+            min_row=header_start + 1,
+            max_row=data_start,
+        )
+    )
+
+
+def _header_structure_for_physical_region(
+    parser,
+    worksheet,
+    header_start: int,
+    data_start: int,
+):
+    rows = _physical_region_rows(worksheet, header_start, data_start)
+    local_end = len(rows)
+    headers = parser._build_headers_for_region(
+        worksheet,
+        rows,
+        0,
+        local_end,
+        row_offset=header_start,
+    )
+    header_paths = parser._build_header_paths_for_region(
+        worksheet,
+        rows,
+        0,
+        local_end,
+        row_offset=header_start,
+    )
+    return headers, [
+        [str(segment).strip() for segment in path if str(segment).strip()]
+        for path in header_paths
+    ]
+
+
 def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unresolved_rows):
     """Prove a titled, source-backed header whose record axis is exactly empty."""
 
@@ -1340,16 +1393,9 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
     if trailing_start > min(populated_rows) and trailing_start - 1 not in populated_rows:
         header_start = trailing_start - 1
         data_start = last_populated
-        headers = parser._build_headers_for_region(
-            worksheet,
-            rows,
-            header_start,
-            data_start,
-        )
-        header_paths = _header_paths_for_region(
+        headers, header_paths = _header_structure_for_physical_region(
             parser,
             worksheet,
-            rows,
             header_start,
             data_start,
         )
@@ -1529,16 +1575,9 @@ def _trailing_empty_record_axis_structure(
 
     header_start = trailing_start - 1
     data_start = last_populated
-    headers = parser._build_headers_for_region(
-        worksheet,
-        rows,
-        header_start,
-        data_start,
-    )
-    header_paths = _header_paths_for_region(
+    headers, header_paths = _header_structure_for_physical_region(
         parser,
         worksheet,
-        rows,
         header_start,
         data_start,
     )
