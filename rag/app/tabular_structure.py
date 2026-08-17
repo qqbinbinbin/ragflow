@@ -25,6 +25,7 @@ import re
 import struct
 import uuid
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
 
@@ -33,8 +34,8 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v16"
-ENUMERATION_RULE_VERSION = "enumeration-rules/v8"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v17"
+ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 _CURRENT_PROJECTION_CONTRACT = (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_VERSION,
@@ -49,6 +50,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v13", "enumeration-rules/v5"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v14", "enumeration-rules/v6"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v15", "enumeration-rules/v7"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v16", "enumeration-rules/v8"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -115,6 +117,9 @@ PROJECTION_ROW_FIELDS = frozenset(
 
 _ULID_RE = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 _UNTRUSTED_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+_ASCII_DECIMAL_SCALAR_RE = re.compile(
+    r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+)
 
 
 class StructureGenerationConflict(RuntimeError):
@@ -510,6 +515,31 @@ def _record_axis_value_shape(value: object) -> tuple[str, ...]:
     return ("text", *_text_structure(value))
 
 
+def _record_key_numeric_value(value: object) -> Decimal | None:
+    """Normalize finite numeric cell scalars without changing source values."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        normalized = value
+    elif isinstance(value, (int, float)):
+        try:
+            normalized = Decimal(str(value))
+        except InvalidOperation:
+            return None
+    elif isinstance(value, str):
+        rendered = value.strip()
+        if not _ASCII_DECIMAL_SCALAR_RE.fullmatch(rendered):
+            return None
+        try:
+            normalized = Decimal(rendered)
+        except InvalidOperation:
+            return None
+    else:
+        return None
+    return normalized if normalized.is_finite() else None
+
+
 def _record_key_axis_proven(
     rows: list[tuple[int, list[object], bool]],
     required_offsets: set[int],
@@ -519,11 +549,17 @@ def _record_key_axis_proven(
     if len(rows) < 2 or not required_offsets:
         return False
     key_offset = min(required_offsets)
-    values = [row[1][key_offset] for row in rows]
-    if any(
-        isinstance(value, bool) or not isinstance(value, (int, float))
-        for value in values
-    ):
+    source_values = [row[1][key_offset] for row in rows]
+    native_numeric = [
+        value
+        for value in source_values
+        if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+    ]
+    text_numeric = [value for value in source_values if isinstance(value, str)]
+    if text_numeric and not native_numeric:
+        return False
+    values = [_record_key_numeric_value(value) for value in source_values]
+    if any(value is None for value in values):
         return False
     if len(set(values)) != len(values):
         return False

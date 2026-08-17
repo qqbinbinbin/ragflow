@@ -38,8 +38,8 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v16"
-    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v8"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v17"
+    assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -585,7 +585,7 @@ def test_projection_root_requires_the_current_enumeration_rule_version(table_par
         parser=table_parser,
     )
 
-    assert projection["enumeration_rule_version"] == "enumeration-rules/v8"
+    assert projection["enumeration_rule_version"] == "enumeration-rules/v9"
 
     missing = dict(projection)
     missing.pop("enumeration_rule_version")
@@ -2208,6 +2208,54 @@ def _competing_header_depth_candidate_workbook_bytes():
     return _save_workbook(workbook)
 
 
+def _mixed_storage_numeric_key_candidate_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous mixed storage"
+    sheet.merge_cells("A1:H2")
+    sheet["A1"] = "Anonymous register"
+    for row in (3, 4):
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        sheet.cell(row=row, column=1, value=f"Context {row} A")
+        sheet.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+        sheet.cell(row=row, column=3, value=f"Context {row} B")
+        sheet.merge_cells(start_row=row, start_column=5, end_row=row, end_column=7)
+        sheet.cell(row=row, column=5, value=f"Context {row} C")
+        sheet.cell(row=row, column=8, value=f"Context {row} D")
+    sheet.merge_cells("A5:H5")
+    sheet["A5"] = "Record fields"
+    sheet.merge_cells("A6:A7")
+    sheet["A6"] = "Sequence"
+    sheet.merge_cells("B6:B7")
+    sheet["B6"] = "Code"
+    sheet.merge_cells("C6:D6")
+    sheet["C6"] = "Grouping"
+    sheet["C7"] = "Group"
+    sheet["D7"] = "State"
+    sheet.merge_cells("E6:E7")
+    sheet["E6"] = "Owner"
+    sheet.merge_cells("F6:G7")
+    sheet["F6"] = "Evidence"
+    sheet.merge_cells("H6:H7")
+    sheet["H6"] = "Optional"
+    for index, row in enumerate(range(8, 18), start=1):
+        key = str(index) if index <= 2 else index
+        values = [
+            key,
+            f"R-{index:02d}",
+            "A",
+            "Open",
+            "Team",
+            f"V-{index}",
+            f"V-{index}",
+            "present" if index == 8 else None,
+        ]
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row=row, column=column, value=value)
+        sheet.merge_cells(start_row=row, start_column=6, end_row=row, end_column=7)
+    return _save_workbook(workbook)
+
+
 def _sparse_region_workbook_bytes():
     workbook = Workbook()
     sheet = workbook.active
@@ -3400,6 +3448,40 @@ def test_numeric_record_key_keeps_value_shape_changes_on_one_axis(table_parser):
     ]
 
 
+def test_record_key_axis_accepts_lossless_mixed_numeric_storage():
+    rows = [
+        (1, ["01", "A"], False),
+        (2, ["2.0", "B"], False),
+        (3, [3, "C"], False),
+        (4, [4.0, "D"], False),
+    ]
+    original_keys = [row[1][0] for row in rows]
+
+    assert tabular_structure._record_key_axis_proven(rows, {0}) is True
+    assert [row[1][0] for row in rows] == original_keys
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["1", "one", 3],
+        ["1", "1.0", 2],
+        ["1", "3", 2],
+        ["1", "NaN", 3],
+        ["１", "2", 3],
+        ["1", "2", "3"],
+        [True, 2, 3],
+    ],
+)
+def test_record_key_axis_rejects_non_numeric_duplicate_or_non_monotonic_values(values):
+    rows = [
+        (row_ordinal, [value, f"R-{row_ordinal}"], False)
+        for row_ordinal, value in enumerate(values, start=1)
+    ]
+
+    assert tabular_structure._record_key_axis_proven(rows, {0}) is False
+
+
 def test_repeated_context_block_separated_from_the_table_does_not_break_g1(
     table_parser,
 ):
@@ -4305,6 +4387,34 @@ def test_header_candidate_selection_prefers_the_largest_proven_record_axis(
 
     assert data_start == 7, (header_start, data_start, headers)
     assert len(rows[data_start:]) == 10
+
+
+def test_header_candidate_accepts_lossless_mixed_storage_numeric_keys(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _mixed_storage_numeric_key_candidate_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["table_label"] == "Anonymous mixed storage"
+    )
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == table["table_ref"]
+    ]
+
+    assert table["source_total_count"] == 10
+    assert [row["row_ordinal_int"] for row in rows] == list(range(8, 18))
+    assert [row["row_role_kwd"] for row in rows] == ["data"] * 10
+    assert [row["data_row_index_int"] for row in rows] == list(range(1, 11))
+    assert [
+        json.loads(row["ordered_fields_list"])[0]["value"] for row in rows
+    ] == [str(value) for value in range(1, 11)]
 
 
 def test_vertical_merge_parent_values_are_inherited_and_emitted_once(
