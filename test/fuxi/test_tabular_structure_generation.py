@@ -3725,6 +3725,43 @@ def test_table_index_discovery_is_generation_bound_and_content_free(
     assert "search_text" not in result["seeds"][0]
 
 
+def test_table_index_projection_excludes_non_authoritative_fragments(service_module):
+    projection = {
+        "producer_generation_ref": "generation-a",
+        "tables": [
+            {
+                "table_ref": "table-authoritative",
+                "table_ordinal": 1,
+                "enumeration_status": "supported_complete",
+                "table_label": "Control plan",
+                "table_context": [],
+                "ordered_columns": [
+                    {"header_path": ["Process"], "name": "Process"},
+                ],
+            },
+            {
+                "table_ref": "table-fragment",
+                "table_ordinal": 2,
+                "enumeration_status": "not_guaranteed_explained",
+                "table_label": "Control plan metadata",
+                "table_context": [],
+                "ordered_columns": [
+                    {"header_path": ["Process"], "name": "Process"},
+                ],
+            },
+        ],
+    }
+
+    records = service_module.build_tabular_discovery_index_projection(
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        projection=projection,
+    )
+
+    assert [record["table_ref"] for record in records] == ["table-authoritative"]
+
+
 def test_discovery_revision_is_dataset_scoped(service_module):
     repository = service_module.InMemoryTabularStructureRepository()
     repository.add_authorization_scope("tenant-owner", "dataset-a", "document-a")
@@ -4391,6 +4428,24 @@ def test_authorized_active_generation_projects_document_name_separately_from_man
     assert query_calls, "the authorized document control record must provide source identity"
 
 
+def test_active_table_route_binds_document_generation_table_and_source_identity():
+    module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
+    route = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "get_active_tabular_structure_table"
+    )
+    source = ast.unparse(route)
+
+    assert "_authorized_structure_owner(tenant_id, dataset_id, document_id)" in source
+    assert "request.args.get('generation_ref')" in source
+    assert "read_active_table" in source
+    assert "producer_generation_ref=generation_ref" in source
+    assert "table_ref=table_ref" in source
+    assert "_authorized_document_source_name(dataset_id, document_id)" in source
+
+
 @pytest.mark.parametrize(
     ("documents", "message"),
     [
@@ -4905,6 +4960,53 @@ def test_exact_generation_reads_support_shadow_active_and_retained_with_scope_bi
             repository=generation_repository,
         )
     assert first_storage.get_calls == []
+
+
+def test_active_table_read_returns_only_the_generation_bound_table_metadata(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation(table_parser)
+    service_module.TabularStructureService.register_shadow_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        receipt=receipt,
+        repository=generation_repository,
+    )
+    service_module.TabularStructureService.activate_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        expected_active_generation_ref=None,
+        repository=generation_repository,
+    )
+
+    table_ref = projection["tables"][0]["table_ref"]
+    result = service_module.TabularStructureService.read_active_table(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        table_ref=table_ref,
+        repository=generation_repository,
+    )
+
+    assert result["producer_generation_ref"] == projection["producer_generation_ref"]
+    assert result["table"] == projection["tables"][0]
+    assert set(result) == {
+        "producer_generation_ref",
+        "producer_schema_version",
+        "projection_version",
+        "structure_algorithm_version",
+        "enumeration_rule_version",
+        "table",
+    }
 
 
 def test_managed_generation_receipts_preserve_validated_source_identity(

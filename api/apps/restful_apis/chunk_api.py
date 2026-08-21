@@ -521,6 +521,34 @@ async def get_tabular_structure_manifest(tenant_id, dataset_id, document_id):
         return _tabular_structure_error_response(error)
 
 
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/<table_ref>", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def get_active_tabular_structure_table(tenant_id, dataset_id, document_id, table_ref):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    generation_ref = str(request.args.get("generation_ref") or "").strip()
+    if not generation_ref:
+        return get_error_data_result(message="`generation_ref` is required")
+    try:
+        data = _get_tabular_structure_service().read_active_table(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=generation_ref,
+            table_ref=table_ref,
+        )
+        data["document_name"] = _authorized_document_source_name(
+            dataset_id,
+            document_id,
+        )
+        return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
 @manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/<table_ref>/rows", methods=["GET"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs

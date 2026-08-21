@@ -16,6 +16,7 @@ from rag.app.tabular_structure import (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_ROW_FIELDS,
     _ordered_fields,
+    _formula_cached_result_kinds_from_biff_stream,
     _formula_coordinates_from_biff_stream,
     build_tabular_structure_projection,
     partition_tabular_structure_projection,
@@ -38,7 +39,7 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v17"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v19"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -1877,6 +1878,189 @@ def _vertical_complete_with_headerless_continuation_bytes():
     return _save_workbook(workbook)
 
 
+def _sheet_level_repeated_form_segments_bytes(
+    *,
+    second_context_name="零件号",
+    second_context_value="2906150-PH01",
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "PFMEA"
+    rows = (
+        ("10", "外观检查", "缺陷", "5"),
+        ("20", "尺寸检查", "超差", "7"),
+        ("30", "装配", "漏装", "6"),
+        ("40", "终检", "错装", "8"),
+    )
+    for segment_index, (segment_start, segment_rows) in enumerate(
+        ((1, rows[:2]), (9, rows[2:])),
+    ):
+        sheet.cell(segment_start, 1, "潜在失效模式及后果分析（PFMEA）")
+        sheet.cell(
+            segment_start + 1,
+            1,
+            "零件号" if segment_index == 0 else second_context_name,
+        )
+        sheet.cell(
+            segment_start + 1,
+            2,
+            "2906150-PH01" if segment_index == 0 else second_context_value,
+        )
+        for column, value in enumerate(
+            ("过程编号", "过程名称", "潜在失效模式", "严重度"),
+            start=1,
+        ):
+            sheet.cell(segment_start + 2, column, value)
+        for row_offset, values in enumerate(segment_rows, start=3):
+            for column, value in enumerate(values, start=1):
+                sheet.cell(segment_start + row_offset, column, value)
+    return _save_workbook(workbook)
+
+
+def _four_page_repeated_form_with_context_value_changes_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "PFMEA"
+    pages = (
+        ("2906150-PH01", (("10", "外观检查", "缺陷", "5"), ("20", "尺寸检查", "超差", "7"))),
+        ("2906150-PH01", (("30", "装配", "漏装", "6"), ("40", "终检", "错装", "8"))),
+        ("2906150-PH01", (("50", "包装", "破损", "4"), ("60", "发运", "错发", "3"))),
+        ("2906151-SE01", (("10", "外观检查", "缺陷", "5"), ("20", "尺寸检查", "超差", "7"))),
+    )
+    for page_index, (part_number, records) in enumerate(pages):
+        start = page_index * 8 + 1
+        sheet.cell(start, 1, "潜在失效模式及后果分析（PFMEA）")
+        sheet.cell(start + 1, 1, "零件号")
+        sheet.cell(start + 1, 2, part_number)
+        for column, value in enumerate(
+            ("过程编号", "过程名称", "潜在失效模式", "严重度"),
+            start=1,
+        ):
+            sheet.cell(start + 2, column, value)
+        for row_offset, record in enumerate(records, start=3):
+            for column, value in enumerate(record, start=1):
+                sheet.cell(start + row_offset, column, value)
+    return _save_workbook(workbook)
+
+
+def _headerless_predecessor_with_named_following_page_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous paged register"
+    records = (
+        ("10", "Missing", "Delay", "4", "Cause A", "3", "Prevent A", "Detect A", "4", "48"),
+        ("20", "Wrong", "Rework", "6", "Cause B", "2", "Prevent B", "Detect B", "3", "36"),
+        ("30", "Damaged", "Reject", "5", "Cause C", "3", "Prevent C", "Detect C", "4", "60"),
+        ("40", "Loose", "Noise", "7", "Cause D", "2", "Prevent D", "Detect D", "3", "42"),
+    )
+
+    def context(start):
+        sheet.cell(start, 1, "Submission")
+        sheet.cell(start + 2, 1, "Reference")
+        sheet.cell(start + 2, 4, "Description")
+        sheet.cell(start + 2, 9, "Program")
+        sheet.cell(start + 2, 12, "Prepared")
+        sheet.cell(start + 2, 13, "Person")
+        sheet.cell(start + 2, 14, "Phone")
+        sheet.merge_cells(
+            start_row=start + 2,
+            start_column=15,
+            end_row=start + 3,
+            end_column=18,
+        )
+        sheet.cell(start + 2, 15, "Contact")
+        sheet.merge_cells(
+            start_row=start + 3,
+            start_column=1,
+            end_row=start + 3,
+            end_column=3,
+        )
+        sheet.cell(start + 3, 1, "R-001")
+        sheet.merge_cells(
+            start_row=start + 3,
+            start_column=4,
+            end_row=start + 3,
+            end_column=8,
+        )
+        sheet.cell(start + 3, 4, "Assembly")
+        sheet.merge_cells(
+            start_row=start + 3,
+            start_column=9,
+            end_row=start + 3,
+            end_column=11,
+        )
+        sheet.cell(start + 3, 9, "Program A")
+        sheet.cell(start + 3, 12, "Approved")
+        sheet.cell(start + 4, 1, "Core team")
+        sheet.merge_cells(
+            start_row=start + 4,
+            start_column=2,
+            end_row=start + 5,
+            end_column=3,
+        )
+        sheet.cell(start + 4, 2, "Team")
+        sheet.cell(start + 4, 4, "Modified")
+        sheet.cell(start + 4, 12, "Approval")
+        sheet.merge_cells(
+            start_row=start + 4,
+            start_column=15,
+            end_row=start + 4,
+            end_column=18,
+        )
+        sheet.merge_cells(
+            start_row=start + 5,
+            start_column=4,
+            end_row=start + 5,
+            end_column=7,
+        )
+        sheet.cell(start + 5, 12, "Approval date")
+        sheet.merge_cells(
+            start_row=start + 5,
+            start_column=15,
+            end_row=start + 5,
+            end_column=18,
+        )
+
+    def record(row, values):
+        for column, value in zip((1, 2, 3, 4, 6, 7, 8, 9, 10, 11), values):
+            sheet.cell(row, column, value)
+
+    context(1)
+    for row, values in enumerate(records[:2], start=7):
+        record(row, values)
+    sheet.merge_cells("B10:N10")
+    sheet["B10"] = "Anonymous paged register"
+
+    context(15)
+    for column, value in enumerate(
+        (
+            "Process",
+            "Mode",
+            "Effect",
+            "Severity",
+            "Class",
+            "Cause",
+            "Occurrence",
+            "Prevention",
+            "Detection",
+            "Rating",
+            "Priority",
+            "Action",
+            "Owner",
+            "Result",
+            "Final severity",
+            "Final occurrence",
+            "Final detection",
+            "Final priority",
+        ),
+        start=1,
+    ):
+        sheet.cell(21, column, value)
+    for row, values in enumerate(records[2:], start=22):
+        record(row, values)
+    return _save_workbook(workbook)
+
+
 def _vertical_complete_with_subset_headerless_continuation_bytes():
     workbook = Workbook()
     sheet = workbook.active
@@ -2205,6 +2389,567 @@ def _competing_header_depth_candidate_workbook_bytes():
         for column, value in enumerate(values, start=1):
             sheet.cell(row=row, column=column, value=value)
         sheet.merge_cells(start_row=row, start_column=6, end_row=row, end_column=7)
+    return _save_workbook(workbook)
+
+
+def _context_form_before_multilevel_header_workbook_bytes(*, record_count=2):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous performance report"
+    sheet.merge_cells("A1:J1")
+    sheet["A1"] = "Anonymous performance report"
+
+    sheet.merge_cells("A2:E3")
+    sheet["A2"] = "Unpaired context"
+    sheet.merge_cells("F2:G2")
+    sheet["F2"] = "Provider"
+    sheet.merge_cells("H2:J2")
+    sheet["H2"] = "Laboratory"
+    sheet.merge_cells("F3:G3")
+    sheet["F3"] = "Provider A"
+    sheet.merge_cells("H3:J3")
+    sheet["H3"] = "Laboratory A"
+    sheet["K2"] = "Sidecar action"
+
+    for row, values in (
+        (4, ("Component", "Reference", "Revision")),
+        (5, ("Component A", "Reference A", "Revision A")),
+    ):
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+        sheet.cell(row, 1, values[0])
+        sheet.merge_cells(start_row=row, start_column=4, end_row=row, end_column=5)
+        sheet.cell(row, 4, values[1])
+        sheet.merge_cells(start_row=row, start_column=6, end_row=row, end_column=10)
+        sheet.cell(row, 6, values[2])
+
+    sheet.merge_cells("A6:B6")
+    sheet["A6"] = "Fixture"
+    sheet["C6"] = "Fixture A"
+    sheet.merge_cells("D6:E6")
+    sheet["D6"] = "Cavity count"
+    sheet["F6"] = "Cavity count A"
+    sheet["G6"] = "Cavity"
+    sheet.merge_cells("H6:J6")
+    sheet["H6"] = "Cavity A"
+
+    for column, value in enumerate(
+        (
+            "Sequence",
+            "Test",
+            "Description",
+            "Requirement",
+            "Quantity",
+            "Equipment",
+            "Date",
+        ),
+        start=1,
+    ):
+        sheet.merge_cells(
+            start_row=7,
+            start_column=column,
+            end_row=8,
+            end_column=column,
+        )
+        sheet.cell(7, column, value)
+    sheet.merge_cells("H7:J7")
+    sheet["H7"] = "Measured"
+    for column, value in enumerate(("Run 1", "Run 2", "Run 3"), start=8):
+        sheet.cell(8, column, value)
+
+    for index, row in enumerate(range(9, 9 + record_count), start=1):
+        for column, value in enumerate(
+            (
+                index,
+                f"Test {index}",
+                f"Description {index}",
+                f"Requirement {index}",
+                "1",
+                f"Equipment {index}",
+                "2026-08-21",
+                f"M-{index}-1",
+                f"M-{index}-2",
+                f"M-{index}-3",
+            ),
+            start=1,
+        ):
+            sheet.cell(row, column, value)
+    return _save_workbook(workbook)
+
+
+def _context_form_with_an_unused_trailing_table_column_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous characteristics"
+    sheet.merge_cells("A1:H1")
+    sheet["A1"] = "Anonymous characteristics"
+    for row, values in (
+        (2, ("Provider", "Provider A", "Component", "Component A")),
+        (3, ("Program", "Program A", "Reference", "Reference A")),
+    ):
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        sheet.cell(row, 1, values[0])
+        sheet.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+        sheet.cell(row, 3, values[1])
+        sheet.merge_cells(start_row=row, start_column=5, end_row=row, end_column=7)
+        sheet.cell(row, 5, values[2])
+        sheet.merge_cells(start_row=row, start_column=8, end_row=row, end_column=9)
+        sheet.cell(row, 8, values[3])
+    sheet.merge_cells("A4:A5")
+    sheet["A4"] = "Sequence"
+    sheet.merge_cells("B4:B5")
+    sheet["B4"] = "Operation"
+    sheet.merge_cells("C4:D4")
+    sheet["C4"] = "Characteristic"
+    sheet["C5"] = "Product"
+    sheet["D5"] = "Process"
+    for column, value in enumerate(
+        ("Class", "Requirement", "Method", "Note"),
+        start=5,
+    ):
+        sheet.merge_cells(
+            start_row=4,
+            start_column=column,
+            end_row=5,
+            end_column=column,
+        )
+        sheet.cell(4, column, value)
+    for row, values in (
+        (6, (1, "Inspect", "Surface", "Fixture", "A", "Clean", "Visual")),
+        (7, (2, "Measure", "Length", "Gauge", "B", "10", "Caliper")),
+    ):
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row, column, value)
+    return _save_workbook(workbook)
+
+
+def _multilevel_repeated_form_with_optional_parent_bytes(
+    *,
+    second_process_header="Process",
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous paged register"
+    for page_index, start in enumerate((1, 9)):
+        sheet.merge_cells(
+            start_row=start,
+            start_column=1,
+            end_row=start,
+            end_column=4,
+        )
+        sheet.cell(start, 1, "Anonymous paged register")
+        sheet.cell(start + 1, 1, "Reference")
+        sheet.cell(start + 1, 2, f"R-{page_index + 1}")
+        sheet.merge_cells(
+            start_row=start + 2,
+            start_column=1,
+            end_row=start + 3,
+            end_column=1,
+        )
+        sheet.cell(start + 2, 1, "Sequence")
+        if page_index == 0:
+            sheet.merge_cells(
+                start_row=start + 2,
+                start_column=2,
+                end_row=start + 2,
+                end_column=3,
+            )
+            sheet.cell(start + 2, 2, "Characteristic")
+        sheet.cell(start + 3, 2, "Product")
+        sheet.cell(
+            start + 3,
+            3,
+            "Process" if page_index == 0 else second_process_header,
+        )
+        sheet.merge_cells(
+            start_row=start + 2,
+            start_column=4,
+            end_row=start + 3,
+            end_column=4,
+        )
+        sheet.cell(start + 2, 4, "Status")
+        for row_offset, values in enumerate(
+            (
+                (page_index * 2 + 1, "A", "B", "Open"),
+                (page_index * 2 + 2, "C", "D", "Closed"),
+            ),
+            start=4,
+        ):
+            for column, value in enumerate(values, start=1):
+                sheet.cell(start + row_offset, column, value)
+    return _save_workbook(workbook)
+
+
+def _context_form_with_a_right_side_action_before_multilevel_header_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous characteristics"
+    sheet.merge_cells("A2:H3")
+    sheet["A2"] = "Anonymous characteristics"
+    for row, values in (
+        (4, ("Provider", "Provider A", "Component", "Component A")),
+        (5, ("Program", "Program A", "Reference", "Reference A")),
+    ):
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        sheet.cell(row, 1, values[0])
+        sheet.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+        sheet.cell(row, 3, values[1])
+        sheet.merge_cells(start_row=row, start_column=5, end_row=row, end_column=7)
+        sheet.cell(row, 5, values[2])
+        sheet.cell(row, 8, values[3])
+    sheet["J4"] = "Sidecar action"
+    sheet.merge_cells("A6:H6")
+    sheet["A6"] = "Anonymous component class"
+    for column, value in enumerate(
+        ("Sequence", "Operation"),
+        start=1,
+    ):
+        sheet.merge_cells(
+            start_row=7,
+            start_column=column,
+            end_row=8,
+            end_column=column,
+        )
+        sheet.cell(7, column, value)
+    sheet.merge_cells("C7:D7")
+    sheet["C7"] = "Characteristic"
+    sheet["C8"] = "Product"
+    sheet["D8"] = "Process"
+    for column, value in enumerate(
+        ("Class", "Requirement", "Method", "Note"),
+        start=5,
+    ):
+        sheet.merge_cells(
+            start_row=7,
+            start_column=column,
+            end_row=8,
+            end_column=column,
+        )
+        sheet.cell(7, column, value)
+    for row, values in (
+        (9, (1, "Inspect", "Surface", "Fixture", "SC", "Clean", "Visual", "")),
+        (10, (2, "Measure", "Length", "Gauge", "CC", "10", "Caliper", "")),
+    ):
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row, column, value)
+    return _save_workbook(workbook)
+
+
+def _vertically_paired_context_repeated_form_bytes(
+    *,
+    first_context_values=True,
+    second_context_name="Part",
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous paged form"
+    for page_index, start in enumerate((1, 9)):
+        sheet.merge_cells(
+            start_row=start,
+            start_column=1,
+            end_row=start,
+            end_column=4,
+        )
+        sheet.cell(start, 1, "Anonymous paged form")
+        sheet.cell(start + 1, 1, "Part" if page_index == 0 else second_context_name)
+        sheet.cell(start + 1, 3, "Supplier")
+        sheet.merge_cells(
+            start_row=start + 2,
+            start_column=1,
+            end_row=start + 2,
+            end_column=2,
+        )
+        if page_index > 0 or first_context_values:
+            sheet.cell(start + 2, 1, f"P-{page_index + 1}")
+        sheet.merge_cells(
+            start_row=start + 2,
+            start_column=3,
+            end_row=start + 2,
+            end_column=4,
+        )
+        if page_index > 0 or first_context_values:
+            sheet.cell(start + 2, 3, "Supplier A")
+        for column, value in enumerate(
+            ("Sequence", "Operation", "Characteristic", "Status"),
+            start=1,
+        ):
+            sheet.cell(start + 3, column, value)
+        for row_offset, values in enumerate(
+            (
+                (page_index * 2 + 1, "Inspect", "Surface", "Open"),
+                (page_index * 2 + 2, "Measure", "Length", "Closed"),
+            ),
+            start=4,
+        ):
+            for column, value in enumerate(values, start=1):
+                sheet.cell(start + row_offset, column, value)
+    return _save_workbook(workbook)
+
+
+def _vertically_merged_record_key_with_an_empty_display_row_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous sparse records"
+    sheet.append(["Sequence", "Operation", "Characteristic"])
+    sheet.merge_cells("A2:A5")
+    sheet["A2"] = 10
+    sheet["B2"] = "Form"
+    sheet["C2"] = "Length"
+    sheet["C3"] = "Width"
+    sheet["C5"] = "Depth"
+    sheet["A6"] = 20
+    sheet["B6"] = "Inspect"
+    sheet["C6"] = "Surface"
+    return _save_workbook(workbook)
+
+
+def _multilevel_table_after_context_gap_with_sidecar_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous supplier register"
+    sheet.merge_cells("A1:R1")
+    sheet["A1"] = "Anonymous supplier register"
+
+    sheet.merge_cells("A3:D3")
+    sheet["A3"] = "Program"
+    sheet.merge_cells("E3:I3")
+    sheet["E3"] = "Program A"
+    sheet.merge_cells("J3:L3")
+    sheet["J3"] = "Component"
+    sheet.merge_cells("M3:R3")
+    sheet["M3"] = "Component A"
+    sheet["S3"] = "Sidecar action"
+
+    sheet.merge_cells("A4:A5")
+    sheet["A4"] = "Sequence"
+    sheet.merge_cells("B4:G4")
+    sheet["B4"] = "Level"
+    for column, value in enumerate(range(1, 7), start=2):
+        sheet.cell(5, column, value)
+    for column, value in enumerate(
+        (
+            "Material",
+            "Grade",
+            "Standard",
+            "Alternative",
+            "Status A",
+            "Status B",
+            "Status C",
+            "Status D",
+            "Process",
+            "Supplier",
+            "Address",
+        ),
+        start=8,
+    ):
+        sheet.merge_cells(
+            start_row=4,
+            start_column=column,
+            end_row=5,
+            end_column=column,
+        )
+        sheet.cell(4, column, value)
+
+    for index, row in enumerate(range(6, 11), start=1):
+        sheet.cell(row, index + 1, "yes")
+        for column, value in enumerate(
+            (
+                f"Material {index}",
+                f"Grade {index}",
+                "Standard A",
+                "N",
+                "Y",
+                "N",
+                "N",
+                "N",
+                f"Process {index}",
+                f"Supplier {index}",
+                f"Address {index}",
+            ),
+            start=8,
+        ):
+            sheet.cell(row, column, value)
+    return _save_workbook(workbook)
+
+
+def _competing_merge_free_tail_candidate_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous grouped register"
+    sheet.merge_cells("A1:F1")
+    sheet["A1"] = "Anonymous grouped register"
+    sheet.merge_cells("A2:A3")
+    sheet["A2"] = "Sequence"
+    sheet.merge_cells("B2:B3")
+    sheet["B2"] = "Operation"
+    sheet.merge_cells("C2:D2")
+    sheet["C2"] = "Characteristic"
+    sheet["C3"] = "Product"
+    sheet["D3"] = "Process"
+    sheet.merge_cells("E2:E3")
+    sheet["E2"] = "Method"
+    sheet.merge_cells("F2:F3")
+    sheet["F2"] = "Response"
+
+    sheet.merge_cells("A4:A6")
+    sheet["A4"] = 10
+    sheet.merge_cells("B4:B6")
+    sheet["B4"] = "Grouped operation"
+    for row in range(4, 7):
+        sheet.cell(row, 3, f"Product {row}")
+        sheet.cell(row, 4, f"Process {row}")
+        sheet.cell(row, 5, f"Method {row}")
+        sheet.cell(row, 6, f"Response {row}")
+
+    for row, sequence in ((7, 20), (8, 30), (9, 40)):
+        sheet.cell(row, 1, sequence)
+        sheet.cell(row, 2, f"Operation {sequence}")
+        sheet.cell(row, 3, f"Product {sequence}")
+        sheet.cell(row, 4, f"Process {sequence}")
+        sheet.cell(row, 5, f"Method {sequence}")
+        sheet.cell(row, 6, f"Response {sequence}")
+    return _save_workbook(workbook)
+
+
+def _competing_multilevel_header_candidate_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous material register"
+    sheet.merge_cells("A2:R3")
+    sheet["A2"] = "Anonymous material register"
+    sheet["S2"] = "Sidecar action"
+    sheet.merge_cells("A4:D4")
+    sheet["A4"] = "Reference"
+    sheet.merge_cells("E4:I4")
+    sheet["E4"] = "R-001"
+    sheet.merge_cells("J4:L4")
+    sheet["J4"] = "Description"
+    sheet.merge_cells("M4:P4")
+    sheet["M4"] = "Assembly"
+    sheet.merge_cells("Q4:R4")
+    sheet["Q4"] = "Source"
+
+    sheet.merge_cells("A5:A6")
+    sheet["A5"] = "Sequence"
+    sheet.merge_cells("B5:G5")
+    sheet["B5"] = "Level"
+    for column, value in enumerate(range(1, 7), start=2):
+        sheet.cell(6, column, value)
+    sheet.merge_cells("H5:I5")
+    sheet["H5"] = "Part number"
+    sheet["H6"] = "Internal"
+    sheet["I6"] = "Supplier"
+    sheet.merge_cells("J5:J6")
+    sheet["J5"] = "Material"
+    sheet.merge_cells("K5:K6")
+    sheet["K5"] = "Specification"
+    sheet.merge_cells("L5:L6")
+    sheet["L5"] = "Standard"
+    sheet.merge_cells("M5:M6")
+    sheet["M5"] = "Alternative"
+    sheet.merge_cells("N5:R5")
+    sheet["N5"] = "Status"
+    for column, value in enumerate(
+        ("Internal", "Domestic", "Imported", "Auxiliary", "Approved"),
+        start=14,
+    ):
+        sheet.cell(6, column, value)
+
+    for row, level_column in enumerate((4, 3, 3, 4, 3), start=7):
+        sheet.cell(row, level_column, "yes")
+        sheet.cell(row, 8, "/")
+        sheet.cell(row, 9, "/")
+        sheet.cell(row, 10, f"Material {row}")
+        sheet.cell(row, 11, f"Grade {row}")
+        sheet.cell(row, 12, "/")
+        sheet.cell(row, 13, "Y")
+        sheet.cell(row, 14 if row % 2 else 15, "yes")
+        sheet.cell(row, 18, "approved")
+    return _save_workbook(workbook)
+
+
+def _single_level_header_after_context_workbook_bytes():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous risk register"
+    sheet["A1"] = "Submission"
+    sheet.merge_cells("O1:R1")
+    sheet.merge_cells("O2:R2")
+    sheet["A3"] = "Reference"
+    sheet.merge_cells("D3:G3")
+    sheet["D3"] = "Description"
+    sheet["I3"] = "Program"
+    sheet["L3"] = "Prepared"
+    sheet["M3"] = "Person"
+    sheet["N3"] = "Phone"
+    sheet.merge_cells("O3:R4")
+    sheet["O3"] = "Contact"
+    sheet.merge_cells("A4:C4")
+    sheet["A4"] = "Reference"
+    sheet.merge_cells("D4:H4")
+    sheet["D4"] = "Assembly"
+    sheet.merge_cells("I4:K4")
+    sheet["I4"] = "Program"
+    sheet["L4"] = "Prepared"
+    sheet["A5"] = "Core team"
+    sheet.merge_cells("B5:C6")
+    sheet["B5"] = "Team"
+    sheet["D5"] = "Modified"
+    sheet["L5"] = "Approval"
+    sheet.merge_cells("O5:R5")
+    sheet.merge_cells("D6:G6")
+    sheet["L6"] = "Approval date"
+    sheet.merge_cells("O6:R6")
+    for column, value in enumerate(
+        (
+            "Process",
+            "Mode",
+            "Effect",
+            "Severity",
+            "Class",
+            "Cause",
+            "Occurrence",
+            "Prevention",
+            "Detection",
+            "Rating",
+            "Priority",
+            "Action",
+            "Owner",
+            "Result",
+            "Final severity",
+            "Final occurrence",
+            "Final detection",
+            "Final priority",
+        ),
+        start=1,
+    ):
+        sheet.cell(7, column, value)
+    sheet.merge_cells("A8:A12")
+    sheet["A8"] = "10"
+    sheet.merge_cells("A14:A16")
+    sheet["A14"] = "20"
+    sheet.merge_cells("A17:A18")
+    sheet["A17"] = "30"
+    sheet.merge_cells("A19:A20")
+    sheet["A19"] = "40"
+    sheet.merge_cells("H19:H20")
+    sheet["H19"] = "Shared prevention"
+    for row in range(8, 21):
+        for column, value in {
+            2: f"Mode {row}",
+            3: f"Effect {row}",
+            4: "5",
+            6: f"Cause {row}",
+            7: "3",
+            8: f"Prevention {row}",
+            9: f"Detection {row}",
+            10: "4",
+            11: "60",
+        }.items():
+            if (
+                sheet.cell(row, column).__class__.__name__ != "MergedCell"
+                and sheet.cell(row, column).value is None
+            ):
+                sheet.cell(row, column, value)
     return _save_workbook(workbook)
 
 
@@ -2613,6 +3358,102 @@ def test_vertical_headerless_continuation_downgrades_complete_sibling(table_pars
     assert len(projection["tables"]) == 1
     assert projection["tables"][0]["source_total_count"] == 3
     assert projection["tables"][0]["matched_rule"] == "L1-02"
+
+
+def test_repeated_form_segments_are_one_sheet_level_logical_table(table_parser):
+    projection = build_tabular_structure_projection(
+        "ppap-like.xls",
+        _sheet_level_repeated_form_segments_bytes(),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 4
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [4, 5, 12, 13]
+    assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
+
+
+def test_repeated_form_context_values_may_change_inside_one_sheet_object(table_parser):
+    projection = build_tabular_structure_projection(
+        "ppap-like.xls",
+        _sheet_level_repeated_form_segments_bytes(
+            second_context_value="2906151-SE01",
+        ),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 1
+    assert projection["tables"][0]["source_total_count"] == 4
+
+
+def test_repeated_headers_with_a_conflicting_form_context_remain_separate(table_parser):
+    projection = build_tabular_structure_projection(
+        "ppap-like.xls",
+        _sheet_level_repeated_form_segments_bytes(
+            second_context_name="图号",
+        ),
+        parser=table_parser,
+    )
+
+    assert len(projection["tables"]) == 2
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, 2]
+
+
+def test_four_repeated_pages_merge_in_physical_order_across_context_value_changes(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "ppap-like.xls",
+        _four_page_repeated_form_with_context_value_changes_bytes(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert [table["source_total_count"] for table in complete] == [8]
+    assert [
+        [row["row_ordinal_int"] for row in projection["rows"] if row["table_ref_kwd"] == table["table_ref"]]
+        for table in complete
+    ] == [[4, 5, 12, 13, 20, 21, 28, 29]]
+
+
+def test_headerless_predecessor_merges_into_the_context_bound_named_page(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _headerless_predecessor_with_named_following_page_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+    assert [column["header_path"] for column in complete[0]["ordered_columns"]] == [
+        ["Process"],
+        ["Mode"],
+        ["Effect"],
+        ["Severity"],
+        ["Class"],
+        ["Cause"],
+        ["Occurrence"],
+        ["Prevention"],
+        ["Detection"],
+        ["Rating"],
+        ["Priority"],
+    ]
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+        and row["row_role_kwd"] == "data"
+    ] == [7, 8, 22, 23]
 
 
 def test_isolated_single_row_annotation_is_not_merged_as_a_continuation(table_parser):
@@ -4066,6 +4907,38 @@ def test_optional_field_shape_change_does_not_break_the_record_axis(table_parser
     assert all(row["row_role_kwd"] == "data" for row in projection["rows"])
 
 
+def test_continuous_record_axis_ignores_required_field_shape_changes(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Shape-changing records"
+    sheet.append(
+        ["Process", "Operation", "Characteristic", "Requirement", "Method"]
+    )
+    sheet.append(["80", "Press", "Seat", "No damage", "Visual"])
+    sheet.append(["90", "Rivet", "Torque", "< 8N.m", "Tester"])
+    sheet.append(["90", None, "Angle", "25 deg min", "Tester"])
+    sheet.append(["100", "Oil", "Grease", "0.7-1.0 g", "Valve"])
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = projection["tables"][0]
+    assert table["source_total_count"] == 4
+    assert [row["row_ordinal_int"] for row in projection["rows"]] == [2, 3, 4, 5]
+    assert [row["row_role_kwd"] for row in projection["rows"]] == [
+        "data",
+        "data",
+        "data",
+        "data",
+    ]
+
+
 def test_multilevel_sparse_table_ignores_context_only_g1_disagreement(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
@@ -4084,6 +4957,48 @@ def test_multilevel_sparse_table_ignores_context_only_g1_disagreement(table_pars
     assert [
         column["column_id"] for column in table["ordered_columns"]
     ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 9)]
+
+
+def test_nested_record_axis_g1_children_are_covered_by_one_dominant_axis():
+    workbook = Workbook()
+    worksheet = workbook.active
+    dominant = {
+        (3, 1),
+        (3, 2),
+        (3, 3),
+        (4, 1),
+        (4, 2),
+        (5, 1),
+        (5, 2),
+    }
+    nested = {(4, 3), (5, 3)}
+    region = {
+        "members": dominant | nested,
+        "g1_children": [dominant, nested],
+    }
+
+    assert tabular_structure._g1_disagreement_is_outside_record_axis(
+        worksheet,
+        region,
+        {3, 4, 5},
+    )
+
+
+def test_side_by_side_record_axis_g1_children_are_not_treated_as_nested():
+    workbook = Workbook()
+    worksheet = workbook.active
+    left = {(3, 1), (4, 1), (5, 1)}
+    right = {(3, 3), (4, 3), (5, 3)}
+    region = {
+        "members": left | right,
+        "g1_children": [left, right],
+    }
+
+    assert not tabular_structure._g1_disagreement_is_outside_record_axis(
+        worksheet,
+        region,
+        {3, 4, 5},
+    )
 
 
 def test_repeated_axis_g1_child_before_records_is_not_swallowed_as_context(table_parser):
@@ -4387,6 +5302,413 @@ def test_header_candidate_selection_prefers_the_largest_proven_record_axis(
 
     assert data_start == 7, (header_start, data_start, headers)
     assert len(rows[data_start:]) == 10
+
+
+def test_context_form_does_not_become_part_of_the_multilevel_header(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_multilevel_header_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["table_label"] == "Anonymous performance report"
+        and table["source_total_count"] == 2
+    )
+    assert [column["header_path"] for column in table["ordered_columns"]] == [
+        ["Sequence"],
+        ["Test"],
+        ["Description"],
+        ["Requirement"],
+        ["Quantity"],
+        ["Equipment"],
+        ["Date"],
+        ["Measured", "Run 1"],
+        ["Measured", "Run 2"],
+        ["Measured", "Run 3"],
+    ]
+
+
+def test_context_form_pairs_metadata_by_source_merge_geometry(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_multilevel_header_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["table_label"] == "Anonymous performance report"
+        and table["source_total_count"] == 2
+    )
+    assert table["table_context"] == [
+        {"name": "context", "value": "Anonymous performance report"},
+        {"name": "context", "value": "Unpaired context"},
+        {"name": "Provider", "value": "Provider A"},
+        {"name": "Laboratory", "value": "Laboratory A"},
+        {"name": "Component", "value": "Component A"},
+        {"name": "Reference", "value": "Reference A"},
+        {"name": "Revision", "value": "Revision A"},
+        {"name": "Fixture", "value": "Fixture A"},
+    ]
+
+
+def test_unused_trailing_table_column_does_not_hide_right_side_context(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_with_an_unused_trailing_table_column_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["source_total_count"] == 2
+    )
+    assert [column["header_path"] for column in table["ordered_columns"]] == [
+        ["Sequence"],
+        ["Operation"],
+        ["Characteristic", "Product"],
+        ["Characteristic", "Process"],
+        ["Class"],
+        ["Requirement"],
+        ["Method"],
+    ]
+    assert table["table_context"][:5] == [
+        {"name": "context", "value": "Anonymous characteristics"},
+        {"name": "Provider", "value": "Provider A"},
+        {"name": "Component", "value": "Component A"},
+        {"name": "Program", "value": "Program A"},
+        {"name": "Reference", "value": "Reference A"},
+    ]
+
+
+def test_right_side_action_does_not_expand_the_header_candidate_context_width(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_with_a_right_side_action_before_multilevel_header_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    table = next(
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+        and table["source_total_count"] == 2
+    )
+    assert [column["header_path"] for column in table["ordered_columns"]] == [
+        ["Sequence"],
+        ["Operation"],
+        ["Characteristic", "Product"],
+        ["Characteristic", "Process"],
+        ["Class"],
+        ["Requirement"],
+        ["Method"],
+    ]
+    assert table["table_context"][:5] == [
+        {"name": "context", "value": "Anonymous characteristics"},
+        {"name": "Provider", "value": "Provider A"},
+        {"name": "Component", "value": "Component A"},
+        {"name": "Program", "value": "Program A"},
+        {"name": "Reference", "value": "Reference A"},
+    ]
+
+
+def test_repeated_pages_allow_an_optional_parent_header_path(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _multilevel_repeated_form_with_optional_parent_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+
+
+def test_repeated_pages_with_a_conflicting_leaf_header_remain_separate(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _multilevel_repeated_form_with_optional_parent_bytes(
+            second_process_header="Method",
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 2
+    assert [table["source_total_count"] for table in complete] == [2, 2]
+
+
+def test_vertically_paired_context_values_do_not_split_repeated_pages(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertically_paired_context_repeated_form_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+    assert complete[0]["table_context"][:3] == [
+        {"name": "context", "value": "Anonymous paged form"},
+        {"name": "Part", "value": "P-1"},
+        {"name": "Supplier", "value": "Supplier A"},
+    ]
+
+
+def test_conflicting_vertically_paired_context_keys_keep_pages_separate(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertically_paired_context_repeated_form_bytes(
+            second_context_name="Drawing",
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert [table["source_total_count"] for table in complete] == [2, 2]
+
+
+def test_empty_context_values_keep_source_labels_as_repeated_form_identity(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertically_paired_context_repeated_form_bytes(
+            first_context_values=False,
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+
+
+def test_vertical_record_merge_proves_an_axis_across_an_empty_display_row(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _vertically_merged_record_key_with_an_empty_display_row_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["row_role_kwd"] == "data"
+    ] == [2, 3, 5, 6]
+
+
+def test_context_sidecar_cannot_turn_a_proven_multilevel_table_into_an_empty_axis(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _multilevel_table_after_context_gap_with_sidecar_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 5
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+        and row["row_role_kwd"] == "data"
+    ] == [6, 7, 8, 9, 10]
+
+
+def test_context_form_followed_by_a_multilevel_header_proves_an_empty_axis(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_multilevel_header_workbook_bytes(record_count=0),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert [column["header_path"] for column in complete[0]["ordered_columns"]] == [
+        ["Sequence"],
+        ["Test"],
+        ["Description"],
+        ["Requirement"],
+        ["Quantity"],
+        ["Equipment"],
+        ["Date"],
+        ["Measured", "Run 1"],
+        ["Measured", "Run 2"],
+        ["Measured", "Run 3"],
+    ]
+    assert projection["rows"] == []
+
+
+def test_context_preceded_empty_axis_discovery_has_linear_membership_checks(
+    table_parser,
+):
+    class MembershipCountingRows(list):
+        def __init__(self, values):
+            super().__init__(values)
+            self.contains_calls = 0
+
+        def __contains__(self, value):
+            self.contains_calls += 1
+            return super().__contains__(value)
+
+    workbook = Workbook()
+    sheet = workbook.active
+    for row_ordinal in range(1, 201):
+        sheet.cell(row_ordinal, 1, f"Row {row_ordinal}")
+    rows = list(sheet.iter_rows())
+    populated_rows = MembershipCountingRows(range(1, 201))
+
+    assert tabular_structure._context_preceded_multilevel_empty_axis(
+        table_parser,
+        sheet,
+        rows,
+        populated_rows,
+        [],
+    ) is None
+    assert populated_rows.contains_calls <= len(populated_rows) * 2
+
+
+def test_header_candidate_does_not_fold_a_merged_record_group_into_the_header(
+    table_parser,
+):
+    workbook = table_parser._load_excel_to_workbook(
+        BytesIO(_competing_merge_free_tail_candidate_workbook_bytes())
+    )
+    worksheet = workbook.active
+    rows, _populated_rows, _unresolved_rows = (
+        tabular_structure._complete_worksheet_rows(worksheet)
+    )
+
+    headers, header_start, data_start = tabular_structure._parse_region_structure(
+        table_parser,
+        worksheet,
+        rows,
+    )
+
+    assert data_start == 3, (header_start, data_start, headers)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _competing_merge_free_tail_candidate_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+    assert projection["tables"][0]["source_total_count"] == 6
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["row_role_kwd"] == "data"
+    ] == [4, 5, 6, 7, 8, 9]
+
+
+def test_header_candidate_excludes_all_rows_of_a_multilevel_header(table_parser):
+    workbook = table_parser._load_excel_to_workbook(
+        BytesIO(_competing_multilevel_header_candidate_workbook_bytes())
+    )
+    worksheet = workbook.active
+    rows, _populated_rows, _unresolved_rows = (
+        tabular_structure._complete_worksheet_rows(worksheet)
+    )
+
+    headers, header_start, data_start = tabular_structure._parse_region_structure(
+        table_parser,
+        worksheet,
+        rows,
+    )
+
+    assert data_start == 6, (header_start, data_start, headers)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _competing_multilevel_header_candidate_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+    assert projection["tables"][0]["source_total_count"] == 5
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["row_role_kwd"] == "data"
+    ] == [7, 8, 9, 10, 11]
+
+
+def test_header_candidate_excludes_a_single_level_header_after_context(table_parser):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _single_level_header_after_context_workbook_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    assert projection["tables"][0]["source_total_count"] == 13
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["row_role_kwd"] == "data"
+    ] == list(range(8, 21))
 
 
 def test_header_candidate_accepts_lossless_mixed_storage_numeric_keys(table_parser):
@@ -4974,6 +6296,135 @@ def test_biff_formula_inventory_uses_only_sheet_and_cell_coordinates():
     stream = global_bof + boundsheet + eof + worksheet_bof + formula + eof
 
     assert _formula_coordinates_from_biff_stream(stream) == [{(3, 4)}]
+
+
+def test_biff_formula_inventory_preserves_nonworksheet_sheet_ordinals():
+    global_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0005)
+    macro_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0040)
+    worksheet_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0010)
+    formula = struct.pack("<HHHH", 0x0006, 4, 2, 3)
+    eof = struct.pack("<HH", 0x000A, 0)
+    first_boundsheet_length = 4 + 8
+    second_boundsheet_length = 4 + 8
+    macro_offset = len(global_bof) + first_boundsheet_length + second_boundsheet_length + len(eof)
+    worksheet_offset = macro_offset + len(macro_bof) + len(eof)
+    macro_payload = struct.pack("<IBBBB", macro_offset, 2, 1, 0, 0)
+    worksheet_payload = struct.pack("<IBBBB", worksheet_offset, 0, 0, 0, 0)
+    macro_boundsheet = struct.pack("<HH", 0x0085, len(macro_payload)) + macro_payload
+    worksheet_boundsheet = (
+        struct.pack("<HH", 0x0085, len(worksheet_payload)) + worksheet_payload
+    )
+    stream = (
+        global_bof
+        + macro_boundsheet
+        + worksheet_boundsheet
+        + eof
+        + macro_bof
+        + eof
+        + worksheet_bof
+        + formula
+        + eof
+    )
+
+    assert _formula_coordinates_from_biff_stream(stream) == [set(), {(3, 4)}]
+
+
+def test_biff_formula_cached_result_inventory_preserves_result_kind_and_ordinals():
+    global_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0005)
+    macro_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0040)
+    worksheet_bof = struct.pack("<HHHH", 0x0809, 4, 0x0600, 0x0010)
+    numeric_formula_payload = (
+        struct.pack("<HHH", 2, 3, 0)
+        + struct.pack("<d", 60.0)
+        + b"\x00" * 6
+    )
+    empty_formula_payload = (
+        struct.pack("<HHH", 4, 5, 0)
+        + b"\x03\x00\x00\x00\x00\x00\xff\xff"
+        + b"\x00" * 6
+    )
+    numeric_formula = struct.pack(
+        "<HH", 0x0006, len(numeric_formula_payload)
+    ) + numeric_formula_payload
+    empty_formula = struct.pack(
+        "<HH", 0x0006, len(empty_formula_payload)
+    ) + empty_formula_payload
+    eof = struct.pack("<HH", 0x000A, 0)
+    first_boundsheet_length = 4 + 8
+    second_boundsheet_length = 4 + 8
+    macro_offset = len(global_bof) + first_boundsheet_length + second_boundsheet_length + len(eof)
+    worksheet_offset = macro_offset + len(macro_bof) + len(eof)
+    macro_payload = struct.pack("<IBBBB", macro_offset, 2, 1, 0, 0)
+    worksheet_payload = struct.pack("<IBBBB", worksheet_offset, 0, 0, 0, 0)
+    stream = (
+        global_bof
+        + struct.pack("<HH", 0x0085, len(macro_payload))
+        + macro_payload
+        + struct.pack("<HH", 0x0085, len(worksheet_payload))
+        + worksheet_payload
+        + eof
+        + macro_bof
+        + eof
+        + worksheet_bof
+        + numeric_formula
+        + empty_formula
+        + eof
+    )
+
+    assert _formula_cached_result_kinds_from_biff_stream(stream) == [
+        {},
+        {(3, 4): "numeric", (5, 6): "empty"},
+    ]
+
+
+def test_cached_empty_formula_coordinate_remains_in_source_region_membership(
+    table_parser,
+    monkeypatch,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Code", "Value", "Calculated"])
+    sheet.append(["A-1", 1, None])
+    binary = _save_workbook(workbook)
+    monkeypatch.setattr(
+        tabular_structure,
+        "_formula_coordinates_by_sheet",
+        lambda _binary: ([{(2, 3)}], True),
+    )
+    monkeypatch.setattr(
+        tabular_structure,
+        "_formula_cached_result_kinds_by_sheet",
+        lambda _binary: [{(2, 3): "empty"}],
+    )
+    captured = []
+    original = tabular_structure._worksheet_structure_regions
+
+    def capture(
+        parser,
+        worksheet,
+        sheet_ordinal,
+        unresolved_formula_coordinates=None,
+        formula_coordinates=None,
+    ):
+        captured.append(
+            (
+                set(unresolved_formula_coordinates or ()),
+                set(formula_coordinates or ()),
+            )
+        )
+        return original(
+            parser,
+            worksheet,
+            sheet_ordinal,
+            unresolved_formula_coordinates,
+            formula_coordinates,
+        )
+
+    monkeypatch.setattr(tabular_structure, "_worksheet_structure_regions", capture)
+
+    build_tabular_structure_projection("anonymous.xls", binary, parser=table_parser)
+
+    assert captured == [(set(), {(2, 3)})]
 
 
 def test_generation_reference_rejects_customer_text(table_parser):

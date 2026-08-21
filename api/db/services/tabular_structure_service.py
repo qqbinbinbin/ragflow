@@ -162,6 +162,8 @@ def build_tabular_discovery_index_projection(
     generation_ref = projection["producer_generation_ref"]
     records = []
     for table in projection["tables"]:
+        if table.get("enumeration_status") != "supported_complete":
+            continue
         search_text, unsafe_reason = _table_search_text(table)
         identity_hash = hashlib.sha256(
             json.dumps(
@@ -2192,6 +2194,32 @@ class TabularStructureService:
             "enumeration_rule_version": projection["enumeration_rule_version"],
             "row_count": record["row_count"],
             "tables": tables,
+        }
+
+    @classmethod
+    def read_active_table(
+        cls,
+        storage,
+        *,
+        table_ref: str,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Return one table snapshot bound to the requested active generation."""
+
+        record, projection = cls._read_projection(storage, **kwargs)
+        table = next(
+            (item for item in projection["tables"] if item["table_ref"] == table_ref),
+            None,
+        )
+        if table is None:
+            raise StructureSnapshotMissing("active table snapshot is missing")
+        return {
+            "producer_generation_ref": projection["producer_generation_ref"],
+            "producer_schema_version": projection["producer_schema_version"],
+            "projection_version": projection["version"],
+            "structure_algorithm_version": projection["structure_algorithm_version"],
+            "enumeration_rule_version": projection["enumeration_rule_version"],
+            "table": deepcopy(table),
         }
 
     @classmethod
