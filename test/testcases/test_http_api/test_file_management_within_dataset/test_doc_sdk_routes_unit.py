@@ -1319,7 +1319,16 @@ class TestDocRoutesUnit:
         monkeypatch.setattr(
             module,
             "request",
-            SimpleNamespace(args=_DummyArgs({"generation_ref": "generation-1", "cursor": "2", "page_size": "25"})),
+            SimpleNamespace(
+                args=_DummyArgs(
+                    {
+                        "generation_ref": "generation-1",
+                        "cursor": "2",
+                        "page_size": "25",
+                        "row_transport_version": "tabular-row-page-compact/v1",
+                    }
+                )
+            ),
         )
         rows = _run(_route_core(module.list_tabular_structure_rows)("tenant-1", "ds-1", "doc-1", "table-1"))
         assert rows["code"] == 0
@@ -1352,6 +1361,7 @@ class TestDocRoutesUnit:
             "table_ref": "table-1",
             "cursor": 2,
             "page_size": 25,
+            "row_transport_version": "tabular-row-page-compact/v1",
         }
 
     def test_tabular_structure_error_returns_stable_reason_without_exception_text(self, monkeypatch, caplog):

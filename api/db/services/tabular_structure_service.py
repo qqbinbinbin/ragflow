@@ -2177,10 +2177,17 @@ class TabularStructureService:
         table_ref: str,
         cursor: int = 0,
         page_size: int = 30,
+        row_transport_version: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         _record, projection = cls._read_generation_projection(storage, **kwargs)
-        return page_tabular_structure_rows(projection, table_ref=table_ref, cursor=cursor, page_size=page_size)
+        return page_tabular_structure_rows(
+            projection,
+            table_ref=table_ref,
+            cursor=cursor,
+            page_size=page_size,
+            row_transport_version=row_transport_version,
+        )
 
     @classmethod
     def read_active_manifest(cls, storage, **kwargs) -> dict[str, Any]:

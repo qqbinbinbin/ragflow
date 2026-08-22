@@ -36,6 +36,7 @@ PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
 STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v19"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
+ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v1"
 _CURRENT_PROJECTION_CONTRACT = (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_VERSION,
@@ -6992,6 +6993,7 @@ def page_tabular_structure_rows(
     table_ref: str,
     cursor: int = 0,
     page_size: int = 30,
+    row_transport_version: str | None = None,
 ) -> dict[str, Any]:
     """Return one stable offset page from an already verified generation."""
 
@@ -7002,6 +7004,8 @@ def page_tabular_structure_rows(
         raise ValueError("cursor must be a non-negative integer")
     if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
         raise ValueError("page_size must be a positive integer")
+    if row_transport_version not in {None, ROW_PAGE_TRANSPORT_VERSION}:
+        raise ValueError("unsupported row transport version")
 
     table = next((item for item in projection["tables"] if item["table_ref"] == table_ref), None)
     if table is None:
@@ -7015,9 +7019,22 @@ def page_tabular_structure_rows(
         )
     )
     page_rows = rows[cursor : cursor + page_size]
+    if row_transport_version == ROW_PAGE_TRANSPORT_VERSION:
+        page_rows = [
+            [
+                row["row_ordinal_int"],
+                row["data_row_index_int"],
+                row["row_role_kwd"],
+                [
+                    [field["column_ordinal"], field["value"]]
+                    for field in json.loads(row["ordered_fields_list"])
+                ],
+            ]
+            for row in page_rows
+        ]
     next_cursor = cursor + len(page_rows)
     has_more = next_cursor < len(rows)
-    return {
+    result = {
         "producer_generation_ref": projection["producer_generation_ref"],
         "table_ref": table_ref,
         "producer_schema_version": projection["producer_schema_version"],
@@ -7030,3 +7047,6 @@ def page_tabular_structure_rows(
         "has_more": has_more,
         "next_cursor": next_cursor if has_more else None,
     }
+    if row_transport_version is not None:
+        result["row_transport_version"] = row_transport_version
+    return result

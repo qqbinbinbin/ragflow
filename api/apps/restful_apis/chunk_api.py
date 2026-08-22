@@ -562,6 +562,7 @@ async def list_tabular_structure_rows(tenant_id, dataset_id, document_id, table_
     try:
         cursor = int(request.args.get("cursor", 0))
         page_size = int(request.args.get("page_size", 30))
+        row_transport_version = request.args.get("row_transport_version")
         if cursor < 0 or page_size < 1 or page_size > TABULAR_STRUCTURE_PAGE_SIZE_MAX:
             raise ValueError("invalid structure pagination")
         data = _get_tabular_structure_service().read_generation_rows(
@@ -573,6 +574,7 @@ async def list_tabular_structure_rows(tenant_id, dataset_id, document_id, table_
             table_ref=table_ref,
             cursor=cursor,
             page_size=page_size,
+            row_transport_version=row_transport_version,
         )
         return get_result(data=data)
     except Exception as error:

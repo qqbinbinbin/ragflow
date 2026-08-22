@@ -4689,6 +4689,71 @@ def test_generation_bound_page_has_stable_order_total_and_explicit_end(table_par
     assert second["next_cursor"] is None
 
 
+def test_generation_bound_compact_page_is_lossless_and_smaller(table_parser):
+    _storage, projection, _receipt = _stored_generation(table_parser)
+    table_ref = projection["tables"][0]["table_ref"]
+
+    verbose = tabular_structure.page_tabular_structure_rows(
+        projection,
+        table_ref=table_ref,
+        cursor=0,
+        page_size=3,
+    )
+    compact = tabular_structure.page_tabular_structure_rows(
+        projection,
+        table_ref=table_ref,
+        cursor=0,
+        page_size=3,
+        row_transport_version="tabular-row-page-compact/v1",
+    )
+
+    assert compact["row_transport_version"] == "tabular-row-page-compact/v1"
+    assert {
+        key: compact[key]
+        for key in (
+            "producer_generation_ref",
+            "table_ref",
+            "producer_schema_version",
+            "projection_version",
+            "structure_algorithm_version",
+            "enumeration_rule_version",
+            "total",
+            "source_total_count",
+            "has_more",
+            "next_cursor",
+        )
+    } == {
+        key: verbose[key]
+        for key in (
+            "producer_generation_ref",
+            "table_ref",
+            "producer_schema_version",
+            "projection_version",
+            "structure_algorithm_version",
+            "enumeration_rule_version",
+            "total",
+            "source_total_count",
+            "has_more",
+            "next_cursor",
+        )
+    }
+    assert compact["rows"] == [
+        [
+            row["row_ordinal_int"],
+            row["data_row_index_int"],
+            row["row_role_kwd"],
+            [
+                [field["column_ordinal"], field["value"]]
+                for field in json.loads(row["ordered_fields_list"])
+            ],
+        ]
+        for row in verbose["rows"]
+    ]
+    assert len(tabular_structure._canonical_json(compact)) < len(
+        tabular_structure._canonical_json(verbose)
+    )
+
+
 def test_shadow_registration_is_scope_checked_and_idempotent(service_module, generation_repository, table_parser):
     storage, projection, receipt = _stored_generation(table_parser)
 
@@ -4960,6 +5025,47 @@ def test_exact_generation_reads_support_shadow_active_and_retained_with_scope_bi
             repository=generation_repository,
         )
     assert first_storage.get_calls == []
+
+
+def test_exact_generation_row_read_forwards_compact_transport_after_scope_binding(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation(table_parser)
+    service_module.TabularStructureService.register_shadow_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        receipt=receipt,
+        repository=generation_repository,
+    )
+
+    table_ref = projection["tables"][0]["table_ref"]
+    result = service_module.TabularStructureService.read_generation_rows(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        table_ref=table_ref,
+        row_transport_version="tabular-row-page-compact/v1",
+        repository=generation_repository,
+    )
+
+    assert result["row_transport_version"] == "tabular-row-page-compact/v1"
+    assert result["producer_generation_ref"] == projection["producer_generation_ref"]
+    assert result["table_ref"] == table_ref
+    assert result["rows"][0] == [
+        projection["rows"][0]["row_ordinal_int"],
+        projection["rows"][0]["data_row_index_int"],
+        projection["rows"][0]["row_role_kwd"],
+        [
+            [field["column_ordinal"], field["value"]]
+            for field in json.loads(projection["rows"][0]["ordered_fields_list"])
+        ],
+    ]
 
 
 def test_active_table_read_returns_only_the_generation_bound_table_metadata(
