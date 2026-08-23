@@ -5,7 +5,7 @@ import uuid
 from io import BytesIO
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
 
 from test.fuxi.test_table_semantic_rows import _load_table_module
@@ -39,7 +39,7 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v19"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v20"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -2473,6 +2473,90 @@ def _context_form_before_multilevel_header_workbook_bytes(*, record_count=2):
             start=1,
         ):
             sheet.cell(row, column, value)
+    return _save_workbook(workbook)
+
+
+def _context_form_before_horizontally_merged_leaf_empty_axis_bytes(
+    *,
+    merge_record_fields=False,
+    numeric_record_key=True,
+    rectangular_leaf_merges=True,
+    rectangular_header_continuation=False,
+    record_count=0,
+    single_semantic_path=False,
+):
+    workbook = load_workbook(
+        BytesIO(
+            _context_form_before_multilevel_header_workbook_bytes(
+                record_count=record_count
+            )
+        )
+    )
+    sheet = workbook.active
+    for merged in list(sheet.merged_cells.ranges):
+        if merged.min_row >= 7:
+            sheet.unmerge_cells(str(merged))
+    for row in range(7, 9):
+        for column in range(1, 11):
+            sheet.cell(row, column).value = None
+
+    if single_semantic_path:
+        sheet.merge_cells("A7:J7")
+        sheet["A7"] = "Record field"
+        sheet.merge_cells("A8:J8")
+        sheet["A8"] = "Record field"
+        return _save_workbook(workbook)
+
+    leaf_merges = (
+        (
+            ("A7:A8", "Sequence"),
+            ("B7:C8", "Material"),
+            ("D7:D8", "Requirement"),
+            ("E7:F8", "Standard"),
+            ("G7:G8", "Result"),
+        )
+        if rectangular_leaf_merges
+        else (
+            ("A7:A8", "Sequence"),
+            ("B7:C7", "Material"),
+            ("B8:C8", "Detail"),
+            ("D7:D8", "Requirement"),
+            ("E7:F7", "Standard"),
+            ("E8:F8", "Clause"),
+            ("G7:G8", "Result"),
+        )
+    )
+    for cell_range, value in leaf_merges:
+        sheet.merge_cells(cell_range)
+        sheet[cell_range.split(":", 1)[0]] = value
+    sheet.merge_cells("H7:J7")
+    sheet["H7"] = "Outcome"
+    for column, value in enumerate(("Measured", "Unit", "Conclusion"), start=8):
+        sheet.cell(8, column).value = value
+    if merge_record_fields:
+        for row in range(9, 9 + record_count):
+            for start_column, end_column in ((2, 3), (5, 6)):
+                sheet.cell(row, end_column).value = None
+                sheet.merge_cells(
+                    start_row=row,
+                    start_column=start_column,
+                    end_row=row,
+                    end_column=end_column,
+                )
+    if not numeric_record_key:
+        for index, row in enumerate(range(9, 9 + record_count), start=1):
+            sheet.cell(row, 1).value = f"Header level {index}"
+    if rectangular_header_continuation:
+        for row in range(9, 9 + record_count):
+            for column in range(2, 4):
+                sheet.cell(row, column).value = None
+        sheet.merge_cells(
+            start_row=9,
+            start_column=2,
+            end_row=8 + record_count,
+            end_column=3,
+        )
+        sheet["B9"] = "Header continuation"
     return _save_workbook(workbook)
 
 
@@ -5602,6 +5686,204 @@ def test_context_form_followed_by_a_multilevel_header_proves_an_empty_axis(
         ["Measured", "Run 3"],
     ]
     assert projection["rows"] == []
+
+
+def test_context_form_with_horizontally_merged_leaf_headers_proves_an_empty_axis(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_horizontally_merged_leaf_empty_axis_bytes(),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert [column["header_path"] for column in complete[0]["ordered_columns"]] == [
+        ["Sequence"],
+        ["Material"],
+        ["Material"],
+        ["Requirement"],
+        ["Standard"],
+        ["Standard"],
+        ["Result"],
+        ["Outcome", "Measured"],
+        ["Outcome", "Unit"],
+        ["Outcome", "Conclusion"],
+    ]
+    assert [column["column_ordinal"] for column in complete[0]["ordered_columns"]] == list(
+        range(1, 11)
+    )
+    assert projection["rows"] == []
+
+
+def test_proven_records_take_precedence_over_a_horizontally_merged_empty_axis_candidate(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_horizontally_merged_leaf_empty_axis_bytes(
+            merge_record_fields=True,
+            record_count=2,
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 2
+    assert complete[0]["matched_rule"] == "L1-04"
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+        and row["row_role_kwd"] == "data"
+    ] == [9, 10]
+
+
+def test_header_levels_without_a_proven_record_key_remain_an_empty_axis(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_horizontally_merged_leaf_empty_axis_bytes(
+            numeric_record_key=False,
+            rectangular_header_continuation=True,
+            record_count=2,
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 0
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert projection["rows"] == []
+
+
+def test_source_backed_records_after_a_rectangular_header_boundary_take_precedence(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_horizontally_merged_leaf_empty_axis_bytes(
+            merge_record_fields=True,
+            numeric_record_key=False,
+            record_count=2,
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 2
+    assert complete[0]["matched_rule"] == "L1-04"
+    assert [
+        row["row_ordinal_int"]
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+        and row["row_role_kwd"] == "data"
+    ] == [9, 10]
+
+
+def test_duplicate_context_empty_axis_preserves_an_existing_trailing_proof():
+    context = (
+        ["Sequence", "Material", "Material"],
+        [["Sequence"], ["Material"], ["Material"]],
+        4,
+        13,
+    )
+    trailing = (
+        ["Sequence", "Material", "Requirement"],
+        [["Sequence"], ["Material"], ["Requirement"]],
+        2,
+        13,
+    )
+
+    assert tabular_structure._preferred_empty_record_axis_structure(
+        context,
+        trailing,
+    ) is trailing
+
+
+def test_unique_context_empty_axis_keeps_its_existing_precedence():
+    context = (
+        ["Sequence", "Material", "Requirement"],
+        [["Sequence"], ["Material"], ["Requirement"]],
+        4,
+        13,
+    )
+    trailing = (
+        ["Sequence", "Material", "Requirement"],
+        [["Sequence"], ["Material"], ["Requirement"]],
+        2,
+        13,
+    )
+
+    assert tabular_structure._preferred_empty_record_axis_structure(
+        context,
+        trailing,
+    ) is context
+
+
+def test_one_dimensional_duplicate_header_paths_do_not_prove_an_empty_axis(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_horizontally_merged_leaf_empty_axis_bytes(
+            rectangular_leaf_merges=False,
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    assert not any(
+        table["enumeration_status"] == "supported_complete"
+        and table["source_total_count"] == 0
+        for table in projection["tables"]
+    )
+
+
+def test_context_form_with_only_one_merged_semantic_path_is_not_an_empty_axis(
+    table_parser,
+):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _context_form_before_horizontally_merged_leaf_empty_axis_bytes(
+            single_semantic_path=True
+        ),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    assert not any(
+        table["enumeration_status"] == "supported_complete"
+        and table["source_total_count"] == 0
+        for table in projection["tables"]
+    )
 
 
 def test_context_preceded_empty_axis_discovery_has_linear_membership_checks(

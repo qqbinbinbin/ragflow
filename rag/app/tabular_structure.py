@@ -34,7 +34,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v19"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v20"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v1"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -54,6 +54,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v16", "enumeration-rules/v8"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v17", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v18", "enumeration-rules/v9"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v19", "enumeration-rules/v9"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -1931,6 +1932,12 @@ def _context_preceded_multilevel_empty_axis(
             headers.pop()
             header_paths.pop()
         width = len(headers)
+        distinct_header_path_count = len({tuple(path) for path in header_paths})
+        duplicate_paths_have_rectangular_merge = any(
+            merged.max_row > merged.min_row
+            and merged.max_col > merged.min_col
+            for merged in header_merges
+        )
         if (
             width < 2
             or len(header_paths) != width
@@ -1940,7 +1947,11 @@ def _context_preceded_multilevel_empty_axis(
                 or not path
                 for header, path in zip(headers, header_paths)
             )
-            or len({tuple(path) for path in header_paths}) != width
+            or distinct_header_path_count < 2
+            or (
+                distinct_header_path_count != width
+                and not duplicate_paths_have_rectangular_merge
+            )
             or not _inline_context_row_proven(
                 worksheet,
                 rows,
@@ -2224,7 +2235,14 @@ def _trailing_empty_record_axis_structure(
     return None
 
 
-def _nonempty_record_axis_structure(parser, worksheet, rows, populated_rows):
+def _nonempty_record_axis_structure(
+    parser,
+    worksheet,
+    rows,
+    populated_rows,
+    *,
+    require_record_key_axis: bool = False,
+):
     """Return parsed structure only when its body independently proves records."""
 
     headers, header_start, data_start = _parse_region_structure(parser, worksheet, rows)
@@ -2289,7 +2307,85 @@ def _nonempty_record_axis_structure(parser, worksheet, rows, populated_rows):
         record_axis_evidence=evidence,
     ):
         return None
+    if require_record_key_axis and not evidence["record_key_axis_proven"]:
+        return None
     return headers, header_start, data_start
+
+
+def _primary_record_axis_structures(
+    parser,
+    worksheet,
+    rows,
+    populated_rows,
+    *,
+    allow_context_preceded_empty_axis: bool,
+):
+    """Resolve overlapping nonempty and context-preceded empty-axis proofs."""
+
+    context_preceded_empty_structure = (
+        _context_preceded_multilevel_empty_axis(
+            parser,
+            worksheet,
+            rows,
+            populated_rows,
+            list(worksheet.merged_cells.ranges),
+        )
+        if allow_context_preceded_empty_axis
+        else None
+    )
+    nonempty_structure = _nonempty_record_axis_structure(
+        parser,
+        worksheet,
+        rows,
+        populated_rows,
+    )
+    if context_preceded_empty_structure is not None and nonempty_structure is not None:
+        _empty_headers, empty_header_paths, empty_header_start, empty_data_start = (
+            context_preceded_empty_structure
+        )
+        _record_headers, _record_header_start, record_data_start = nonempty_structure
+        duplicate_header_paths = len(
+            {tuple(path) for path in empty_header_paths}
+        ) != len(empty_header_paths)
+        rectangular_header_merge_extends_into_record_axis = any(
+            merged.min_row >= empty_header_start + 1
+            and merged.max_row <= empty_data_start
+            and merged.max_row > merged.min_row
+            and merged.max_col > merged.min_col
+            and merged.max_row > record_data_start
+            for merged in worksheet.merged_cells.ranges
+        )
+        record_key_axis_proven = _nonempty_record_axis_structure(
+            parser,
+            worksheet,
+            rows,
+            populated_rows,
+            require_record_key_axis=True,
+        ) is not None
+        if record_key_axis_proven or (
+            duplicate_header_paths
+            and not rectangular_header_merge_extends_into_record_axis
+        ):
+            context_preceded_empty_structure = None
+        else:
+            nonempty_structure = None
+    return nonempty_structure, context_preceded_empty_structure
+
+
+def _preferred_empty_record_axis_structure(
+    context_preceded_empty_structure,
+    trailing_empty_structure,
+):
+    if context_preceded_empty_structure is None:
+        return trailing_empty_structure
+    if trailing_empty_structure is None:
+        return context_preceded_empty_structure
+    _headers, header_paths, _header_start, _data_start = (
+        context_preceded_empty_structure
+    )
+    if len({tuple(path) for path in header_paths}) != len(header_paths):
+        return trailing_empty_structure
+    return context_preceded_empty_structure
 
 
 def _record_field_offsets(
@@ -2839,27 +2935,17 @@ def _project_structure_region(
     header_rows, populated_row_ordinals, unresolved_row_ordinals = _complete_worksheet_rows(worksheet)
     if not header_rows or not populated_row_ordinals:
         return None
-    context_preceded_empty_structure = (
-        _context_preceded_multilevel_empty_axis(
+    nonempty_structure, context_preceded_empty_structure = (
+        _primary_record_axis_structures(
             parser,
             worksheet,
             header_rows,
             populated_row_ordinals,
-            list(worksheet.merged_cells.ranges),
-        )
-        if not force_unknown_total
-        and not unresolved_row_ordinals
-        and len(populated_row_ordinals) >= 2
-        else None
-    )
-    nonempty_structure = (
-        None
-        if context_preceded_empty_structure is not None
-        else _nonempty_record_axis_structure(
-            parser,
-            worksheet,
-            header_rows,
-            populated_row_ordinals,
+            allow_context_preceded_empty_axis=(
+                not force_unknown_total
+                and not unresolved_row_ordinals
+                and len(populated_row_ordinals) >= 2
+            ),
         )
     )
     trailing_empty_candidate = (
@@ -2888,7 +2974,11 @@ def _project_structure_region(
     )
     if trailing_empty_structure is not None:
         nonempty_structure = None
-    empty_structure = context_preceded_empty_structure or trailing_empty_structure or (
+    preferred_empty_structure = _preferred_empty_record_axis_structure(
+        context_preceded_empty_structure,
+        trailing_empty_structure,
+    )
+    empty_structure = preferred_empty_structure or (
         None
         if force_unknown_total or nonempty_structure is not None
         else _empty_record_axis_structure(
@@ -3490,25 +3580,15 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
     header_rows, populated_rows, _unresolved_rows = _complete_worksheet_rows(region_worksheet)
     if not header_rows or not populated_rows:
         return None
-    context_preceded_empty_structure = (
-        _context_preceded_multilevel_empty_axis(
+    nonempty_structure, context_preceded_empty_structure = (
+        _primary_record_axis_structures(
             parser,
             region_worksheet,
             header_rows,
             populated_rows,
-            list(region_worksheet.merged_cells.ranges),
-        )
-        if not _unresolved_rows and len(populated_rows) >= 2
-        else None
-    )
-    nonempty_structure = (
-        None
-        if context_preceded_empty_structure is not None
-        else _nonempty_record_axis_structure(
-            parser,
-            region_worksheet,
-            header_rows,
-            populated_rows,
+            allow_context_preceded_empty_axis=(
+                not _unresolved_rows and len(populated_rows) >= 2
+            ),
         )
     )
     trailing_empty_candidate = _trailing_empty_record_axis_structure(
@@ -3532,7 +3612,11 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
     )
     if trailing_empty_structure is not None:
         nonempty_structure = None
-    empty_structure = context_preceded_empty_structure or trailing_empty_structure or (
+    preferred_empty_structure = _preferred_empty_record_axis_structure(
+        context_preceded_empty_structure,
+        trailing_empty_structure,
+    )
+    empty_structure = preferred_empty_structure or (
         None
         if nonempty_structure is not None
         else _empty_record_axis_structure(
