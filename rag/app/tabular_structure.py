@@ -34,7 +34,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v20"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v21"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v1"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -55,6 +55,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v17", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v18", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v19", "enumeration-rules/v9"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v20", "enumeration-rules/v9"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -2435,6 +2436,48 @@ def _record_rows_are_semantically_adjacent(
     )
 
 
+def _record_axis_body_rows(
+    parser,
+    worksheet,
+    headers: list[str],
+    data_start: int,
+    body_ordinals,
+    merged_ranges,
+) -> list[tuple[int, list[object], bool]]:
+    """Build the shared source-backed body-row view for record-axis decisions."""
+
+    body_rows = []
+    previous_body_ordinal = data_start
+    for row_ordinal in sorted(body_ordinals):
+        follows_body_gap = (
+            row_ordinal > previous_body_ordinal + 1
+            and not _record_rows_are_semantically_adjacent(
+                previous_body_ordinal,
+                row_ordinal,
+                len(headers),
+                merged_ranges,
+            )
+        )
+        body_rows.append(
+            (
+                row_ordinal,
+                [
+                    _cell_value(
+                        parser,
+                        worksheet,
+                        row_ordinal,
+                        column_ordinal,
+                        merged_ranges,
+                    )
+                    for column_ordinal in range(1, len(headers) + 1)
+                ],
+                follows_body_gap,
+            )
+        )
+        previous_body_ordinal = row_ordinal
+    return body_rows
+
+
 def _record_axis_evidence(
     headers: list[str],
     body_rows: list[tuple[int, list[object], bool]],
@@ -3077,26 +3120,14 @@ def _project_structure_region(
         value_bytes=table_context_value_bytes,
     )
     merged_ranges = list(worksheet.merged_cells.ranges)
-    body_rows = []
-    body_gap_seen = False
-    previous_body_ordinal = data_start
-    for row_ordinal in sorted(body_ordinals):
-        values = [
-            _cell_value(parser, worksheet, row_ordinal, column_ordinal, merged_ranges)
-            for column_ordinal in range(1, len(headers) + 1)
-        ]
-        if (
-            row_ordinal > previous_body_ordinal + 1
-            and not _record_rows_are_semantically_adjacent(
-                previous_body_ordinal,
-                row_ordinal,
-                len(headers),
-                merged_ranges,
-            )
-        ):
-            body_gap_seen = True
-        body_rows.append((row_ordinal, values, body_gap_seen))
-        previous_body_ordinal = row_ordinal
+    body_rows = _record_axis_body_rows(
+        parser,
+        worksheet,
+        headers,
+        data_start,
+        body_ordinals,
+        merged_ranges,
+    )
 
     record_axis_evidence = _record_axis_evidence(headers, body_rows, merged_ranges)
     if (
@@ -3427,16 +3458,258 @@ def _unknown_region_can_extend_proven_axis(
     )
 
 
-def _independent_region_is_physically_separated(
-    proven: dict[str, Any],
-    candidate: dict[str, Any],
-) -> bool:
-    proven_rows = sorted({row for row, _column in proven["members"]})
-    candidate_rows = sorted({row for row, _column in candidate["members"]})
-    return bool(proven_rows and candidate_rows) and (
-        candidate_rows[0] - proven_rows[-1]
-        > max(len(proven_rows), len(candidate_rows), 2)
+def _record_axis_details(item: dict[str, Any]) -> tuple[dict[str, Any], int, int] | None:
+    evidence = item.get("structure_evidence")
+    if not evidence:
+        return None
+    axis = evidence.get("record_axis_evidence")
+    source_column = evidence.get("record_axis_source_column")
+    width = evidence.get("record_axis_width")
+    if (
+        not isinstance(axis, dict)
+        or not isinstance(source_column, int)
+        or not isinstance(width, int)
+        or width < 1
+        or not axis.get("record_row_ordinals")
+        or not axis.get("required_offsets")
+    ):
+        return None
+    return axis, source_column, width
+
+
+def _candidate_record_axis_source_column(item: dict[str, Any]) -> int | None:
+    """Return a candidate's source-column origin without requiring a table parse."""
+
+    evidence = item.get("structure_evidence")
+    source_column = (
+        evidence.get("record_axis_source_column")
+        if isinstance(evidence, dict)
+        else None
     )
+    if isinstance(source_column, int):
+        return source_column
+    bbox = item.get("bbox")
+    if (
+        isinstance(bbox, tuple)
+        and len(bbox) == 4
+        and isinstance(bbox[1], int)
+    ):
+        return bbox[1]
+    return None
+
+
+def _source_row_offsets(
+    item: dict[str, Any],
+    row_ordinal: int,
+    *,
+    source_column: int,
+) -> set[int]:
+    """Rebase an item's source columns onto one earlier record-axis origin."""
+
+    return {
+        column_ordinal - source_column
+        for column_ordinal in _member_rows(item["members"]).get(row_ordinal, set())
+    }
+
+
+def _source_row_merge_signature(
+    worksheet,
+    row_ordinal: int,
+    *,
+    source_column: int,
+    width: int,
+) -> tuple[tuple[int, int], ...]:
+    axis_end = source_column + width - 1
+    return tuple(
+        sorted(
+            (
+                max(source_column, merged.min_col) - source_column,
+                min(axis_end, merged.max_col) - source_column,
+            )
+            for merged in worksheet.merged_cells.ranges
+            if merged.min_row <= row_ordinal <= merged.max_row
+            and merged.max_col >= source_column
+            and merged.min_col <= axis_end
+        )
+    )
+
+
+def _candidate_row_is_record_under(
+    *,
+    worksheet,
+    candidate: dict[str, Any],
+    row_ordinal: int,
+    record_axis_evidence: dict[str, Any],
+    candidate_source_column: int,
+    width: int,
+    proven_merge_signatures: set[tuple[tuple[int, int], ...]],
+) -> bool:
+    """Apply the established axis' row predicate in its source-column basis."""
+
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    axis_end = candidate_source_column + width - 1
+    row_offsets = _source_row_offsets(
+        candidate,
+        row_ordinal,
+        source_column=candidate_source_column,
+    )
+    full_width_merge = any(
+        merged.min_row <= row_ordinal <= merged.max_row
+        and merged.min_col <= candidate_source_column
+        and merged.max_col >= axis_end
+        for merged in merged_ranges
+    )
+    if full_width_merge:
+        return False
+    partial_merge = any(
+        merged.min_row <= row_ordinal <= merged.max_row
+        and merged.max_col >= candidate_source_column
+        and merged.min_col <= axis_end
+        and not (
+            merged.min_col <= candidate_source_column and merged.max_col >= axis_end
+        )
+        for merged in merged_ranges
+    )
+    merge_signature = _source_row_merge_signature(
+        worksheet,
+        row_ordinal,
+        source_column=candidate_source_column,
+        width=width,
+    )
+    if partial_merge and not merge_signature:
+        return False
+    if merge_signature not in proven_merge_signatures:
+        return False
+    required_offsets = set(record_axis_evidence["required_offsets"])
+    return bool(required_offsets) and required_offsets.issubset(row_offsets) and (
+        width == 1
+        or len(row_offsets) >= 2
+        or record_axis_evidence.get("record_key_axis_proven") is True
+        or record_axis_evidence.get("single_record_axis_proven") is True
+    )
+
+
+def _anchor_shape(value: object) -> tuple[str, ...]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ()
+    return _text_structure(value)
+
+
+def _axis_anchor_is_not_extendable(
+    *,
+    parser,
+    worksheet,
+    earlier: dict[str, Any],
+    later: dict[str, Any],
+    record_axis_evidence: dict[str, Any],
+    source_column: int,
+    candidate_source_column: int,
+) -> bool:
+    """Prove a stable non-numeric anchor cannot be continued by later rows."""
+
+    required_offsets = record_axis_evidence.get("required_offsets", ())
+    if not required_offsets:
+        return False
+    anchor_column = source_column + min(required_offsets)
+    candidate_anchor_column = candidate_source_column + min(required_offsets)
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    later_rows = later.get("rows", ())
+    if not later_rows:
+        return False
+    if record_axis_evidence.get("record_key_axis_proven") is True:
+        # The earlier axis evidence already proves the numeric key contract.
+        # Footer/signature rows are context, so their key-column values must
+        # not be required for proving that the established axis is closed.
+        return True
+    main_anchor_shapes = {
+        _anchor_shape(
+            _cell_value(parser, worksheet, row["row_ordinal_int"], anchor_column, merged_ranges)
+        )
+        for row in earlier["rows"]
+        if row["row_role_kwd"] == "data"
+    }
+    if (
+        not main_anchor_shapes
+        or () in main_anchor_shapes
+        or not any(
+            kind in {"digit", "symbol"}
+            for shape in main_anchor_shapes
+            for kind in shape
+        )
+    ):
+        return False
+    return all(
+        _anchor_shape(
+            _cell_value(
+                parser,
+                worksheet,
+                row["row_ordinal_int"],
+                candidate_anchor_column,
+                merged_ranges,
+            )
+        )
+        not in main_anchor_shapes
+        for row in later_rows
+    )
+
+
+def _axis_closure_proven(
+    *,
+    parser,
+    worksheet,
+    earlier: dict[str, Any],
+    later: dict[str, Any],
+) -> bool:
+    """Prove a later unknown region cannot be an unaccounted record continuation.
+
+    The proof is deliberately independent of row distance and footer wording.
+    An established record axis plus non-record candidate rows are both required;
+    missing page-footer values are not business records and do not invalidate
+    the proof by themselves.
+    """
+
+    details = _record_axis_details(earlier)
+    later_rows = later.get("rows", ())
+    if details is None or not later_rows:
+        return False
+    record_axis_evidence, source_column, width = details
+    candidate_source_column = _candidate_record_axis_source_column(later)
+    if not isinstance(candidate_source_column, int):
+        return False
+    proven_merge_signatures = {
+        _source_row_merge_signature(
+            worksheet,
+            row["row_ordinal_int"],
+            source_column=source_column,
+            width=width,
+        )
+        for row in earlier["rows"]
+        if row["row_role_kwd"] == "data"
+    }
+    if not proven_merge_signatures:
+        return False
+    axis_not_extendable = _axis_anchor_is_not_extendable(
+        parser=parser,
+        worksheet=worksheet,
+        earlier=earlier,
+        later=later,
+        record_axis_evidence=record_axis_evidence,
+        source_column=source_column,
+        candidate_source_column=candidate_source_column,
+    )
+    candidate_rows_are_not_records = all(
+        not _candidate_row_is_record_under(
+            worksheet=worksheet,
+            candidate=later,
+            row_ordinal=row["row_ordinal_int"],
+            record_axis_evidence=record_axis_evidence,
+            candidate_source_column=candidate_source_column,
+            width=width,
+            proven_merge_signatures=proven_merge_signatures,
+        )
+        for row in later_rows
+    )
+    return axis_not_extendable and candidate_rows_are_not_records
 
 
 def _empty_axis_header_row(item: dict[str, Any]) -> int | None:
@@ -3651,6 +3924,19 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
         return None
 
     merged_ranges = list(region_worksheet.merged_cells.ranges)
+    record_axis_body_rows = _record_axis_body_rows(
+        parser,
+        region_worksheet,
+        headers,
+        data_start,
+        body_rows,
+        merged_ranges,
+    )
+    record_axis_evidence = _record_axis_evidence(
+        headers,
+        record_axis_body_rows,
+        merged_ranges,
+    )
     optional_parent_prefix_lengths = {}
     for column_offset, header_path in enumerate(header_paths):
         column_ordinal = column_offset + 1
@@ -3707,6 +3993,10 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
         "body_row_ordinals": [row + row_offset for row in body_rows],
         "header_depth": data_start - header_start,
         "optional_parent_prefix_lengths_by_column": optional_parent_prefix_lengths,
+        # Internal-only closure evidence; it is not part of the projection schema.
+        "record_axis_evidence": record_axis_evidence,
+        "record_axis_source_column": min_column,
+        "record_axis_width": len(headers),
     }
 
 
@@ -6060,16 +6350,17 @@ def _build_tabular_structure_projection_with_audit(
                     and not unknown_is_context_for_following_structure
                     and (
                         risk_ids is partial_overlap_ids
-                        or later.get("structure_evidence") is None
                         or _unknown_region_can_extend_proven_axis(
                             parser=parser,
                             worksheet=worksheet,
                             proven=earlier,
                             unknown=later,
                         )
-                        or not _independent_region_is_physically_separated(
-                            earlier,
-                            later,
+                        or not _axis_closure_proven(
+                            parser=parser,
+                            worksheet=worksheet,
+                            earlier=earlier,
+                            later=later,
                         )
                     )
                 ):

@@ -39,8 +39,268 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v20"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v21"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
+
+
+class _AxisClosureCell:
+    def __init__(self, value):
+        self.value = value
+
+
+class _AxisClosureWorksheet:
+    class _MergedCells:
+        ranges = ()
+
+    def __init__(self, values):
+        self._values = values
+        self.merged_cells = self._MergedCells()
+
+    def cell(self, row, column):
+        return _AxisClosureCell(self._values.get((row, column)))
+
+
+class _AxisClosureParser:
+    @staticmethod
+    def _get_merged_cell_value(_worksheet, _row, _column, _merged_ranges):
+        return None
+
+
+def _axis_closure_item(
+    *,
+    required_offsets=(0, 1, 2),
+    key_axis=True,
+    source_column=1,
+    width=3,
+    row_values=(),
+    row_role="data",
+    data_row_count=None,
+    structure_evidence=True,
+):
+    rows = []
+    members = set()
+    for row_ordinal, values in row_values:
+        rows.append(
+            {
+                "row_ordinal_int": row_ordinal,
+                "row_role_kwd": row_role,
+            }
+        )
+        members.update(
+            (row_ordinal, source_column + offset)
+            for offset, value in enumerate(values)
+            if value is not None and str(value).strip()
+        )
+    axis = {
+        "record_row_ordinals": tuple(row for row, _values in row_values),
+        "required_offsets": tuple(required_offsets),
+        "record_key_axis_proven": key_axis,
+        "single_record_axis_proven": False,
+    }
+    evidence = (
+        {
+            "record_axis_evidence": axis,
+            "record_axis_source_column": source_column,
+            "record_axis_width": width,
+            "body_row_ordinals": [row for row, _values in row_values],
+        }
+        if structure_evidence
+        else None
+    )
+    return {
+        "bbox": (
+            min((row for row, _values in row_values), default=1),
+            source_column,
+            max((row for row, _values in row_values), default=1),
+            source_column + width - 1,
+        ),
+        "members": members,
+        "member_columns": {column for _row, column in members},
+        "rows": rows,
+        "source_values": tuple(row_values),
+        "source_column": source_column,
+        "structure_evidence": evidence,
+        "table": {
+            "data_row_count": (
+                len(row_values) if data_row_count is None else data_row_count
+            )
+        },
+    }
+
+
+def _axis_closure_worksheet(*items):
+    values = {}
+    for item in items:
+        for row, row_values in item["source_values"]:
+            evidence = item.get("structure_evidence") or {}
+            source_column = evidence.get(
+                "record_axis_source_column",
+                item["source_column"],
+            )
+            for offset, value in enumerate(row_values):
+                values[(row, source_column + offset)] = value
+    return _AxisClosureWorksheet(values)
+
+
+def test_axis_closure_accepts_a_value_free_footer_without_geometric_distance():
+    earlier = _axis_closure_item(
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        row_values=((5, (None, None, None)), (6, (None, None, None))),
+        row_role="unknown",
+        data_row_count=0,
+    )
+
+    assert tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_does_not_depend_on_footer_values_in_the_key_column():
+    earlier = _axis_closure_item(
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        row_values=((5, (99, "approval", None)), (6, (None, "sign", None))),
+        row_role="unknown",
+        data_row_count=0,
+    )
+
+    assert tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_rejects_a_candidate_with_the_earlier_record_arity():
+    earlier = _axis_closure_item(
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        row_values=((5, (3, "C", 12)),),
+        row_role="unknown",
+        data_row_count=0,
+    )
+
+    assert not tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_rebases_candidate_columns_to_earlier_source_columns():
+    earlier = _axis_closure_item(
+        required_offsets=(0, 1, 2),
+        source_column=3,
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        source_column=4,
+        row_values=((5, (None, "footer", None)),),
+        row_role="unknown",
+        data_row_count=0,
+    )
+
+    assert tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_rejects_a_shifted_candidate_with_the_same_record_shape():
+    earlier = _axis_closure_item(
+        source_column=3,
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        source_column=4,
+        row_values=((5, (3, "C", 12)),),
+        row_role="unknown",
+        data_row_count=0,
+    )
+
+    assert not tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_accepts_a_nonrecord_footer_without_structure_evidence():
+    earlier = _axis_closure_item(
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        row_values=((5, (None, None, None)),),
+        row_role="unknown",
+        data_row_count=0,
+        structure_evidence=False,
+    )
+
+    assert tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_rejects_a_complete_record_without_structure_evidence():
+    earlier = _axis_closure_item(
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        row_values=((5, (3, "C", 12)),),
+        row_role="unknown",
+        data_row_count=0,
+        structure_evidence=False,
+    )
+
+    assert not tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_accepts_a_partial_context_without_structure_evidence():
+    earlier = _axis_closure_item(
+        row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
+    )
+    later = _axis_closure_item(
+        row_values=((5, (3, None, None)),),
+        row_role="unknown",
+        data_row_count=0,
+        structure_evidence=False,
+    )
+
+    assert tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_v20_projection_contract_remains_available_for_backfill():
+    assert (
+        "table-producer/v6",
+        "tabular-structure-projection/v6",
+        "region-producer/v20",
+        "enumeration-rules/v9",
+    ) in tabular_structure._KNOWN_BACKFILL_PROJECTION_CONTRACTS
 
 
 def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table_parser):
@@ -3151,14 +3411,14 @@ def _formula_only_workbook_bytes():
     return _save_workbook(workbook)
 
 
-def _complete_table_with_distant_multiline_signoff_bytes():
+def _complete_table_with_distant_multiline_signoff_bytes(record_count=3):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Anonymous report"
     sheet.merge_cells("A1:D1")
     sheet["A1"] = "Anonymous register"
     sheet.append(["Sequence", "Item", "Measure", "Status"])
-    for row_ordinal in range(3, 6):
+    for row_ordinal in range(3, 3 + record_count):
         sheet.append(
             [
                 row_ordinal - 2,
@@ -3170,9 +3430,15 @@ def _complete_table_with_distant_multiline_signoff_bytes():
 
     # A physically separated approval form reuses table columns but is not a
     # continuation of the already closed record axis.
-    sheet.merge_cells("A35:D35")
-    sheet["A35"] = "Anonymous approval"
-    for row_ordinal in range(36, 39):
+    signoff_start = 3 + record_count + 2
+    sheet.merge_cells(
+        start_row=signoff_start,
+        start_column=1,
+        end_row=signoff_start,
+        end_column=4,
+    )
+    sheet.cell(signoff_start, 1, "Anonymous approval")
+    for row_ordinal in range(signoff_start + 1, signoff_start + 4):
         sheet.merge_cells(
             start_row=row_ordinal,
             start_column=1,
@@ -4017,7 +4283,7 @@ def test_projected_table_with_unknown_row_does_not_downgrade_complete_sibling(ta
     assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
 
 
-def test_axis_aligned_single_unknown_downgrades_complete_sibling(table_parser):
+def test_axis_aligned_partial_context_does_not_downgrade_complete_sibling(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
         _complete_table_with_axis_aligned_unknown_bytes(),
@@ -4025,7 +4291,7 @@ def test_axis_aligned_single_unknown_downgrades_complete_sibling(table_parser):
     )
 
     assert len(projection["tables"]) == 2
-    assert all(table["source_total_count"] is None for table in projection["tables"])
+    assert [table["source_total_count"] for table in projection["tables"]] == [2, None]
 
 
 def test_context_only_unknown_overlap_does_not_downgrade_complete_sibling(table_parser):
@@ -4493,8 +4759,25 @@ def test_distant_multiline_signoff_does_not_downgrade_a_closed_record_axis(
     assert all(
         row["row_role_kwd"] == "unknown"
         for row in projection["rows"]
-        if row["row_ordinal_int"] >= 35
+        if row["row_ordinal_int"] >= 8
     )
+
+
+@pytest.mark.parametrize("record_count", (3, 8))
+def test_short_signoff_gap_does_not_depend_on_record_count(table_parser, record_count):
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _complete_table_with_distant_multiline_signoff_bytes(record_count),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == record_count
 
 
 def test_context_and_g1_splits_preserve_a_sparse_single_record_axis(table_parser):
