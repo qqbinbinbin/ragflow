@@ -513,6 +513,75 @@ def test_structurally_closed_header_only_table_proves_an_empty_record_axis(table
     }
 
 
+def test_title_backed_multilevel_header_after_metadata_proves_empty_record_axis(
+    table_parser,
+):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Header-only report"
+    sheet.merge_cells("A1:K1")
+    sheet["A1"] = "Header-only report"
+    sheet.merge_cells("A3:D3")
+    sheet["A3"] = "Submission reason"
+    sheet.merge_cells("E3:H3")
+    sheet["E3"] = "Supplier"
+    sheet.merge_cells("I3:K3")
+    sheet["I3"] = "Inspection organization"
+    sheet.merge_cells("A4:D4")
+    sheet["A4"] = "PPAP submission"
+    sheet.merge_cells("E4:H4")
+    sheet["E4"] = "Acme"
+    sheet.merge_cells("I4:K4")
+    sheet["I4"] = "Lab"
+    sheet.merge_cells("A5:D5")
+    sheet["A5"] = "Part number"
+    sheet.merge_cells("E5:F5")
+    sheet["E5"] = "Part name"
+    sheet.merge_cells("G5:K5")
+    sheet["G5"] = "Revision"
+    sheet.merge_cells("A7:A8")
+    sheet["A7"] = "Sequence"
+    sheet.merge_cells("B7:C8")
+    sheet["B7"] = "Material"
+    sheet.merge_cells("D7:D8")
+    sheet["D7"] = "Criteria"
+    sheet.merge_cells("E7:F8")
+    sheet["E7"] = "Standard"
+    sheet.merge_cells("G7:I7")
+    sheet["G7"] = "Actual"
+    sheet.merge_cells("J7:K7")
+    sheet["J7"] = "Result"
+    for column, value in enumerate((1, 2, 3, "OK", "NG"), start=7):
+        sheet.cell(row=8, column=column, value=value)
+    sheet.merge_cells("A31:K31")
+    sheet["A31"] = "Notes"
+    sheet.merge_cells("A36:D36")
+    sheet["A36"] = "Prepared by"
+    sheet.merge_cells("E36:H36")
+    sheet["E36"] = "Reviewed by"
+    sheet.merge_cells("I36:K36")
+    sheet["I36"] = "Approved by"
+
+    projection = build_tabular_structure_projection(
+        "header-only-report.xlsx",
+        _save_workbook(workbook),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["matched_rule"] == "L1-08"
+    assert complete[0]["source_total_count"] == 0
+    assert len(complete[0]["ordered_columns"]) == 11
+    assert len(projection["tables"]) == 1
+    assert projection["rows"] == []
+
+
 def test_empty_record_axis_ignores_a_disjoint_sidecar_outside_the_table_columns(table_parser):
     workbook = Workbook()
     sheet = workbook.active

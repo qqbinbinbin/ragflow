@@ -1876,6 +1876,8 @@ def _context_preceded_multilevel_empty_axis(
     rows,
     populated_rows,
     merged_ranges,
+    *,
+    proof: dict[str, bool] | None = None,
 ):
     populated_set = set(populated_rows)
     last_populated = max(populated_set)
@@ -1939,6 +1941,23 @@ def _context_preceded_multilevel_empty_axis(
             and merged.max_col > merged.min_col
             for merged in header_merges
         )
+        title_backed_context = any(
+            merged.min_col == 1
+            and merged.max_col >= width
+            and merged.max_row < first_header_row
+            and worksheet.cell(merged.min_row, merged.min_col).value is not None
+            and str(worksheet.cell(merged.min_row, merged.min_col).value).strip()
+            for merged in merged_ranges
+        )
+        header_has_vertical_merge = any(
+            merged.max_row > merged.min_row
+            for merged in header_merges
+        )
+        separated_title_backed_context = (
+            title_backed_context
+            and header_has_vertical_merge
+            and first_header_row - 1 not in populated_set
+        )
         if (
             width < 2
             or len(header_paths) != width
@@ -1953,21 +1972,37 @@ def _context_preceded_multilevel_empty_axis(
                 distinct_header_path_count != width
                 and not duplicate_paths_have_rectangular_merge
             )
-            or not _inline_context_row_proven(
-                worksheet,
-                rows,
-                row_ordinal=first_header_row - 1,
-                width=width,
-                merged_ranges=merged_ranges,
+            or not (
+                separated_title_backed_context
+                or _inline_context_row_proven(
+                    worksheet,
+                    rows,
+                    row_ordinal=first_header_row - 1,
+                    width=width,
+                    merged_ranges=merged_ranges,
+                )
             )
         ):
             continue
         candidates.append(
-            (headers, header_paths, header_start, last_populated)
+            (
+                headers,
+                header_paths,
+                header_start,
+                last_populated,
+                separated_title_backed_context,
+            )
         )
     if len(candidates) != 1:
-        return None
-    return candidates[0]
+        inline_candidates = [candidate for candidate in candidates if not candidate[4]]
+        if inline_candidates:
+            candidates = inline_candidates
+        if len(candidates) != 1:
+            return None
+    headers, header_paths, header_start, data_start, title_backed = candidates[0]
+    if proof is not None:
+        proof["title_backed_multilevel"] = title_backed
+    return headers, header_paths, header_start, data_start
 
 
 def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unresolved_rows):
@@ -2320,6 +2355,7 @@ def _primary_record_axis_structures(
     populated_rows,
     *,
     allow_context_preceded_empty_axis: bool,
+    context_preceded_empty_axis_proof: dict[str, bool] | None = None,
 ):
     """Resolve overlapping nonempty and context-preceded empty-axis proofs."""
 
@@ -2330,6 +2366,7 @@ def _primary_record_axis_structures(
             rows,
             populated_rows,
             list(worksheet.merged_cells.ranges),
+            proof=context_preceded_empty_axis_proof,
         )
         if allow_context_preceded_empty_axis
         else None
@@ -3812,11 +3849,13 @@ def _is_safe_empty_axis_context_component(
     table header. This keeps uncertain standalone tables fail-closed.
     """
 
+    candidate_is_before_axis = candidate["bbox"][2] < empty_axis_header_row
+    candidate_is_after_axis = candidate["bbox"][0] > empty_axis_header_row
     if (
         candidate.get("positive_rule") is not None
         or candidate["table"].get("source_total_count") is not None
         or not candidate["members"]
-        or max(row for row, _column in candidate["members"]) >= empty_axis_header_row
+        or not (candidate_is_before_axis or candidate_is_after_axis)
         or any(
             source_regions[source_region_key].get("unresolved_members")
             for source_region_key in candidate["source_components"]
@@ -3826,7 +3865,28 @@ def _is_safe_empty_axis_context_component(
 
     evidence = candidate.get("structure_evidence")
     if evidence is None:
-        return len({row for row, _column in candidate["members"]}) <= 1
+        has_after_context_anchor = any(
+            other is not empty_axis
+            and other["bbox"][0] > empty_axis_header_row
+            and other.get("structure_evidence") is not None
+            for other in projected
+        )
+        title_backed_empty_axis = (
+            empty_axis.get("structure_evidence", {}).get(
+                "record_axis_context_kind"
+            )
+            == "title_backed_multilevel"
+        )
+        return (
+            candidate_is_before_axis
+            or (
+                candidate_is_after_axis
+                and (
+                    has_after_context_anchor
+                    or title_backed_empty_axis
+                )
+            )
+        ) and len({row for row, _column in candidate["members"]}) <= 1
 
     body_rows = set(evidence.get("body_row_ordinals", ()))
     headers = evidence.get("headers_by_column", {})
@@ -3922,6 +3982,7 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
     header_rows, populated_rows, _unresolved_rows = _complete_worksheet_rows(region_worksheet)
     if not header_rows or not populated_rows:
         return None
+    context_preceded_empty_axis_proof = {}
     nonempty_structure, context_preceded_empty_structure = (
         _primary_record_axis_structures(
             parser,
@@ -3931,6 +3992,7 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
             allow_context_preceded_empty_axis=(
                 not _unresolved_rows and len(populated_rows) >= 2
             ),
+            context_preceded_empty_axis_proof=context_preceded_empty_axis_proof,
         )
     )
     trailing_empty_candidate = _trailing_empty_record_axis_structure(
@@ -4006,6 +4068,13 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
         record_axis_body_rows,
         merged_ranges,
     )
+    record_axis_context_kind = (
+        "title_backed_multilevel"
+        if context_preceded_empty_structure is not None
+        and empty_structure == context_preceded_empty_structure
+        and context_preceded_empty_axis_proof.get("title_backed_multilevel")
+        else None
+    )
     optional_parent_prefix_lengths = {}
     for column_offset, header_path in enumerate(header_paths):
         column_ordinal = column_offset + 1
@@ -4064,6 +4133,7 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
         "optional_parent_prefix_lengths_by_column": optional_parent_prefix_lengths,
         # Internal-only closure evidence; it is not part of the projection schema.
         "record_axis_evidence": record_axis_evidence,
+        "record_axis_context_kind": record_axis_context_kind,
         "record_axis_source_column": min_column,
         "record_axis_width": len(headers),
     }
