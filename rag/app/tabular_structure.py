@@ -3534,6 +3534,26 @@ def _source_row_merge_signature(
     )
 
 
+def _candidate_record_axis_is_empty(
+    parser,
+    worksheet,
+    row_ordinal: int,
+    *,
+    source_column: int,
+    width: int,
+    merged_ranges,
+) -> bool:
+    """Prove a candidate row has no source-backed value on the record axis."""
+
+    return all(
+        (
+            (value := _cell_value(parser, worksheet, row_ordinal, column, merged_ranges))
+        ) is None
+        or not str(value).strip()
+        for column in range(source_column, source_column + width)
+    )
+
+
 def _candidate_row_is_record_under(
     *,
     worksheet,
@@ -3548,7 +3568,7 @@ def _candidate_row_is_record_under(
     """Apply the established axis' row predicate in its source-column basis."""
 
     merged_ranges = list(worksheet.merged_cells.ranges)
-    axis_end = candidate_source_column + width - 1
+    axis_end = source_column + width - 1
     row_offsets = _source_row_offsets(
         candidate,
         row_ordinal,
@@ -3558,7 +3578,7 @@ def _candidate_row_is_record_under(
     )
     full_width_merge = any(
         merged.min_row <= row_ordinal <= merged.max_row
-        and merged.min_col <= candidate_source_column
+        and merged.min_col <= source_column
         and merged.max_col >= axis_end
         for merged in merged_ranges
     )
@@ -3566,17 +3586,17 @@ def _candidate_row_is_record_under(
         return False
     partial_merge = any(
         merged.min_row <= row_ordinal <= merged.max_row
-        and merged.max_col >= candidate_source_column
+        and merged.max_col >= source_column
         and merged.min_col <= axis_end
         and not (
-            merged.min_col <= candidate_source_column and merged.max_col >= axis_end
+            merged.min_col <= source_column and merged.max_col >= axis_end
         )
         for merged in merged_ranges
     )
     merge_signature = _source_row_merge_signature(
         worksheet,
         row_ordinal,
-        source_column=candidate_source_column,
+        source_column=source_column,
         width=width,
     )
     if partial_merge and not merge_signature:
@@ -3584,12 +3604,23 @@ def _candidate_row_is_record_under(
     if merge_signature not in proven_merge_signatures:
         return False
     required_offsets = set(record_axis_evidence["required_offsets"])
-    return bool(required_offsets) and required_offsets.issubset(row_offsets) and (
-        width == 1
-        or len(row_offsets) >= 2
+    if not required_offsets:
+        return False
+    record_shape = (
+        len(row_offsets) >= 2
         or record_axis_evidence.get("record_key_axis_proven") is True
         or record_axis_evidence.get("single_record_axis_proven") is True
     )
+    if not record_shape:
+        return False
+    if required_offsets.issubset(row_offsets):
+        return True
+    # A missing key is still a continuation risk when the remaining required
+    # fields and the established merge signature match a proven record row.
+    if record_axis_evidence.get("record_key_axis_proven") is True:
+        key_offset = min(required_offsets)
+        return (required_offsets - {key_offset}).issubset(row_offsets)
+    return False
 
 
 def _anchor_shape(value: object) -> tuple[str, ...]:
@@ -3606,6 +3637,8 @@ def _axis_anchor_is_not_extendable(
     later: dict[str, Any],
     record_axis_evidence: dict[str, Any],
     source_column: int,
+    candidate_source_column: int,
+    width: int,
 ) -> bool:
     """Prove a stable non-numeric anchor cannot be continued by later rows."""
 
@@ -3613,17 +3646,47 @@ def _axis_anchor_is_not_extendable(
     if not required_offsets:
         return False
     anchor_column = source_column + min(required_offsets)
-    # Anchor continuation is also evaluated in the established axis' physical
-    # column basis; candidate-local column zero is not the record key.
-    candidate_anchor_column = source_column + min(required_offsets)
+    candidate_anchor_column = candidate_source_column + min(required_offsets)
     merged_ranges = list(worksheet.merged_cells.ranges)
     later_rows = later.get("rows", ())
     if not later_rows:
         return False
     if record_axis_evidence.get("record_key_axis_proven") is True:
-        # The earlier axis evidence already proves the numeric key contract.
-        # Footer/signature rows are context, so their key-column values must
-        # not be required for proving that the established axis is closed.
+        if all(
+            _candidate_record_axis_is_empty(
+                parser,
+                worksheet,
+                row["row_ordinal_int"],
+                source_column=candidate_source_column,
+                width=width,
+                merged_ranges=merged_ranges,
+            )
+            for row in later_rows
+        ):
+            return True
+        key_offset = min(required_offsets)
+        for row in later_rows:
+            candidate_row_offsets = _source_row_offsets(
+                later,
+                row["row_ordinal_int"],
+                source_column=candidate_source_column,
+            )
+            if candidate_row_offsets != {key_offset}:
+                continue
+            candidate_key = _record_key_numeric_value(
+                _cell_value(
+                    parser,
+                    worksheet,
+                    row["row_ordinal_int"],
+                    candidate_anchor_column,
+                    merged_ranges,
+                )
+            )
+            if candidate_key is not None:
+                # A numeric key-only slot is ambiguous with a continuation;
+                # preserve the existing fail-closed behavior. Other footer
+                # values are handled by the record-shape predicate below.
+                return False
         return True
     main_anchor_shapes = {
         _anchor_shape(
@@ -3642,7 +3705,7 @@ def _axis_anchor_is_not_extendable(
         )
     ):
         return False
-    return all(
+    candidate_anchor_shapes = [
         _anchor_shape(
             _cell_value(
                 parser,
@@ -3652,9 +3715,9 @@ def _axis_anchor_is_not_extendable(
                 merged_ranges,
             )
         )
-        not in main_anchor_shapes
         for row in later_rows
-    )
+    ]
+    return all(shape and shape not in main_anchor_shapes for shape in candidate_anchor_shapes)
 
 
 def _axis_closure_proven(
@@ -3699,6 +3762,8 @@ def _axis_closure_proven(
         later=later,
         record_axis_evidence=record_axis_evidence,
         source_column=source_column,
+        candidate_source_column=candidate_source_column,
+        width=width,
     )
     candidate_rows_are_not_records = all(
         not _candidate_row_is_record_under(
@@ -6320,8 +6385,7 @@ def _build_tabular_structure_projection_with_audit(
                     or (
                         nested_axis_overlap
                         and (
-                            len(later["member_columns"]) == 1
-                            or len(later_rows) != 1
+                            len(later_rows) != 1
                             or (
                                 bool(later_rows)
                                 and _continuation_rows_match_proven_axis(
