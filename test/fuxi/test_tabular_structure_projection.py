@@ -217,7 +217,7 @@ def test_axis_closure_rebases_candidate_columns_to_earlier_source_columns():
     )
 
 
-def test_axis_closure_rejects_a_shifted_candidate_with_the_same_record_shape():
+def test_axis_closure_accepts_a_shifted_candidate_that_lacks_the_main_key_column():
     earlier = _axis_closure_item(
         source_column=3,
         row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
@@ -229,7 +229,29 @@ def test_axis_closure_rejects_a_shifted_candidate_with_the_same_record_shape():
         data_row_count=0,
     )
 
-    assert not tabular_structure._axis_closure_proven(
+    assert tabular_structure._axis_closure_proven(
+        parser=_AxisClosureParser(),
+        worksheet=_axis_closure_worksheet(earlier, later),
+        earlier=earlier,
+        later=later,
+    )
+
+
+def test_axis_closure_rebases_a_non_numeric_anchor_to_the_main_key_column():
+    earlier = _axis_closure_item(
+        key_axis=False,
+        source_column=3,
+        row_values=((2, ("A-1", "A", 10)), (3, ("A-2", "B", 11))),
+    )
+    later = _axis_closure_item(
+        key_axis=False,
+        source_column=4,
+        row_values=((5, ("A-3", "approval", 12)),),
+        row_role="unknown",
+        data_row_count=0,
+    )
+
+    assert tabular_structure._axis_closure_proven(
         parser=_AxisClosureParser(),
         worksheet=_axis_closure_worksheet(earlier, later),
         earlier=earlier,

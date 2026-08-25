@@ -3540,6 +3540,7 @@ def _candidate_row_is_record_under(
     candidate: dict[str, Any],
     row_ordinal: int,
     record_axis_evidence: dict[str, Any],
+    source_column: int,
     candidate_source_column: int,
     width: int,
     proven_merge_signatures: set[tuple[tuple[int, int], ...]],
@@ -3551,7 +3552,9 @@ def _candidate_row_is_record_under(
     row_offsets = _source_row_offsets(
         candidate,
         row_ordinal,
-        source_column=candidate_source_column,
+        # Compare candidate occupancy in the established axis' physical
+        # column basis; a shifted region must not be re-numbered as a record.
+        source_column=source_column,
     )
     full_width_merge = any(
         merged.min_row <= row_ordinal <= merged.max_row
@@ -3603,7 +3606,6 @@ def _axis_anchor_is_not_extendable(
     later: dict[str, Any],
     record_axis_evidence: dict[str, Any],
     source_column: int,
-    candidate_source_column: int,
 ) -> bool:
     """Prove a stable non-numeric anchor cannot be continued by later rows."""
 
@@ -3611,7 +3613,9 @@ def _axis_anchor_is_not_extendable(
     if not required_offsets:
         return False
     anchor_column = source_column + min(required_offsets)
-    candidate_anchor_column = candidate_source_column + min(required_offsets)
+    # Anchor continuation is also evaluated in the established axis' physical
+    # column basis; candidate-local column zero is not the record key.
+    candidate_anchor_column = source_column + min(required_offsets)
     merged_ranges = list(worksheet.merged_cells.ranges)
     later_rows = later.get("rows", ())
     if not later_rows:
@@ -3695,7 +3699,6 @@ def _axis_closure_proven(
         later=later,
         record_axis_evidence=record_axis_evidence,
         source_column=source_column,
-        candidate_source_column=candidate_source_column,
     )
     candidate_rows_are_not_records = all(
         not _candidate_row_is_record_under(
@@ -3703,6 +3706,7 @@ def _axis_closure_proven(
             candidate=later,
             row_ordinal=row["row_ordinal_int"],
             record_axis_evidence=record_axis_evidence,
+            source_column=source_column,
             candidate_source_column=candidate_source_column,
             width=width,
             proven_merge_signatures=proven_merge_signatures,
