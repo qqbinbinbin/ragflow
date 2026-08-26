@@ -34,7 +34,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v21"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v22"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v1"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -56,6 +56,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v18", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v19", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v20", "enumeration-rules/v9"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v21", "enumeration-rules/v9"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -3774,7 +3775,9 @@ def _axis_closure_proven(
 
     details = _record_axis_details(earlier)
     later_rows = later.get("rows", ())
-    if details is None or not later_rows:
+    # An unknown candidate without its own structural evidence cannot be
+    # proven to be non-continuation. Keep that uncertainty fail-closed.
+    if details is None or later.get("structure_evidence") is None or not later_rows:
         return False
     record_axis_evidence, source_column, width = details
     candidate_source_column = _candidate_record_axis_source_column(later)

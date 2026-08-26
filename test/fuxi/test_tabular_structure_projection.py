@@ -39,7 +39,7 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v21"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v22"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -375,7 +375,7 @@ def test_axis_closure_rejects_a_non_numeric_anchor_with_a_missing_candidate_valu
     )
 
 
-def test_axis_closure_accepts_a_nonrecord_footer_without_structure_evidence():
+def test_axis_closure_rejects_a_nonrecord_footer_without_structure_evidence():
     earlier = _axis_closure_item(
         row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
     )
@@ -386,7 +386,7 @@ def test_axis_closure_accepts_a_nonrecord_footer_without_structure_evidence():
         structure_evidence=False,
     )
 
-    assert tabular_structure._axis_closure_proven(
+    assert not tabular_structure._axis_closure_proven(
         parser=_AxisClosureParser(),
         worksheet=_axis_closure_worksheet(earlier, later),
         earlier=earlier,
@@ -437,6 +437,15 @@ def test_v20_projection_contract_remains_available_for_backfill():
         "table-producer/v6",
         "tabular-structure-projection/v6",
         "region-producer/v20",
+        "enumeration-rules/v9",
+    ) in tabular_structure._KNOWN_BACKFILL_PROJECTION_CONTRACTS
+
+
+def test_v21_projection_contract_remains_available_for_backfill_after_v22_rollover():
+    assert (
+        "table-producer/v6",
+        "tabular-structure-projection/v6",
+        "region-producer/v21",
         "enumeration-rules/v9",
     ) in tabular_structure._KNOWN_BACKFILL_PROJECTION_CONTRACTS
 
