@@ -1342,7 +1342,8 @@ def test_task_handler_cancellation_never_deletes_the_whole_document_scope():
     assert '{"doc_id": task_doc_id}' not in handle_task_source
 
 
-def test_canceled_task_rollback_removes_images_before_exact_chunk_ids():
+@pytest.mark.asyncio
+async def test_canceled_task_rollback_removes_images_before_exact_chunk_ids():
     chunk_service_path = (
         REPO_ROOT
         / "rag"
@@ -1390,12 +1391,10 @@ def test_canceled_task_rollback_removes_images_before_exact_chunk_ids():
         _persisted_image_ids={"chunk-2"},
     )
 
-    asyncio.run(
-        rollback_task_writes(
-            service,
-            "tenant-1",
-            "dataset-1",
-        )
+    await rollback_task_writes(
+        service,
+        "tenant-1",
+        "dataset-1",
     )
 
     assert calls == [
@@ -1709,7 +1708,8 @@ def test_image_document_chunk_cleanup_uses_strict_storage_operations():
     ]
 
 
-def test_chunk_image_write_response_loss_rolls_back_before_es_insert():
+@pytest.mark.asyncio
+async def test_chunk_image_write_response_loss_rolls_back_before_es_insert():
     chunk_service_path = (
         REPO_ROOT
         / "rag"
@@ -1785,13 +1785,11 @@ def test_chunk_image_write_response_loss_rolls_back_before_es_insert():
     chunks = [{"id": "chunk-1", "doc_id": "document-1"}]
 
     with pytest.raises(OSError, match="image write response lost"):
-        asyncio.run(
-            intercept_insert(
-                service,
-                chunks,
-                "ragflow_tenant_1",
-                "dataset-1",
-            )
+        await intercept_insert(
+            service,
+            chunks,
+            "ragflow_tenant_1",
+            "dataset-1",
         )
 
     assert storage.objects == {}
@@ -1809,7 +1807,8 @@ def test_chunk_image_write_response_loss_rolls_back_before_es_insert():
         (True, 0, b"image-bytes"),
     ],
 )
-def test_chunk_image_es_failure_only_rolls_back_new_objects(
+@pytest.mark.asyncio
+async def test_chunk_image_es_failure_only_rolls_back_new_objects(
     object_existed,
     expected_remove_calls,
     expected_object,
@@ -1886,13 +1885,11 @@ def test_chunk_image_es_failure_only_rolls_back_new_objects(
     )
 
     with pytest.raises(RuntimeError, match="es insert failed"):
-        asyncio.run(
-            intercept_insert(
-                service,
-                [{"id": "chunk-1", "doc_id": "document-1"}],
-                "ragflow_tenant_1",
-                "dataset-1",
-            )
+        await intercept_insert(
+            service,
+            [{"id": "chunk-1", "doc_id": "document-1"}],
+            "ragflow_tenant_1",
+            "dataset-1",
         )
 
     assert storage.objects.get(("dataset-1", "chunk-1")) == expected_object
@@ -1900,7 +1897,8 @@ def test_chunk_image_es_failure_only_rolls_back_new_objects(
     assert service._pending_images == {"chunk-1": b"image-bytes"}
 
 
-def test_chunk_image_and_es_success_clear_pending_image():
+@pytest.mark.asyncio
+async def test_chunk_image_and_es_success_clear_pending_image():
     chunk_service_path = (
         REPO_ROOT
         / "rag"
@@ -1968,13 +1966,11 @@ def test_chunk_image_and_es_success_clear_pending_image():
         _persisted_image_ids=set(),
     )
 
-    result = asyncio.run(
-        intercept_insert(
-            service,
-            [{"id": "chunk-1", "doc_id": "document-1"}],
-            "ragflow_tenant_1",
-            "dataset-1",
-        )
+    result = await intercept_insert(
+        service,
+        [{"id": "chunk-1", "doc_id": "document-1"}],
+        "ragflow_tenant_1",
+        "dataset-1",
     )
 
     assert result is None
@@ -1982,7 +1978,8 @@ def test_chunk_image_and_es_success_clear_pending_image():
     assert service._pending_images == {}
 
 
-def test_chunk_insert_without_pending_images_does_not_require_strict_storage():
+@pytest.mark.asyncio
+async def test_chunk_insert_without_pending_images_does_not_require_strict_storage():
     chunk_service_path = (
         REPO_ROOT
         / "rag"
@@ -2039,13 +2036,11 @@ def test_chunk_insert_without_pending_images_does_not_require_strict_storage():
         _persisted_image_ids=set(),
     )
 
-    result = asyncio.run(
-        intercept_insert(
-            service,
-            chunks,
-            "ragflow_tenant_1",
-            "dataset-1",
-        )
+    result = await intercept_insert(
+        service,
+        chunks,
+        "ragflow_tenant_1",
+        "dataset-1",
     )
 
     assert result is None
@@ -2762,7 +2757,8 @@ def test_dataset_nav_sync_delete_forwards_strict_mode():
     assert "remove_dataset_nav_doc(" in method_source
 
 
-def test_dataset_nav_delete_retry_keeps_doc_anchor_until_parent_detach(monkeypatch):
+@pytest.mark.asyncio
+async def test_dataset_nav_delete_retry_keeps_doc_anchor_until_parent_detach(monkeypatch):
     document_id = "document-1"
     dataset_id = "dataset-1"
     module_path = (
@@ -2847,25 +2843,21 @@ def test_dataset_nav_delete_retry_keeps_doc_anchor_until_parent_detach(monkeypat
     )
 
     with pytest.raises(OSError, match="parent update unavailable"):
-        asyncio.run(
-            namespace["remove_dataset_nav_doc"](
-                "tenant-1",
-                dataset_id,
-                document_id,
-                strict=True,
-            )
-        )
-
-    assert nav_doc_id in rows
-    assert rows[cluster_id]["doc_ids_kwd"] == ["document-2"]
-
-    asyncio.run(
-        namespace["remove_dataset_nav_doc"](
+        await namespace["remove_dataset_nav_doc"](
             "tenant-1",
             dataset_id,
             document_id,
             strict=True,
         )
+
+    assert nav_doc_id in rows
+    assert rows[cluster_id]["doc_ids_kwd"] == ["document-2"]
+
+    await namespace["remove_dataset_nav_doc"](
+        "tenant-1",
+        dataset_id,
+        document_id,
+        strict=True,
     )
 
     assert nav_doc_id not in rows
@@ -2873,7 +2865,8 @@ def test_dataset_nav_delete_retry_keeps_doc_anchor_until_parent_detach(monkeypat
     assert rows[cluster_id]["doc_count_int"] == 1
 
 
-def test_dataset_nav_delete_retry_preserves_ancestor_path_until_root_cleanup(monkeypatch):
+@pytest.mark.asyncio
+async def test_dataset_nav_delete_retry_preserves_ancestor_path_until_root_cleanup(monkeypatch):
     document_id = "document-1"
     dataset_id = "dataset-1"
     module_path = (
@@ -2967,26 +2960,22 @@ def test_dataset_nav_delete_retry_preserves_ancestor_path_until_root_cleanup(mon
     )
 
     with pytest.raises(OSError, match="ancestor delete unavailable"):
-        asyncio.run(
-            namespace["remove_dataset_nav_doc"](
-                "tenant-1",
-                dataset_id,
-                document_id,
-                strict=True,
-            )
+        await namespace["remove_dataset_nav_doc"](
+            "tenant-1",
+            dataset_id,
+            document_id,
+            strict=True,
         )
 
     assert nav_doc_id in rows
     assert leaf_id not in rows
     assert parent_id not in rows
 
-    asyncio.run(
-        namespace["remove_dataset_nav_doc"](
-            "tenant-1",
-            dataset_id,
-            document_id,
-            strict=True,
-        )
+    await namespace["remove_dataset_nav_doc"](
+        "tenant-1",
+        dataset_id,
+        document_id,
+        strict=True,
     )
 
     assert rows == {}
