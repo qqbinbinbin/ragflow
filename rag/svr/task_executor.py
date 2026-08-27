@@ -257,6 +257,8 @@ async def collect():
             if task:
                 task["doc_id"] = msg["doc_id"]
                 task["doc_ids"] = msg.get("doc_ids", []) or []
+    elif msg.get("task_type") == "tabular_generation":
+        task = TaskService.get_generation_task(msg["id"])
     elif msg.get("task_type") == PipelineTaskType.MEMORY.lower():
         _, task_obj = TaskService.get_by_id(msg["id"])
         task = task_obj.to_dict()
@@ -1417,6 +1419,45 @@ async def do_handle_task(task):
         await run_dataflow(task)
         return
 
+    if task_type == "tabular_generation":
+        task_id = task["id"]
+        try:
+            from rag.app.tabular_structure_runtime import run_tabular_structure_generation_job
+
+            bucket, name = File2DocumentService.get_storage_address(doc_id=task["doc_id"])
+            binary = await get_storage_binary(bucket, name)
+            result = await asyncio.to_thread(
+                run_tabular_structure_generation_job,
+                task,
+                binary,
+                progress_callback=lambda progress, message: TaskService.update_generation_progress(
+                    task_id,
+                    progress=progress,
+                    message=message,
+                ),
+                cancel_check=lambda: has_canceled(task_id),
+            )
+            if result.get("status") == "active":
+                TaskService.update_generation_progress(
+                    task_id,
+                    progress=1.0,
+                    message="Tabular structure generation active.",
+                )
+            else:
+                TaskService.update_generation_progress(
+                    task_id,
+                    progress=-1.0,
+                    message=result.get("safe_error_code", "tabular_generation_failed"),
+                )
+        except Exception as error:
+            TaskService.update_generation_progress(
+                task_id,
+                progress=-1.0,
+                message=error.__class__.__name__.lower(),
+            )
+            logging.exception("Tabular structure generation task failed for doc=%s", task.get("doc_id"))
+        return
+
     task_id = task["id"]
     task_from_page = task["from_page"]
     task_to_page = task["to_page"]
@@ -1716,11 +1757,11 @@ async def do_handle_task(task):
         progress_callback(prog=1.0, msg="Task done ({:.2f}s)".format(task_time_cost))
         if task["parser_id"].lower() == "table":
             try:
-                from rag.app.tabular_structure_runtime import publish_tabular_structure_generation
+                from rag.app.tabular_structure_runtime import enqueue_tabular_structure_generation_if_complete
 
                 completed_task = {**task, "progress": 1.0}
                 await asyncio.to_thread(
-                    publish_tabular_structure_generation,
+                    enqueue_tabular_structure_generation_if_complete,
                     completed_task,
                     await get_storage_binary(*File2DocumentService.get_storage_address(doc_id=task_doc_id)),
                     task_list_provider=TaskService.get_tasks,
@@ -1795,7 +1836,7 @@ async def handle_task():
             pass
         logging.exception(f"handle_task got exception for task {json.dumps(task)}")
     finally:
-        if not task.get("dataflow_id", ""):
+        if not task.get("dataflow_id", "") and task_type != "tabular_generation":
             referred_document_id = None
             if task_type in _KB_FANOUT_TASK_TYPES:
                 # KB-level fan-out tasks store the participating doc list in

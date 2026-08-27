@@ -170,6 +170,7 @@ class TaskHandler:
             "evaluation",
             "reembedding",
             "clone",
+            "tabular_generation",
         } | STRUCTURE_MERGE_TASK_TYPES and not task_type.startswith("dataflow")
 
     async def handle_task(self) -> None:
@@ -219,6 +220,10 @@ class TaskHandler:
         # Check if task is canceled
         if ctx.has_canceled_func(task_id):
             ctx.progress_cb(-1, msg="Task has been canceled.")
+            return
+
+        if task_type == "tabular_generation":
+            await self._run_tabular_structure_generation()
             return
 
         # Language defaults to "Chinese" via TaskContext._DEFAULTS 鈥?safe to bind model directly.
@@ -301,6 +306,44 @@ class TaskHandler:
             billing_hook=self._billing_hook,
         )
         await dataflow_service.run_dataflow()
+
+    async def _run_tabular_structure_generation(self) -> None:
+        ctx = self._task_context
+        try:
+            from rag.app.tabular_structure_runtime import run_tabular_structure_generation_job
+
+            bucket, name = File2DocumentService.get_storage_address(doc_id=ctx.doc_id)
+            binary = await self._get_storage_binary(bucket, name)
+            result = await asyncio.to_thread(
+                run_tabular_structure_generation_job,
+                ctx.raw_task,
+                binary,
+                progress_callback=lambda progress, message: TaskService.update_generation_progress(
+                    ctx.id,
+                    progress=progress,
+                    message=message,
+                ),
+                cancel_check=lambda: ctx.has_canceled_func(ctx.id),
+            )
+            if result.get("status") == "active":
+                TaskService.update_generation_progress(
+                    ctx.id,
+                    progress=1.0,
+                    message="Tabular structure generation active.",
+                )
+            else:
+                TaskService.update_generation_progress(
+                    ctx.id,
+                    progress=-1.0,
+                    message=result.get("safe_error_code", "tabular_generation_failed"),
+                )
+        except Exception as error:
+            TaskService.update_generation_progress(
+                ctx.id,
+                progress=-1.0,
+                message=error.__class__.__name__.lower(),
+            )
+            logging.exception("Tabular structure generation task failed for doc=%s", ctx.doc_id)
 
     async def _run_evaluation(self) -> None:
         """Run evaluation task."""
@@ -667,11 +710,11 @@ class TaskHandler:
         ctx.progress_cb(prog=1.0, msg="Task done ({:.2f}s)".format(task_time_cost))
         if ctx.parser_id.lower() == "table":
             try:
-                from rag.app.tabular_structure_runtime import publish_tabular_structure_generation
+                from rag.app.tabular_structure_runtime import enqueue_tabular_structure_generation_if_complete
 
                 completed_task = {**ctx.raw_task, "progress": 1.0}
                 await asyncio.to_thread(
-                    publish_tabular_structure_generation,
+                    enqueue_tabular_structure_generation_if_complete,
                     completed_task,
                     binary,
                     task_list_provider=TaskService.get_tasks,

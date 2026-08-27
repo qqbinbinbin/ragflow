@@ -1,16 +1,470 @@
 import hashlib
 import ast
 import uuid
+import json
 from pathlib import Path
+
+import pytest
 
 import rag.app.tabular_structure as tabular_structure
 import rag.app.tabular_structure_runtime as runtime
 from rag.app.tabular_structure_runtime import (
+    TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
+    enqueue_tabular_structure_generation,
+    run_tabular_structure_generation_job,
     is_complete_tabular_parse,
     publish_tabular_structure_from_source,
     publish_tabular_structure_generation,
     structure_generation_ref,
 )
+
+
+def test_generation_enqueue_returns_without_reading_or_building_source(monkeypatch):
+    calls = []
+
+    class Service:
+        @staticmethod
+        def find_ongoing_generation_task(**kwargs):
+            calls.append(("find", kwargs))
+            return None
+
+        @staticmethod
+        def insert_generation_task(task):
+            calls.append(("insert", task))
+
+    monkeypatch.setattr(
+        "rag.app.tabular_structure_runtime._generation_task_service",
+        lambda: Service,
+    )
+
+    result = enqueue_tabular_structure_generation(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="workbook.xlsx",
+        source_sha256="a" * 64,
+        task_service=Service,
+        queue=lambda task: calls.append(("queue", task)),
+    )
+
+    assert result["status"] == "queued"
+    assert result["task_type"] == TABULAR_STRUCTURE_GENERATION_TASK_TYPE
+    assert [entry[0] for entry in calls] == ["find", "insert", "queue"]
+
+
+def test_generation_enqueue_closes_the_task_when_queue_delivery_fails():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def find_ongoing_generation_task(**_kwargs):
+            return None
+
+        @staticmethod
+        def insert_generation_task(task):
+            return {"id": task["id"]}
+
+        @staticmethod
+        def fail_generation_task(task_id, *, message):
+            calls.append((task_id, message))
+
+    with pytest.raises(RuntimeError, match="could not be queued"):
+        enqueue_tabular_structure_generation(
+            tenant_id="tenant-1",
+            dataset_id="dataset-1",
+            document_id="document-1",
+            filename="workbook.xlsx",
+            source_sha256="a" * 64,
+            task_service=Service,
+            queue=lambda _task: False,
+        )
+
+    assert len(calls) == 1
+    assert calls[0][1] == "Tabular structure generation could not be queued."
+
+
+def test_generation_job_skips_completed_sheet_checkpoints_and_does_not_activate_early():
+    calls = []
+    generation_ref = structure_generation_ref("document-1", b"workbook")
+    source_sha256 = hashlib.sha256(b"workbook").hexdigest()
+
+    class Workbook:
+        sheetnames = ["Sheet 1", "Sheet 2"]
+
+    checkpoints = {
+        1: {
+            "version": runtime.TABULAR_GENERATION_CHECKPOINT_VERSION,
+            "producer_generation_ref": generation_ref,
+            "source_sha256": source_sha256,
+            "sheet_ordinal": 1,
+            "projection": {
+                "version": "tabular-structure-projection/v6",
+                "producer_schema_version": "table-producer/v6",
+                "producer_generation_ref": generation_ref,
+                "structure_algorithm_version": "region-producer/v22",
+                "enumeration_rule_version": "enumeration-rules/v9",
+                "source_sha256": source_sha256,
+                "tables": [],
+                "rows": [],
+            },
+            "audit": {},
+        },
+    }
+
+    class Storage:
+        def __init__(self):
+            self.objects = {}
+
+        def obj_exist(self, _bucket, name, tenant_id=None):
+            return name.endswith("sheet-000001.json") or name in self.objects
+
+        def get(self, _bucket, name, tenant_id=None):
+            if name.endswith("sheet-000001.json"):
+                return json.dumps(checkpoints[1]).encode()
+            return self.objects[name]
+
+        def put(self, _bucket, name, payload, tenant_id=None):
+            self.objects[name] = payload
+            calls.append("put")
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            calls.append("shadow")
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            calls.append("activate")
+
+    def build(*_args, **kwargs):
+        calls.append(kwargs["sheet_ordinals"])
+        if kwargs["sheet_ordinals"] == {2}:
+            return {
+                "version": "tabular-structure-projection/v6",
+                "producer_schema_version": "table-producer/v6",
+                "producer_generation_ref": generation_ref,
+                "structure_algorithm_version": "region-producer/v22",
+                "enumeration_rule_version": "enumeration-rules/v9",
+                "source_sha256": source_sha256,
+                "tables": [],
+                "rows": [],
+            }, {}
+        raise AssertionError("completed Sheet must not be rebuilt")
+
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+        },
+        b"workbook",
+        storage=Storage(),
+        service=Service,
+        projection_builder=build,
+        sheet_count_provider=lambda *_args: 2,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+    )
+
+    assert result["status"] == "active"
+    assert {2} in calls
+    assert calls[-1] == "activate"
+
+
+def test_generation_job_failure_keeps_completed_checkpoints_and_never_activates():
+    calls = []
+
+    class Workbook:
+        sheetnames = ["Sheet 1", "Sheet 2"]
+
+    class Storage:
+        def __init__(self):
+            self.objects = {}
+
+        def obj_exist(self, _bucket, name, **_kwargs):
+            return name in self.objects
+
+        def put(self, _bucket, name, payload, tenant_id=None):
+            self.objects[name] = payload
+            calls.append(("checkpoint", name, payload))
+
+        def get(self, _bucket, name, tenant_id=None):
+            return self.objects[name]
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            calls.append(("shadow",))
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            calls.append(("activate",))
+
+    def build(*_args, **kwargs):
+        if kwargs["sheet_ordinals"] == {2}:
+            raise TimeoutError("sheet budget exceeded")
+        return {
+            "version": "tabular-structure-projection/v6",
+            "producer_schema_version": "table-producer/v6",
+            "producer_generation_ref": structure_generation_ref("document-1", b"workbook"),
+            "structure_algorithm_version": "region-producer/v22",
+            "enumeration_rule_version": "enumeration-rules/v9",
+            "source_sha256": hashlib.sha256(b"workbook").hexdigest(),
+            "tables": [],
+            "rows": [],
+        }, {}
+
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+        },
+        b"workbook",
+        storage=Storage(),
+        service=Service,
+        projection_builder=build,
+        sheet_count_provider=lambda *_args: 2,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+    )
+
+    assert result["status"] == "failed"
+    assert any(entry[0] == "checkpoint" for entry in calls)
+    assert not any(entry[0] in {"shadow", "activate"} for entry in calls)
+
+
+def test_generation_job_cancellation_keeps_completed_checkpoints_and_never_activates():
+    calls = []
+
+    class Workbook:
+        sheetnames = ["Sheet 1", "Sheet 2"]
+
+    class Storage:
+        def __init__(self):
+            self.objects = {}
+
+        def obj_exist(self, _bucket, name, **_kwargs):
+            return name in self.objects
+
+        def put(self, _bucket, name, payload, tenant_id=None):
+            self.objects[name] = payload
+            calls.append(("checkpoint", name))
+
+        def get(self, _bucket, name, tenant_id=None):
+            return self.objects[name]
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            calls.append(("shadow",))
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            calls.append(("activate",))
+
+    def build(*_args, **kwargs):
+        calls.append(("build", kwargs["sheet_ordinals"]))
+        generation = structure_generation_ref("document-1", b"workbook")
+        return {
+            "version": "tabular-structure-projection/v6",
+            "producer_schema_version": "table-producer/v6",
+            "producer_generation_ref": generation,
+            "structure_algorithm_version": "region-producer/v22",
+            "enumeration_rule_version": "enumeration-rules/v9",
+            "source_sha256": hashlib.sha256(b"workbook").hexdigest(),
+            "tables": [],
+            "rows": [],
+        }, {}
+
+    checks = 0
+
+    def cancel_check():
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+        },
+        b"workbook",
+        storage=Storage(),
+        service=Service,
+        projection_builder=build,
+        sheet_count_provider=lambda *_args: 2,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+        cancel_check=cancel_check,
+    )
+
+    assert result == {
+        "status": "cancelled",
+        "producer_generation_ref": structure_generation_ref("document-1", b"workbook"),
+        "safe_error_code": "task_cancelled",
+    }
+    assert [entry[0] for entry in calls] == ["build", "checkpoint"]
+    assert not any(entry[0] in {"shadow", "activate"} for entry in calls)
+
+
+def test_generation_job_retry_reuses_completed_checkpoints_after_sheet_failure():
+    calls = []
+    generation = structure_generation_ref("document-1", b"workbook")
+    source_sha256 = hashlib.sha256(b"workbook").hexdigest()
+
+    class Workbook:
+        sheetnames = ["Sheet 1", "Sheet 2"]
+
+    class Storage:
+        def __init__(self):
+            self.objects = {}
+
+        def obj_exist(self, _bucket, name, **_kwargs):
+            return name in self.objects
+
+        def put(self, _bucket, name, payload, tenant_id=None):
+            self.objects[name] = payload
+
+        def get(self, _bucket, name, tenant_id=None):
+            return self.objects[name]
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            calls.append("shadow")
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            calls.append("activate")
+
+    def projection():
+        return {
+            "version": "tabular-structure-projection/v6",
+            "producer_schema_version": "table-producer/v6",
+            "producer_generation_ref": generation,
+            "structure_algorithm_version": "region-producer/v22",
+            "enumeration_rule_version": "enumeration-rules/v9",
+            "source_sha256": source_sha256,
+            "tables": [],
+            "rows": [],
+        }, {}
+
+    storage = Storage()
+    failed_once = True
+
+    def build(_name, _binary, **kwargs):
+        nonlocal failed_once
+        ordinal = next(iter(kwargs["sheet_ordinals"]))
+        calls.append(("build", ordinal))
+        if ordinal == 2 and failed_once:
+            failed_once = False
+            raise TimeoutError("sheet budget exceeded")
+        return projection()
+
+    task = {
+        "tenant_id": "tenant-1",
+        "kb_id": "dataset-1",
+        "doc_id": "document-1",
+        "name": "workbook.xlsx",
+    }
+    first = run_tabular_structure_generation_job(
+        task,
+        b"workbook",
+        storage=storage,
+        service=Service,
+        projection_builder=build,
+        sheet_count_provider=lambda *_args: 2,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+    )
+    second = run_tabular_structure_generation_job(
+        task,
+        b"workbook",
+        storage=storage,
+        service=Service,
+        projection_builder=build,
+        sheet_count_provider=lambda *_args: 2,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+    )
+
+    assert first["status"] == "failed"
+    assert second["status"] == "active"
+    assert [entry for entry in calls if isinstance(entry, tuple)] == [
+        ("build", 1),
+        ("build", 2),
+        ("build", 2),
+    ]
+    assert calls[-1] == "activate"
+
+
+def test_generation_job_rejects_a_sheet_count_that_could_skip_real_sheets():
+    calls = []
+
+    class Workbook:
+        sheetnames = ["Sheet 1", "Sheet 2"]
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            calls.append("shadow")
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            calls.append("activate")
+
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+        },
+        b"workbook",
+        storage=type("Storage", (), {})(),
+        service=Service,
+        projection_builder=lambda *_args, **_kwargs: {},
+        sheet_count_provider=lambda *_args: 1,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+    )
+
+    assert result["status"] == "failed"
+    assert calls == []
 
 
 def _task(task_id, progress, *, parser_id="table"):
@@ -456,9 +910,11 @@ def test_legacy_and_refactored_executors_call_the_same_runtime_hook():
     refactored = (repo_root / "rag" / "svr" / "task_executor_refactor" / "task_handler.py").read_text(encoding="utf-8")
 
     for source in (legacy, refactored):
-        assert "publish_tabular_structure_generation" in source
+        assert "enqueue_tabular_structure_generation_if_complete" in source
+        assert "run_tabular_structure_generation_job" in source
         assert "TaskService.get_tasks" in source
         assert '"progress": 1.0' in source
+        assert "cancel_check=" in source
 
 
 def test_task_executor_never_downgrades_to_the_legacy_mutation_path():
@@ -478,6 +934,23 @@ def test_task_executor_never_downgrades_to_the_legacy_mutation_path():
     assert "unsupported TE_RUN_MODE" in method_source
     assert "do_handle_task(task)" not in method_source
     assert method_source.count("TaskManager.run_refactored_task(") == 1
+
+
+def test_generation_task_is_not_recorded_as_a_parse_operation():
+    repo_root = Path(__file__).resolve().parents[2]
+    source = (repo_root / "rag" / "svr" / "task_executor.py").read_text(encoding="utf-8")
+    module = ast.parse(source)
+    handle_task = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle_task"
+    )
+    method_source = ast.get_source_segment(source, handle_task)
+
+    assert method_source is not None
+    assert 'task_type != "tabular_generation"' in method_source
+    assert method_source.count("redis_msg.ack()") == 1
+    assert method_source.rfind("redis_msg.ack()") > method_source.rfind("finally:")
 
 
 def test_structure_only_build_publishes_from_source_without_parse_tasks():

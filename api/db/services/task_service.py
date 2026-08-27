@@ -162,6 +162,83 @@ class TaskService(CommonService):
 
     @classmethod
     @DB.connection_context()
+    def find_ongoing_generation_task(cls, *, document_id: str, source_sha256: str | None = None):
+        """Find one queued/running structure-generation task for a document."""
+        query = (
+            cls.model.select()
+            .where(
+                cls.model.doc_id == document_id,
+                cls.model.task_type == "tabular_generation",
+                cls.model.progress >= 0,
+                cls.model.progress < 1,
+            )
+            .order_by(cls.model.create_time.desc())
+        )
+        if source_sha256:
+            query = query.where(cls.model.digest == source_sha256)
+        task = query.first()
+        return task.to_dict() if task else None
+
+    @classmethod
+    @DB.connection_context()
+    def insert_generation_task(cls, task: dict):
+        """Persist a generation task using the existing Task table contract."""
+        fields = {
+            key: task[key]
+            for key in (
+                "id",
+                "doc_id",
+                "from_page",
+                "to_page",
+                "task_type",
+                "priority",
+                "begin_at",
+                "progress",
+                "progress_msg",
+                "digest",
+            )
+            if key in task
+        }
+        fields["task_type"] = "tabular_generation"
+        record = cls.insert(**fields)
+        return record.to_dict()
+
+    @classmethod
+    @DB.connection_context()
+    def update_generation_progress(cls, task_id: str, *, progress: float, message: str = "") -> None:
+        """Update only a generation task; ordinary document status is untouched."""
+        task = cls.model.get_or_none(cls.model.id == task_id)
+        if task is None:
+            return
+        values = {"progress": progress}
+        if message:
+            values["progress_msg"] = trim_header_by_lines(
+                (task.progress_msg or "") + "\n" + message,
+                TASK_MAX_LOG_LENGTH,
+            )
+        cls.model.update(**values).where(cls.model.id == task_id).execute()
+
+    @classmethod
+    @DB.connection_context()
+    def fail_generation_task(cls, task_id: str, *, message: str) -> None:
+        """Close a generation enqueue failure without failing its Document."""
+        task = cls.model.get_or_none(
+            (cls.model.id == task_id)
+            & (cls.model.task_type == "tabular_generation")
+        )
+        if task is None:
+            return
+        progress_msg = trim_header_by_lines(
+            (task.progress_msg or "") + "\n" + message,
+            TASK_MAX_LOG_LENGTH,
+        )
+        cls.model.update(progress=-1.0, progress_msg=progress_msg).where(
+            (cls.model.id == task_id)
+            & (cls.model.task_type == "tabular_generation")
+        ).execute()
+
+    @classmethod
+    @DB.connection_context()
     def get_task(cls, task_id, doc_ids=[]):
         """Retrieve detailed task information by task ID.
 
@@ -239,6 +316,51 @@ class TaskService(CommonService):
 
     @classmethod
     @DB.connection_context()
+    def get_generation_task(cls, task_id):
+        """Read a structure-generation task without mutating document state."""
+        fields = [
+            cls.model.id,
+            cls.model.doc_id,
+            cls.model.from_page,
+            cls.model.to_page,
+            cls.model.task_type,
+            cls.model.progress,
+            cls.model.progress_msg,
+            cls.model.digest,
+            Document.kb_id,
+            Document.parser_id,
+            Document.parser_config,
+            Document.name,
+            Document.type,
+            Document.location,
+            Document.size,
+            Knowledgebase.tenant_id,
+            Knowledgebase.language,
+            Knowledgebase.embd_id,
+            Knowledgebase.tenant_embd_id,
+            Knowledgebase.pagerank,
+            Knowledgebase.parser_config.alias("kb_parser_config"),
+            Tenant.img2txt_id,
+            Tenant.asr_id,
+            Tenant.llm_id,
+            Tenant.tenant_llm_id,
+            cls.model.update_time,
+        ]
+        task = (
+            cls.model.select(*fields)
+            .join(Document, on=(cls.model.doc_id == Document.id))
+            .join(Knowledgebase, on=(Document.kb_id == Knowledgebase.id))
+            .join(Tenant, on=(Knowledgebase.tenant_id == Tenant.id))
+            .where(
+                cls.model.id == task_id,
+                cls.model.task_type == "tabular_generation",
+            )
+            .first()
+        )
+        return task.to_dict() if task else None
+
+    @classmethod
+    @DB.connection_context()
     def get_tasks(cls, doc_id: str):
         """Retrieve all tasks associated with a document.
 
@@ -258,6 +380,7 @@ class TaskService(CommonService):
             cls.model.progress,
             cls.model.digest,
             cls.model.chunk_ids,
+            cls.model.task_type,
         ]
         tasks = cls.model.select(*fields).order_by(cls.model.from_page.asc(), cls.model.create_time.desc()).where(cls.model.doc_id == doc_id)
         tasks = list(tasks.dicts())

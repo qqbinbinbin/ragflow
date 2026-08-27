@@ -573,11 +573,16 @@ def build_structure_projection(filename, binary, *, producer_generation_ref=None
 
     from rag.app.tabular_structure import build_tabular_structure_projection
 
+    parser = kwargs.pop("parser", None) or Excel()
+    workbook = kwargs.pop("workbook", None)
+    source_context = kwargs.pop("source_context", None)
     return build_tabular_structure_projection(
         filename,
         binary,
         producer_generation_ref=producer_generation_ref,
-        parser=Excel(),
+        parser=parser,
+        workbook=workbook,
+        source_context=source_context,
         **kwargs,
     )
 

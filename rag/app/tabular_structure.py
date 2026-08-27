@@ -6133,6 +6133,9 @@ def _build_tabular_structure_projection_with_audit(
     table_context_entry_limit: int = DEFAULT_CONTEXT_ENTRY_LIMIT,
     table_context_value_bytes: int = DEFAULT_CONTEXT_VALUE_BYTES,
     parser=None,
+    sheet_ordinals: set[int] | None = None,
+    workbook=None,
+    source_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build one immutable generation from complete workbook bytes.
 
@@ -6161,10 +6164,24 @@ def _build_tabular_structure_projection_with_audit(
         if has_adr044_receipt
         else converted_source_sha256
     )
-    workbook = parser._load_excel_to_workbook(BytesIO(binary))
-    formula_coordinates, formula_inventory_proven = _formula_coordinates_by_sheet(binary)
-    formula_cached_result_kinds = _formula_cached_result_kinds_by_sheet(binary)
-    formula_values = _formula_values_by_sheet(binary)
+    source_context = source_context or {}
+    workbook = workbook or source_context.get("workbook") or parser._load_excel_to_workbook(BytesIO(binary))
+    selected_sheet_ordinals = None if sheet_ordinals is None else {
+        int(sheet_ordinal) for sheet_ordinal in sheet_ordinals
+    }
+    if selected_sheet_ordinals is not None and (
+        not selected_sheet_ordinals
+        or any(sheet_ordinal < 1 for sheet_ordinal in selected_sheet_ordinals)
+        or any(sheet_ordinal > len(workbook.sheetnames) for sheet_ordinal in selected_sheet_ordinals)
+    ):
+        raise ValueError("sheet_ordinals must identify existing worksheets")
+    formula_coordinates, formula_inventory_proven = source_context.get(
+        "formula_coordinates"
+    ) or _formula_coordinates_by_sheet(binary)
+    formula_cached_result_kinds = source_context.get(
+        "formula_cached_result_kinds"
+    ) or _formula_cached_result_kinds_by_sheet(binary)
+    formula_values = source_context.get("formula_values") or _formula_values_by_sheet(binary)
     records = []
     tables = []
     defects = []
@@ -6172,6 +6189,8 @@ def _build_tabular_structure_projection_with_audit(
     audit_output_objects = []
 
     for sheet_ordinal, sheet_name in enumerate(workbook.sheetnames, start=1):
+        if selected_sheet_ordinals is not None and sheet_ordinal not in selected_sheet_ordinals:
+            continue
         worksheet = workbook[sheet_name]
         sheet_formula_coordinates = (
             formula_coordinates[sheet_ordinal - 1]
@@ -6634,6 +6653,9 @@ def build_tabular_structure_projection(
     table_context_entry_limit: int = DEFAULT_CONTEXT_ENTRY_LIMIT,
     table_context_value_bytes: int = DEFAULT_CONTEXT_VALUE_BYTES,
     parser=None,
+    sheet_ordinals: set[int] | None = None,
+    workbook=None,
+    source_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     projection, _audit = _build_tabular_structure_projection_with_audit(
         filename,
@@ -6643,6 +6665,9 @@ def build_tabular_structure_projection(
         table_context_entry_limit=table_context_entry_limit,
         table_context_value_bytes=table_context_value_bytes,
         parser=parser,
+        sheet_ordinals=sheet_ordinals,
+        workbook=workbook,
+        source_context=source_context,
     )
     return projection
 
