@@ -310,7 +310,27 @@ class TaskHandler:
     async def _run_tabular_structure_generation(self) -> None:
         ctx = self._task_context
         try:
-            from rag.app.tabular_structure_runtime import run_tabular_structure_generation_job
+            from rag.app.tabular_structure_runtime import (
+                TabularGenerationClaimUnavailable,
+                TabularGenerationRetryUnavailable,
+                claim_tabular_structure_generation_attempt,
+            )
+
+            claimed = claim_tabular_structure_generation_attempt(ctx.id)
+        except TabularGenerationClaimUnavailable:
+            raise
+        except Exception:
+            logging.exception("Unable to claim tabular generation task=%s", ctx.id)
+            raise
+        if not claimed:
+            logging.info("Skipping duplicate or terminal tabular generation task=%s", ctx.id)
+            return
+        try:
+            from rag.app.tabular_structure_runtime import (
+                _generation_progress,
+                retry_tabular_structure_generation_task,
+                run_tabular_structure_generation_job,
+            )
 
             bucket, name = File2DocumentService.get_storage_address(doc_id=ctx.doc_id)
             binary = await self._get_storage_binary(bucket, name)
@@ -320,7 +340,7 @@ class TaskHandler:
                 binary,
                 progress_callback=lambda progress, message: TaskService.update_generation_progress(
                     ctx.id,
-                    progress=progress,
+                    progress=_generation_progress(progress),
                     message=message,
                 ),
                 cancel_check=lambda: ctx.has_canceled_func(ctx.id),
@@ -332,17 +352,25 @@ class TaskHandler:
                     message="Tabular structure generation active.",
                 )
             else:
+                failure_code = result.get("safe_error_code", "tabular_generation_failed")
+                if not retry_tabular_structure_generation_task(ctx.id, failure_code=failure_code):
+                    if failure_code not in {"source_changed", "invalid_generation_task", "task_cancelled"}:
+                        TaskService.update_generation_progress(
+                            ctx.id,
+                            progress=-1.0,
+                            message=failure_code,
+                        )
+        except TabularGenerationRetryUnavailable:
+            raise
+        except Exception as error:
+            from rag.app.tabular_structure_runtime import retry_tabular_structure_generation_task
+
+            if not retry_tabular_structure_generation_task(ctx.id):
                 TaskService.update_generation_progress(
                     ctx.id,
                     progress=-1.0,
-                    message=result.get("safe_error_code", "tabular_generation_failed"),
+                    message=error.__class__.__name__.lower(),
                 )
-        except Exception as error:
-            TaskService.update_generation_progress(
-                ctx.id,
-                progress=-1.0,
-                message=error.__class__.__name__.lower(),
-            )
             logging.exception("Tabular structure generation task failed for doc=%s", ctx.doc_id)
 
     async def _run_evaluation(self) -> None:

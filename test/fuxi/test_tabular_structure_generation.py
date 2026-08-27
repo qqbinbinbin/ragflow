@@ -384,6 +384,71 @@ def test_generation_activation_and_restore_reject_document_deletion_gate():
         )
 
 
+def test_both_generation_workers_use_bounded_retry_and_do_not_fail_ordinary_documents():
+    for relative_path in (
+        REPO_ROOT / "rag" / "svr" / "task_executor.py",
+        REPO_ROOT / "rag" / "svr" / "task_executor_refactor" / "task_handler.py",
+    ):
+        source = relative_path.read_text(encoding="utf-8")
+        assert "retry_tabular_structure_generation_task" in source
+        assert "failure_code" in source
+        assert "source_changed" in source
+        assert 'task_type != "tabular_generation"' in source or "task_type == \"tabular_generation\"" in source
+
+
+def test_both_generation_workers_claim_before_reading_source():
+    for relative_path in (
+        REPO_ROOT / "rag" / "svr" / "task_executor.py",
+        REPO_ROOT / "rag" / "svr" / "task_executor_refactor" / "task_handler.py",
+    ):
+        source = relative_path.read_text(encoding="utf-8")
+        claim_position = source.index("claim_tabular_structure_generation_attempt")
+        source_read_position = source.index("get_storage_address", claim_position)
+        assert claim_position < source_read_position
+
+
+def test_generation_claim_unavailability_does_not_ack_the_redis_message():
+    source = (REPO_ROOT / "rag" / "svr" / "task_executor.py").read_text(encoding="utf-8")
+    assert "TabularGenerationClaimUnavailable" in source
+    assert "ack_message = False" in source
+    assert "if ack_message:" in source
+    assert "set_progress(task_id, prog=-1" in source
+    assert "if not generation_delivery_unavailable:" in source
+    assert "TabularGenerationRetryUnavailable" in source
+    assert "except TabularGenerationRetryUnavailable:" in source
+
+
+def test_both_generation_workers_do_not_mark_task_complete_before_activation():
+    runtime_source = (REPO_ROOT / "rag" / "app" / "tabular_structure_runtime.py").read_text(encoding="utf-8")
+    assert "def _generation_progress" in runtime_source
+    assert "min(float(progress), 0.999999)" in runtime_source
+    for relative_path in (
+        REPO_ROOT / "rag" / "svr" / "task_executor.py",
+        REPO_ROOT / "rag" / "svr" / "task_executor_refactor" / "task_handler.py",
+    ):
+        assert "_generation_progress" in relative_path.read_text(encoding="utf-8")
+
+
+def test_retry_claim_must_confirm_the_failed_to_queued_update():
+    source = (REPO_ROOT / "api" / "db" / "services" / "task_service.py").read_text(encoding="utf-8")
+    method = source[source.index("def fail_generation_attempt_and_reserve_retry"):]
+    assert "updated = cls.model.update(" in method
+    assert "if updated != 1:" in method
+    assert "with DB.atomic()" in method
+    assert "retryable" in method
+    assert "if task is None:" in method
+    assert "& (cls.model.progress == 0)" in method
+
+
+def test_generation_retry_contract_has_hard_five_attempt_cap_and_stale_recovery():
+    task_service_source = (REPO_ROOT / "api" / "db" / "services" / "task_service.py").read_text(encoding="utf-8")
+    runtime_source = (REPO_ROOT / "rag" / "app" / "tabular_structure_runtime.py").read_text(encoding="utf-8")
+    assert "TABULAR_GENERATION_MAX_ATTEMPTS = 5" in task_service_source
+    assert "not 1 <= max_attempts <= TABULAR_GENERATION_MAX_ATTEMPTS" in task_service_source
+    assert "not 1 <= max_attempts <= TABULAR_GENERATION_MAX_ATTEMPTS" in runtime_source
+    assert "Recovering stale tabular structure generation attempt." in task_service_source
+
+
 def test_peewee_repository_exposes_the_runtime_model_bundle(service_module, monkeypatch):
     class AnonymousModel:
         pass

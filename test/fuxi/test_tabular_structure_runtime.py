@@ -10,11 +10,16 @@ import rag.app.tabular_structure as tabular_structure
 import rag.app.tabular_structure_runtime as runtime
 from rag.app.tabular_structure_runtime import (
     TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
+    TABULAR_GENERATION_MAX_ATTEMPTS,
+    TabularGenerationClaimUnavailable,
+    TabularGenerationRetryUnavailable,
+    claim_tabular_structure_generation_attempt,
     enqueue_tabular_structure_generation,
     run_tabular_structure_generation_job,
     is_complete_tabular_parse,
     publish_tabular_structure_from_source,
     publish_tabular_structure_generation,
+    retry_tabular_structure_generation_task,
     structure_generation_ref,
 )
 
@@ -24,13 +29,9 @@ def test_generation_enqueue_returns_without_reading_or_building_source(monkeypat
 
     class Service:
         @staticmethod
-        def find_ongoing_generation_task(**kwargs):
-            calls.append(("find", kwargs))
-            return None
-
-        @staticmethod
-        def insert_generation_task(task):
-            calls.append(("insert", task))
+        def find_or_insert_generation_task(task, *, source_sha256):
+            calls.append(("find_or_insert", task, source_sha256))
+            return {"created": True, "task": task}
 
     monkeypatch.setattr(
         "rag.app.tabular_structure_runtime._generation_task_service",
@@ -49,7 +50,30 @@ def test_generation_enqueue_returns_without_reading_or_building_source(monkeypat
 
     assert result["status"] == "queued"
     assert result["task_type"] == TABULAR_STRUCTURE_GENERATION_TASK_TYPE
-    assert [entry[0] for entry in calls] == ["find", "insert", "queue"]
+    assert [entry[0] for entry in calls] == ["find_or_insert", "queue"]
+
+
+def test_generation_enqueue_reuses_the_existing_atomic_task_without_requeueing():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def find_or_insert_generation_task(task, *, source_sha256):
+            calls.append(("find_or_insert", task, source_sha256))
+            return {"created": False, "task": {"id": "existing-task"}}
+
+    result = enqueue_tabular_structure_generation(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="workbook.xlsx",
+        source_sha256="a" * 64,
+        task_service=Service,
+        queue=lambda task: calls.append(("queue", task)),
+    )
+
+    assert result["task_id"] == "existing-task"
+    assert [entry[0] for entry in calls] == ["find_or_insert"]
 
 
 def test_generation_enqueue_closes_the_task_when_queue_delivery_fails():
@@ -57,12 +81,8 @@ def test_generation_enqueue_closes_the_task_when_queue_delivery_fails():
 
     class Service:
         @staticmethod
-        def find_ongoing_generation_task(**_kwargs):
-            return None
-
-        @staticmethod
-        def insert_generation_task(task):
-            return {"id": task["id"]}
+        def find_or_insert_generation_task(task, *, source_sha256):
+            return {"created": True, "task": {**task, "digest": source_sha256}}
 
         @staticmethod
         def fail_generation_task(task_id, *, message):
@@ -176,6 +196,73 @@ def test_generation_job_skips_completed_sheet_checkpoints_and_does_not_activate_
     assert result["status"] == "active"
     assert {2} in calls
     assert calls[-1] == "activate"
+
+
+def test_generation_progress_never_reports_complete_before_activation():
+    progress = []
+
+    class Workbook:
+        sheetnames = ["Sheet 1"]
+
+    class Storage:
+        def __init__(self):
+            self.objects = {}
+
+        def obj_exist(self, _bucket, name, **_kwargs):
+            return name in self.objects
+
+        def put(self, _bucket, name, payload, **_kwargs):
+            self.objects[name] = payload
+
+        def get(self, _bucket, name, **_kwargs):
+            return self.objects[name]
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            pass
+
+    projection = {
+        "version": "tabular-structure-projection/v6",
+        "producer_schema_version": "table-producer/v6",
+        "producer_generation_ref": structure_generation_ref("document-1", b"workbook"),
+        "structure_algorithm_version": "region-producer/v22",
+        "enumeration_rule_version": "enumeration-rules/v9",
+        "source_sha256": hashlib.sha256(b"workbook").hexdigest(),
+        "tables": [],
+        "rows": [],
+    }
+
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+        },
+        b"workbook",
+        storage=Storage(),
+        service=Service,
+        projection_builder=lambda *_args, **_kwargs: (projection, {}),
+        sheet_count_provider=lambda *_args: 1,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+        progress_callback=lambda value, _message: progress.append(value),
+    )
+
+    assert result["status"] == "active"
+    assert progress
+    assert max(progress) < 1.0
 
 
 def test_generation_job_failure_keeps_completed_checkpoints_and_never_activates():
@@ -465,6 +552,337 @@ def test_generation_job_rejects_a_sheet_count_that_could_skip_real_sheets():
 
     assert result["status"] == "failed"
     assert calls == []
+
+
+def test_generation_job_rejects_a_changed_source_without_retrying_or_activating():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            calls.append("active")
+            return None
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            calls.append("shadow")
+
+        @staticmethod
+        def activate_generation(*_args, **_kwargs):
+            calls.append("activate")
+
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+            "digest": hashlib.sha256(b"original").hexdigest(),
+        },
+        b"changed",
+        storage=type("Storage", (), {})(),
+        service=Service,
+    )
+
+    assert result == {"status": "failed", "safe_error_code": "source_changed"}
+    assert calls == []
+
+
+def test_generation_retry_allows_at_most_five_total_attempts():
+    calls = []
+    transitions = []
+    queued = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(task_id, *, message, max_attempts, retryable):
+            transitions.append((task_id, message, max_attempts, retryable))
+            retry_count = len(transitions)
+            return (
+                {"status": "retry", "retry_count": retry_count}
+                if retry_count < max_attempts
+                else {"status": "exhausted", "retry_count": retry_count - 1}
+            )
+
+    for _ in range(TABULAR_GENERATION_MAX_ATTEMPTS):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda task: (queued.append(task), True)[1],
+        )
+
+    assert len(transitions) == TABULAR_GENERATION_MAX_ATTEMPTS
+    assert len(queued) == TABULAR_GENERATION_MAX_ATTEMPTS - 1
+
+
+def test_generation_retry_preserves_delivery_when_retry_queue_returns_false():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(task_id, *, message, max_attempts, retryable):
+            calls.append(("transition", task_id, message, max_attempts, retryable))
+            return {"status": "retry", "retry_count": 1}
+
+        @staticmethod
+        def fail_generation_retry_delivery(*_args, **_kwargs):
+            return False
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda _task: False,
+        )
+    assert calls == [
+        ("transition", "generation-task", "tabular_generation_failed", TABULAR_GENERATION_MAX_ATTEMPTS, True),
+    ]
+
+
+def test_generation_retry_accepts_ack_only_after_explicit_false_is_finalized():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
+            return {"status": "retry", "retry_count": 1}
+
+        @staticmethod
+        def fail_generation_retry_delivery(task_id, *, message):
+            calls.append((task_id, message))
+            return True
+
+    assert retry_tabular_structure_generation_task(
+        "generation-task",
+        task_service=Service,
+        queue=lambda _task: False,
+    ) is False
+    assert calls == [
+        ("generation-task", "Tabular structure generation retry could not be queued."),
+    ]
+
+
+def test_generation_retry_keeps_delivery_unknown_when_explicit_false_cannot_be_finalized():
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
+            return {"status": "retry", "retry_count": 1}
+
+        @staticmethod
+        def fail_generation_retry_delivery(*_args, **_kwargs):
+            return False
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda _task: False,
+        )
+
+
+def test_generation_retry_preserves_delivery_when_retry_queue_raises():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(task_id, *, message, max_attempts, retryable):
+            calls.append(("transition", task_id, message, max_attempts, retryable))
+            return {"status": "retry", "retry_count": 1}
+
+        @staticmethod
+        def fail_generation_retry_delivery(task_id, *, message):
+            calls.append(("fail", task_id, message))
+            return True
+
+    def queue(_task):
+        raise ConnectionError("queue unavailable")
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=queue,
+        )
+    assert calls == [
+        ("transition", "generation-task", "tabular_generation_failed", TABULAR_GENERATION_MAX_ATTEMPTS, True),
+    ]
+
+
+def test_generation_retry_does_not_claim_deterministic_source_change():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(task_id, *, message, max_attempts, retryable):
+            calls.append(("transition", task_id, message, max_attempts, retryable))
+            return {"status": "failed", "retry_count": 0}
+
+    assert retry_tabular_structure_generation_task(
+        "generation-task",
+        task_service=Service,
+        queue=lambda _task: calls.append("queue"),
+        failure_code="source_changed",
+    ) is False
+    assert calls == [
+        ("transition", "generation-task", "source_changed", TABULAR_GENERATION_MAX_ATTEMPTS, False),
+    ]
+
+
+def test_generation_retry_treats_claim_service_failure_as_terminal_for_this_worker_attempt():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
+            calls.append("transition")
+            raise ConnectionError("database unavailable")
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda _task: calls.append("queue"),
+        )
+    assert calls == [
+        "transition",
+    ]
+
+
+def test_generation_retry_preserves_delivery_when_marking_failure_is_unavailable():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(_task_id, *, message, max_attempts, retryable):
+            calls.append(message)
+            raise ConnectionError("database unavailable")
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda _task: calls.append("queue"),
+            failure_code="worker_error",
+        )
+    assert calls == ["worker_error"]
+
+
+def test_generation_retry_finishes_the_attempt_and_claims_requeue_in_one_transition():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(task_id, *, message, max_attempts, retryable):
+            calls.append(("transition", task_id, message, max_attempts, retryable))
+            return {"status": "retry", "retry_count": 1}
+
+    assert retry_tabular_structure_generation_task(
+        "generation-task",
+        task_service=Service,
+        queue=lambda _task: (calls.append("queue"), True)[1],
+        failure_code="worker_error",
+    ) is True
+    assert calls == [
+        ("transition", "generation-task", "worker_error", TABULAR_GENERATION_MAX_ATTEMPTS, True),
+        "queue",
+    ]
+
+
+def test_generation_retry_does_not_requeue_when_transition_is_unavailable():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
+            calls.append("transition")
+            return None
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda _task: calls.append("queue"),
+            failure_code="worker_error",
+        )
+    assert calls == ["transition"]
+
+
+def test_generation_retry_does_not_ack_when_retry_delivery_outcome_is_unknown():
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
+            return {"status": "retry", "retry_count": 1}
+
+        @staticmethod
+        def fail_generation_retry_delivery(*_args, **_kwargs):
+            raise ConnectionError("database unavailable")
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda _task: False,
+        )
+
+
+def test_generation_retry_rejects_non_boolean_queue_outcome():
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
+            return {"status": "retry", "retry_count": 1}
+
+    with pytest.raises(TabularGenerationRetryUnavailable):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            queue=lambda _task: None,
+        )
+
+
+def test_generation_retry_rejects_attempt_cap_above_five():
+    class Service:
+        @staticmethod
+        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
+            raise AssertionError("service must not receive an invalid cap")
+
+    with pytest.raises(ValueError, match="at most 5"):
+        retry_tabular_structure_generation_task(
+            "generation-task",
+            task_service=Service,
+            max_attempts=6,
+        )
+
+
+def test_generation_attempt_claim_returns_false_for_duplicate_message():
+    class Service:
+        @staticmethod
+        def claim_generation_attempt(_task_id):
+            return {"status": "running"}
+
+    assert claim_tabular_structure_generation_attempt(
+        "generation-task", task_service=Service
+    ) is False
+
+
+def test_generation_attempt_claim_preserves_message_when_service_is_unavailable():
+    class Service:
+        @staticmethod
+        def claim_generation_attempt(_task_id):
+            raise ConnectionError("database unavailable")
+
+    with pytest.raises(TabularGenerationClaimUnavailable):
+        claim_tabular_structure_generation_attempt("generation-task", task_service=Service)
+
+
+def test_generation_retry_claim_requires_failed_state_and_returns_to_queued_state():
+    source = Path(runtime.__file__).parents[2] / "api" / "db" / "services" / "task_service.py"
+    service_source = source.read_text(encoding="utf-8")
+    method = service_source[service_source.index("def fail_generation_attempt_and_reserve_retry"):]
+    assert "with DB.atomic()" in method
+    assert "retryable" in method
+    assert "& (cls.model.progress > 0)" in method
+    assert "& (cls.model.progress < 1)" in method
+    assert "progress=0.0" in method
 
 
 def _task(task_id, progress, *, parser_id="table"):

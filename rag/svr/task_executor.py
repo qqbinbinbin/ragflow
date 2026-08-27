@@ -1422,7 +1422,24 @@ async def do_handle_task(task):
     if task_type == "tabular_generation":
         task_id = task["id"]
         try:
-            from rag.app.tabular_structure_runtime import run_tabular_structure_generation_job
+            from rag.app.tabular_structure_runtime import (
+                TabularGenerationRetryUnavailable,
+                claim_tabular_structure_generation_attempt,
+            )
+
+            claimed = claim_tabular_structure_generation_attempt(task_id)
+        except Exception:
+            logging.exception("Unable to claim tabular generation task=%s", task_id)
+            raise
+        if not claimed:
+            logging.info("Skipping duplicate or terminal tabular generation task=%s", task_id)
+            return
+        try:
+            from rag.app.tabular_structure_runtime import (
+                _generation_progress,
+                retry_tabular_structure_generation_task,
+                run_tabular_structure_generation_job,
+            )
 
             bucket, name = File2DocumentService.get_storage_address(doc_id=task["doc_id"])
             binary = await get_storage_binary(bucket, name)
@@ -1432,7 +1449,7 @@ async def do_handle_task(task):
                 binary,
                 progress_callback=lambda progress, message: TaskService.update_generation_progress(
                     task_id,
-                    progress=progress,
+                    progress=_generation_progress(progress),
                     message=message,
                 ),
                 cancel_check=lambda: has_canceled(task_id),
@@ -1444,17 +1461,25 @@ async def do_handle_task(task):
                     message="Tabular structure generation active.",
                 )
             else:
+                failure_code = result.get("safe_error_code", "tabular_generation_failed")
+                if not retry_tabular_structure_generation_task(task_id, failure_code=failure_code):
+                    if failure_code not in {"source_changed", "invalid_generation_task", "task_cancelled"}:
+                        TaskService.update_generation_progress(
+                            task_id,
+                            progress=-1.0,
+                            message=failure_code,
+                        )
+        except TabularGenerationRetryUnavailable:
+            raise
+        except Exception as error:
+            from rag.app.tabular_structure_runtime import retry_tabular_structure_generation_task
+
+            if not retry_tabular_structure_generation_task(task_id):
                 TaskService.update_generation_progress(
                     task_id,
                     progress=-1.0,
-                    message=result.get("safe_error_code", "tabular_generation_failed"),
+                    message=error.__class__.__name__.lower(),
                 )
-        except Exception as error:
-            TaskService.update_generation_progress(
-                task_id,
-                progress=-1.0,
-                message=error.__class__.__name__.lower(),
-            )
             logging.exception("Tabular structure generation task failed for doc=%s", task.get("doc_id"))
         return
 
@@ -1802,6 +1827,7 @@ async def handle_task():
     task_type = task["task_type"]
     pipeline_task_type = TASK_TYPE_TO_PIPELINE_TASK_TYPE.get(task_type, PipelineTaskType.PARSE) or PipelineTaskType.PARSE
     task_id = task["id"]
+    ack_message = True
     try:
         CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
         run_mode = os.environ.get("TE_RUN_MODE", "0")
@@ -1823,17 +1849,27 @@ async def handle_task():
         CURRENT_TASKS.pop(task_id, None)
         logging.info(f"handle_task canceled for task {task_id}: {getattr(e, 'msg', str(e))}")
     except Exception as e:
+        generation_delivery_unavailable = (
+            task_type == "tabular_generation"
+            and e.__class__.__name__ in {
+                "TabularGenerationClaimUnavailable",
+                "TabularGenerationRetryUnavailable",
+            }
+        )
+        if generation_delivery_unavailable:
+            ack_message = False
         FAILED_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
-        try:
-            err_msg = str(e)
-            while isinstance(e, exceptiongroup.ExceptionGroup):
-                e = e.exceptions[0]
-                err_msg += " -- " + str(e)
-            set_progress(task_id, prog=-1, msg=f"[Exception]: {err_msg}")
-        except Exception as e:
-            logging.exception(f"[Exception]: {str(e)}")
-            pass
+        if not generation_delivery_unavailable:
+            try:
+                err_msg = str(e)
+                while isinstance(e, exceptiongroup.ExceptionGroup):
+                    e = e.exceptions[0]
+                    err_msg += " -- " + str(e)
+                set_progress(task_id, prog=-1, msg=f"[Exception]: {err_msg}")
+            except Exception as e:
+                logging.exception(f"[Exception]: {str(e)}")
+                pass
         logging.exception(f"handle_task got exception for task {json.dumps(task)}")
     finally:
         if not task.get("dataflow_id", "") and task_type != "tabular_generation":
@@ -1848,7 +1884,8 @@ async def handle_task():
             )
             get_recording_context().save_func_return_value("PipelineOperationLogService.record_pipeline_operation", ret)
 
-    redis_msg.ack()
+    if ack_message:
+        redis_msg.ack()
 
 
 async def get_server_ip() -> str:

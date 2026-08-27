@@ -39,6 +39,9 @@ CANVAS_DEBUG_DOC_ID = "dataflow_x"
 GRAPH_RAPTOR_FAKE_DOC_ID = "graph_raptor_x"
 TASK_MAX_LOG_LENGTH = int(os.environ.get("TASK_MAX_LOG_LENGTH", 3000))  # TEXT MAX is 64 KiB bytes!
 DOC_CHUNKING_COUNTER_TTL_SECONDS = 7 * 24 * 3600
+TABULAR_GENERATION_RUNNING_PROGRESS = 0.000001
+TABULAR_GENERATION_MAX_ATTEMPTS = 5
+TABULAR_GENERATION_STALE_SECONDS = 60 * 60 * 3
 
 
 def _doc_chunking_pending_key(doc_id: str) -> str:
@@ -181,6 +184,28 @@ class TaskService(CommonService):
 
     @classmethod
     @DB.connection_context()
+    def find_or_insert_generation_task(cls, task: dict, *, source_sha256: str | None = None):
+        """Atomically deduplicate and insert a structure-generation task."""
+        with DB.lock("tabular_generation_enqueue", -1):
+            query = (
+                cls.model.select()
+                .where(
+                    cls.model.doc_id == task["doc_id"],
+                    cls.model.task_type == "tabular_generation",
+                    cls.model.progress >= 0,
+                    cls.model.progress < 1,
+                )
+                .order_by(cls.model.create_time.desc())
+            )
+            if source_sha256:
+                query = query.where(cls.model.digest == source_sha256)
+            existing = query.first()
+            if existing is not None:
+                return {"created": False, "task": existing.to_dict()}
+            return {"created": True, "task": cls.insert_generation_task(task)}
+
+    @classmethod
+    @DB.connection_context()
     def insert_generation_task(cls, task: dict):
         """Persist a generation task using the existing Task table contract."""
         fields = {
@@ -207,16 +232,76 @@ class TaskService(CommonService):
     @DB.connection_context()
     def update_generation_progress(cls, task_id: str, *, progress: float, message: str = "") -> None:
         """Update only a generation task; ordinary document status is untouched."""
-        task = cls.model.get_or_none(cls.model.id == task_id)
-        if task is None:
-            return
-        values = {"progress": progress}
-        if message:
-            values["progress_msg"] = trim_header_by_lines(
-                (task.progress_msg or "") + "\n" + message,
-                TASK_MAX_LOG_LENGTH,
+        with DB.lock("tabular_generation_progress", -1):
+            task = cls.model.get_or_none(
+                (cls.model.id == task_id)
+                & (cls.model.task_type == "tabular_generation")
             )
-        cls.model.update(**values).where(cls.model.id == task_id).execute()
+            if task is None:
+                return
+            next_progress = progress
+            if task.progress >= 1 or (task.progress < 0 and progress < 1):
+                next_progress = task.progress
+            elif progress < task.progress:
+                next_progress = task.progress
+            values = {"progress": next_progress}
+            if message:
+                values["progress_msg"] = trim_header_by_lines(
+                    (task.progress_msg or "") + "\n" + message,
+                    TASK_MAX_LOG_LENGTH,
+                )
+            cls.model.update(**values).where(
+                (cls.model.id == task_id)
+                & (cls.model.task_type == "tabular_generation")
+            ).execute()
+
+    @classmethod
+    @DB.connection_context()
+    def claim_generation_attempt(cls, task_id: str) -> dict | None:
+        """Atomically claim one queued generation message for execution.
+
+        A tiny positive progress value represents a running generation. It is
+        intentionally below normal UI precision and keeps the existing Task
+        lifecycle contract without adding a second task-state column.
+        """
+        with DB.lock("tabular_generation_attempt", -1):
+            task = cls.model.get_or_none(
+                (cls.model.id == task_id)
+                & (cls.model.task_type == "tabular_generation")
+            )
+            if task is None:
+                return None
+            if task.progress == 0:
+                updated = cls.model.update(
+                    progress=TABULAR_GENERATION_RUNNING_PROGRESS,
+                ).where(
+                    (cls.model.id == task_id)
+                    & (cls.model.task_type == "tabular_generation")
+                    & (cls.model.progress == 0)
+                ).execute()
+                if updated == 1:
+                    return {"status": "claimed"}
+            if 0 < task.progress < 1:
+                if task.update_time is None or (
+                    current_timestamp() - task.update_time > TABULAR_GENERATION_STALE_SECONDS * 1000
+                ):
+                    updated = cls.model.update(
+                        progress=TABULAR_GENERATION_RUNNING_PROGRESS,
+                        progress_msg=trim_header_by_lines(
+                            (task.progress_msg or "") + "\nRecovering stale tabular structure generation attempt.",
+                            TASK_MAX_LOG_LENGTH,
+                        ),
+                    ).where(
+                        (cls.model.id == task_id)
+                        & (cls.model.task_type == "tabular_generation")
+                        & (cls.model.progress > 0)
+                        & (cls.model.progress < 1)
+                        & (cls.model.update_time == task.update_time)
+                    ).execute()
+                    if updated == 1:
+                        return {"status": "claimed", "recovered": True}
+                return {"status": "running"}
+            return {"status": "terminal", "progress": task.progress}
 
     @classmethod
     @DB.connection_context()
@@ -236,6 +321,100 @@ class TaskService(CommonService):
             (cls.model.id == task_id)
             & (cls.model.task_type == "tabular_generation")
         ).execute()
+
+    @classmethod
+    @DB.connection_context()
+    def fail_generation_attempt_and_reserve_retry(
+        cls,
+        task_id: str,
+        *,
+        message: str,
+        max_attempts: int,
+        retryable: bool,
+    ) -> dict | None:
+        """Atomically finish an attempt and reserve its next retry, if any.
+
+        The task never passes through a durable ``failed`` state before a
+        retry is reserved. This closes the window where a redelivered Redis
+        message could observe a failed task and be acknowledged as terminal.
+        """
+        if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= TABULAR_GENERATION_MAX_ATTEMPTS:
+            raise ValueError("max_attempts must be a positive integer at most 5")
+        if not isinstance(retryable, bool):
+            raise ValueError("retryable must be a boolean")
+        with DB.lock("tabular_generation_attempt", -1):
+            with DB.atomic():
+                task = cls.model.get_or_none(
+                    (cls.model.id == task_id)
+                    & (cls.model.task_type == "tabular_generation")
+                )
+                if task is None or not 0 < task.progress < 1:
+                    return None
+                progress_msg = trim_header_by_lines(
+                    (task.progress_msg or "") + "\n" + message,
+                    TASK_MAX_LOG_LENGTH,
+                )
+                if retryable and task.retry_count < max_attempts - 1:
+                    retry_count = task.retry_count + 1
+                    progress_msg = trim_header_by_lines(
+                        progress_msg + f"\nRetrying tabular structure generation ({retry_count}/{max_attempts}).",
+                        TASK_MAX_LOG_LENGTH,
+                    )
+                    updated = cls.model.update(
+                        progress=0.0,
+                        retry_count=retry_count,
+                        progress_msg=progress_msg,
+                    ).where(
+                        (cls.model.id == task_id)
+                        & (cls.model.task_type == "tabular_generation")
+                        & (cls.model.progress > 0)
+                        & (cls.model.progress < 1)
+                    ).execute()
+                    if updated != 1:
+                        return None
+                    return {"status": "retry", "retry_count": retry_count}
+
+                updated = cls.model.update(
+                    progress=-1.0,
+                    progress_msg=progress_msg,
+                ).where(
+                    (cls.model.id == task_id)
+                    & (cls.model.task_type == "tabular_generation")
+                    & (cls.model.progress > 0)
+                    & (cls.model.progress < 1)
+                ).execute()
+                if updated != 1:
+                    return None
+                return {"status": "failed", "retry_count": task.retry_count}
+
+    @classmethod
+    @DB.connection_context()
+    def fail_generation_retry_delivery(cls, task_id: str, *, message: str) -> bool:
+        """Close a retry that the queue explicitly reported as undelivered."""
+        with DB.lock("tabular_generation_attempt", -1):
+            with DB.atomic():
+                task = cls.model.select(
+                    cls.model.progress_msg,
+                ).where(
+                    (cls.model.id == task_id)
+                    & (cls.model.task_type == "tabular_generation")
+                    & (cls.model.progress == 0)
+                ).first()
+                if task is None:
+                    return False
+                progress_msg = trim_header_by_lines(
+                    (task.progress_msg or "") + "\n" + message,
+                    TASK_MAX_LOG_LENGTH,
+                )
+                updated = cls.model.update(
+                    progress=-1.0,
+                    progress_msg=progress_msg,
+                ).where(
+                    (cls.model.id == task_id)
+                    & (cls.model.task_type == "tabular_generation")
+                    & (cls.model.progress == 0)
+                ).execute()
+                return updated == 1
 
     @classmethod
     @DB.connection_context()
@@ -327,6 +506,7 @@ class TaskService(CommonService):
             cls.model.progress,
             cls.model.progress_msg,
             cls.model.digest,
+            cls.model.retry_count,
             Document.kb_id,
             Document.parser_id,
             Document.parser_config,

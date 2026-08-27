@@ -19,6 +19,27 @@ from rag.app.tabular_structure import (
 TABULAR_STRUCTURE_GENERATION_TASK_TYPE = "tabular_generation"
 TABULAR_GENERATION_CHECKPOINT_VERSION = "tabular-generation-checkpoint/v1"
 TABULAR_GENERATION_SHEET_BUDGET_SECONDS = 120
+TABULAR_GENERATION_MAX_ATTEMPTS = 5
+TABULAR_GENERATION_NON_RETRYABLE_ERRORS = frozenset(
+    {
+        "source_changed",
+        "invalid_generation_task",
+        "task_cancelled",
+    }
+)
+
+
+class TabularGenerationClaimUnavailable(RuntimeError):
+    """The worker could not determine ownership of a generation message."""
+
+
+class TabularGenerationRetryUnavailable(RuntimeError):
+    """The worker could not durably transition a failed generation attempt."""
+
+
+def _generation_progress(progress: float) -> float:
+    """Keep completion reserved for the post-activation worker update."""
+    return min(float(progress), 0.999999)
 
 
 def is_complete_tabular_parse(current_task: dict[str, Any], tasks: list[dict[str, Any]] | None) -> bool:
@@ -249,16 +270,6 @@ def enqueue_tabular_structure_generation(
     ):
         raise ValueError("source SHA-256 is invalid")
     task_service = task_service or _generation_task_service()
-    task = task_service.find_ongoing_generation_task(
-        document_id=document_id,
-        source_sha256=source_sha256,
-    )
-    if task is not None:
-        return {
-            "status": "queued",
-            "task_id": task["id"],
-            "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
-        }
     task = {
         "id": uuid.uuid4().hex,
         "doc_id": document_id,
@@ -273,11 +284,21 @@ def enqueue_tabular_structure_generation(
         "digest": source_sha256 or "source-pending",
         "progress_msg": "Tabular structure generation queued.",
     }
-    inserted = task_service.insert_generation_task(task)
-    if isinstance(inserted, dict):
-        # The Task table stores only task lifecycle fields. Keep the scoped
-        # queue payload as the source of tenant/dataset/document identity.
-        task = {**task, **inserted}
+    outcome = task_service.find_or_insert_generation_task(
+        task,
+        source_sha256=source_sha256,
+    )
+    existing = outcome.get("task") if isinstance(outcome, dict) else None
+    if existing is not None and not outcome.get("created", False):
+        task = {**task, **existing}
+        return {
+            "status": "queued",
+            "task_id": task["id"],
+            "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
+        }
+    if isinstance(existing, dict):
+        task = {**task, **existing}
+
     if queue is None:
         from common import settings
         from rag.utils.redis_conn import REDIS_CONN
@@ -297,6 +318,71 @@ def enqueue_tabular_structure_generation(
         "task_id": task["id"],
         "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
     }
+
+
+def retry_tabular_structure_generation_task(
+    task_id: str,
+    *,
+    task_service=None,
+    queue: Callable[[dict[str, Any]], Any] | None = None,
+    max_attempts: int = TABULAR_GENERATION_MAX_ATTEMPTS,
+    failure_code: str | None = None,
+) -> bool:
+    """Requeue a recoverable generation failure within the total-attempt cap."""
+    task_service = task_service or _generation_task_service()
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= TABULAR_GENERATION_MAX_ATTEMPTS:
+        raise ValueError("max_attempts must be a positive integer at most 5")
+    retryable = failure_code not in TABULAR_GENERATION_NON_RETRYABLE_ERRORS
+    try:
+        outcome = task_service.fail_generation_attempt_and_reserve_retry(
+            task_id,
+            message=failure_code or "tabular_generation_failed",
+            max_attempts=max_attempts,
+            retryable=retryable,
+        )
+    except Exception as error:
+        logging.exception("Unable to claim tabular generation retry task=%s", task_id)
+        raise TabularGenerationRetryUnavailable(task_id) from error
+    if not isinstance(outcome, dict):
+        raise TabularGenerationRetryUnavailable(task_id)
+    if outcome.get("status") != "retry":
+        return False
+    if queue is None:
+        from common import settings
+        from rag.utils.redis_conn import REDIS_CONN
+
+        queue = lambda message: REDIS_CONN.queue_product(  # noqa: E731
+            settings.get_svr_queue_name(0, "common"),
+            message=message,
+        )
+    try:
+        queued = queue({"id": task_id, "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE})
+    except Exception as error:
+        raise TabularGenerationRetryUnavailable(task_id) from error
+    if queued is False:
+        try:
+            closed = task_service.fail_generation_retry_delivery(
+                task_id,
+                message="Tabular structure generation retry could not be queued.",
+            )
+        except Exception as error:
+            raise TabularGenerationRetryUnavailable(task_id) from error
+        if not closed:
+            raise TabularGenerationRetryUnavailable(task_id)
+        return False
+    if queued is not True:
+        raise TabularGenerationRetryUnavailable(task_id)
+    return True
+
+
+def claim_tabular_structure_generation_attempt(task_id: str, *, task_service=None) -> bool:
+    """Claim a queued generation message, preserving it on service failure."""
+    task_service = task_service or _generation_task_service()
+    try:
+        claim = task_service.claim_generation_attempt(task_id)
+    except Exception as error:
+        raise TabularGenerationClaimUnavailable(task_id) from error
+    return isinstance(claim, dict) and claim.get("status") == "claimed"
 
 
 def run_tabular_structure_generation_job(
@@ -324,6 +410,12 @@ def run_tabular_structure_generation_job(
     dataset_id = task["kb_id"]
     document_id = task["doc_id"]
     source_sha256 = hashlib.sha256(binary).hexdigest()
+    expected_source_sha256 = task.get("digest")
+    if expected_source_sha256 and expected_source_sha256 != "source-pending" and expected_source_sha256 != source_sha256:
+        return {
+            "status": "failed",
+            "safe_error_code": "source_changed",
+        }
     generation_ref = structure_generation_ref(document_id, binary)
 
     if service is None:
@@ -392,7 +484,7 @@ def run_tabular_structure_generation_job(
             if checkpoint is None:
                 if progress_callback is not None:
                     progress_callback(
-                        (sheet_ordinal - 1) / sheet_count,
+                        _generation_progress((sheet_ordinal - 1) / sheet_count),
                         f"Building worksheet {sheet_ordinal}/{sheet_count}.",
                     )
                 started = time.monotonic()
@@ -438,7 +530,7 @@ def run_tabular_structure_generation_job(
             projections.append(sheet_projection)
             if progress_callback is not None:
                 progress_callback(
-                    sheet_ordinal / sheet_count,
+                    _generation_progress(sheet_ordinal / sheet_count),
                     f"Worksheet {sheet_ordinal}/{sheet_count} complete.",
                 )
 
