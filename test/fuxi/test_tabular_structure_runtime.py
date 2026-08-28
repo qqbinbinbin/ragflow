@@ -53,6 +53,30 @@ def test_generation_enqueue_returns_without_reading_or_building_source(monkeypat
     assert [entry[0] for entry in calls] == ["find_or_insert", "queue"]
 
 
+def test_generation_enqueue_returns_source_bound_generation_reference(monkeypatch):
+    source = b"workbook"
+    source_sha256 = hashlib.sha256(source).hexdigest()
+
+    class Service:
+        @staticmethod
+        def find_or_insert_generation_task(task, *, source_sha256):
+            return {"created": True, "task": {**task, "digest": source_sha256}}
+
+    result = enqueue_tabular_structure_generation(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="workbook.xlsx",
+        source_sha256=source_sha256,
+        task_service=Service,
+        queue=lambda _task: True,
+    )
+
+    assert result["status"] == "queued"
+    assert result["source_sha256"] == source_sha256
+    assert "producer_generation_ref" not in result
+
+
 def test_generation_enqueue_reuses_the_existing_atomic_task_without_requeueing():
     calls = []
 
@@ -193,9 +217,10 @@ def test_generation_job_skips_completed_sheet_checkpoints_and_does_not_activate_
         source_context_provider=lambda _binary: {"workbook": Workbook()},
     )
 
-    assert result["status"] == "active"
+    assert result["status"] == "shadow"
     assert {2} in calls
-    assert calls[-1] == "activate"
+    assert calls[-1] == "shadow"
+    assert "activate" not in calls
 
 
 def test_generation_progress_never_reports_complete_before_activation():
@@ -260,7 +285,7 @@ def test_generation_progress_never_reports_complete_before_activation():
         progress_callback=lambda value, _message: progress.append(value),
     )
 
-    assert result["status"] == "active"
+    assert result["status"] == "shadow"
     assert progress
     assert max(progress) < 1.0
 
@@ -504,13 +529,13 @@ def test_generation_job_retry_reuses_completed_checkpoints_after_sheet_failure()
     )
 
     assert first["status"] == "failed"
-    assert second["status"] == "active"
+    assert second["status"] == "shadow"
     assert [entry for entry in calls if isinstance(entry, tuple)] == [
         ("build", 1),
         ("build", 2),
         ("build", 2),
     ]
-    assert calls[-1] == "activate"
+    assert calls[-1] == "shadow"
 
 
 def test_generation_job_rejects_a_sheet_count_that_could_skip_real_sheets():

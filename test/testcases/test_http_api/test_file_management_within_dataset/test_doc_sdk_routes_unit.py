@@ -1053,6 +1053,41 @@ class TestDocRoutesUnit:
         }
         assert len(calls) == 2
 
+    def test_structure_generation_queue_returns_pending_without_building(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        calls = []
+
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1", parser_id="table", name="anonymous.xlsx")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+        monkeypatch.setattr(module.File2DocumentService, "get_storage_address", lambda **_kwargs: ("source-bucket", "source-object"))
+        monkeypatch.setattr(module.settings.STORAGE_IMPL, "get", lambda *_args: b"workbook")
+        monkeypatch.setattr(
+            module,
+            "_enqueue_tabular_structure_generation",
+            lambda **kwargs: calls.append(kwargs) or {
+                "status": "pending",
+                "task_id": "task-1",
+                "producer_generation_ref": "generation-1",
+                "source_sha256": "a" * 64,
+            },
+        )
+
+        result = _run(_route_core(module.queue_tabular_structure_generation)("tenant-1", "ds-1", "doc-1"))
+
+        assert result["code"] == 0
+        assert result["data"] == {
+            "status": "pending",
+            "producer_generation_ref": "generation-1",
+            "source_sha256": "a" * 64,
+            "producer_schema_version": "table-producer/v6",
+            "projection_version": "tabular-structure-projection/v6",
+            "structure_algorithm_version": "region-producer/v22",
+            "enumeration_rule_version": "enumeration-rules/v9",
+            "task_id": "task-1",
+        }
+        assert calls[0]["binary"] == b"workbook"
+
     def test_structure_generation_activate_and_restore_require_compare_and_swap_refs(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
         calls = []

@@ -16,6 +16,7 @@
 import base64
 import binascii
 import datetime
+import hashlib
 import json
 import logging
 import re
@@ -105,6 +106,29 @@ def _build_tabular_structure_shadow_from_source(**kwargs):
     from rag.app.tabular_structure_runtime import build_tabular_structure_shadow_from_source
 
     return build_tabular_structure_shadow_from_source(**kwargs)
+
+
+def _enqueue_tabular_structure_generation(**kwargs):
+    from rag.app.tabular_structure_runtime import (
+        enqueue_tabular_structure_generation,
+        structure_generation_ref,
+    )
+
+    binary = kwargs.pop("binary")
+    source_sha256 = hashlib.sha256(binary).hexdigest()
+    result = enqueue_tabular_structure_generation(
+        source_sha256=source_sha256,
+        **kwargs,
+    )
+    return {
+        **result,
+        "status": "pending",
+        "producer_generation_ref": structure_generation_ref(
+            kwargs["document_id"],
+            binary,
+        ),
+        "source_sha256": source_sha256,
+    }
 
 
 async def _expected_active_generation_ref(*, required: bool):
@@ -343,6 +367,52 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
                 "enumeration_rule_version": manifest["enumeration_rule_version"],
             })
         return get_result(data=safe_result)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations/queue", methods=["POST"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def queue_tabular_structure_generation(tenant_id, dataset_id, document_id):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    docs = DocumentService.query(id=document_id, kb_id=dataset_id)
+    document = docs[0]
+    if str(getattr(document, "parser_id", "")).lower() != "table":
+        reason = "provider_capability_unavailable"
+        return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+    try:
+        source_bucket, source_object = File2DocumentService.get_storage_address(doc_id=document_id)
+        binary = await thread_pool_exec(settings.STORAGE_IMPL.get, source_bucket, source_object)
+        result = await thread_pool_exec(
+            _enqueue_tabular_structure_generation,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            filename=document.name,
+            binary=binary,
+        )
+        from rag.app.tabular_structure import (
+            ENUMERATION_RULE_VERSION,
+            PRODUCER_SCHEMA_VERSION,
+            PROJECTION_VERSION,
+            STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+        )
+
+        return get_result(
+            data={
+                "status": result["status"],
+                "producer_generation_ref": result["producer_generation_ref"],
+                "source_sha256": result["source_sha256"],
+                "producer_schema_version": PRODUCER_SCHEMA_VERSION,
+                "projection_version": PROJECTION_VERSION,
+                "structure_algorithm_version": STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+                "enumeration_rule_version": ENUMERATION_RULE_VERSION,
+                "task_id": result["task_id"],
+            }
+        )
     except Exception as error:
         return _tabular_structure_error_response(error)
 

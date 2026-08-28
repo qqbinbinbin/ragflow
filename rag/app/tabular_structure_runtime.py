@@ -317,6 +317,7 @@ def enqueue_tabular_structure_generation(
         "status": "queued",
         "task_id": task["id"],
         "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
+        "source_sha256": source_sha256,
     }
 
 
@@ -400,7 +401,7 @@ def run_tabular_structure_generation_job(
     cancel_check: Callable[[], bool] | None = None,
     sheet_budget_seconds: int = TABULAR_GENERATION_SHEET_BUDGET_SECONDS,
 ) -> dict[str, Any]:
-    """Resume a source-bound Sheet job and activate only after full assembly."""
+    """Resume a source-bound Sheet job and publish a shadow for CAS activation."""
     if not isinstance(binary, bytes) or not binary:
         return {"status": "failed", "safe_error_code": "source_unavailable"}
     required = ("tenant_id", "kb_id", "doc_id", "name")
@@ -549,24 +550,8 @@ def run_tabular_structure_generation_job(
         )
         if cancelled():
             return cancelled_result()
-        expected_active = _active_generation_ref(
-            service,
-            tenant_id=tenant_id,
-            dataset_id=dataset_id,
-            document_id=document_id,
-        )
-        if cancelled():
-            return cancelled_result()
-        service.activate_generation(
-            storage,
-            tenant_id=tenant_id,
-            dataset_id=dataset_id,
-            document_id=document_id,
-            producer_generation_ref=generation_ref,
-            expected_active_generation_ref=expected_active,
-        )
         return {
-            "status": "active",
+            "status": "shadow",
             "producer_generation_ref": generation_ref,
             "row_count": len(projection.get("rows", [])),
         }

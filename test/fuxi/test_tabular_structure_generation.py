@@ -418,7 +418,7 @@ def test_generation_claim_unavailability_does_not_ack_the_redis_message():
     assert "except TabularGenerationRetryUnavailable:" in source
 
 
-def test_both_generation_workers_do_not_mark_task_complete_before_activation():
+def test_both_generation_workers_mark_complete_only_after_shadow_publication():
     runtime_source = (REPO_ROOT / "rag" / "app" / "tabular_structure_runtime.py").read_text(encoding="utf-8")
     assert "def _generation_progress" in runtime_source
     assert "min(float(progress), 0.999999)" in runtime_source
@@ -426,7 +426,10 @@ def test_both_generation_workers_do_not_mark_task_complete_before_activation():
         REPO_ROOT / "rag" / "svr" / "task_executor.py",
         REPO_ROOT / "rag" / "svr" / "task_executor_refactor" / "task_handler.py",
     ):
-        assert "_generation_progress" in relative_path.read_text(encoding="utf-8")
+        source = relative_path.read_text(encoding="utf-8")
+        assert "_generation_progress" in source
+        assert 'result.get("status") in {"shadow", "active"}' in source
+        assert "Tabular structure generation shadow ready." in source
 
 
 def test_retry_claim_must_confirm_the_failed_to_queued_update():

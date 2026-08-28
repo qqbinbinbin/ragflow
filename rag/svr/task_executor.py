@@ -1454,11 +1454,15 @@ async def do_handle_task(task):
                 ),
                 cancel_check=lambda: has_canceled(task_id),
             )
-            if result.get("status") == "active":
+            if result.get("status") in {"shadow", "active"}:
                 TaskService.update_generation_progress(
                     task_id,
                     progress=1.0,
-                    message="Tabular structure generation active.",
+                    message=(
+                        "Tabular structure generation shadow ready."
+                        if result.get("status") == "shadow"
+                        else "Tabular structure generation active."
+                    ),
                 )
             else:
                 failure_code = result.get("safe_error_code", "tabular_generation_failed")
