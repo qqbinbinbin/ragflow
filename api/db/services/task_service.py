@@ -232,12 +232,16 @@ class TaskService(CommonService):
             message_before = task.progress_msg or ""
             is_unknown = TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER in message_before
             is_claimed = TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER in message_before
+            stale_before = current_timestamp() - TABULAR_GENERATION_DELIVERY_RECONCILIATION_STALE_SECONDS * 1000
             claimed_is_stale = is_claimed and (
                 task.update_time is None
                 or current_timestamp() - task.update_time
                 > TABULAR_GENERATION_DELIVERY_RECONCILIATION_STALE_SECONDS * 1000
             )
-            if not is_unknown and not claimed_is_stale:
+            unmarked_is_stale = not is_unknown and not is_claimed and (
+                task.update_time is not None and task.update_time <= stale_before
+            )
+            if not is_unknown and not claimed_is_stale and not unmarked_is_stale:
                 return False
             message = (task.progress_msg or "").replace(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER, "")
             if TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER not in message:
@@ -251,6 +255,10 @@ class TaskService(CommonService):
                     & (
                         cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER)
                         | cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER)
+                        | (
+                            cls.model.update_time.is_null(False)
+                            & (cls.model.update_time <= stale_before)
+                        )
                     )
                 )
                 .execute()
