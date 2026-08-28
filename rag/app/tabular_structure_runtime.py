@@ -101,7 +101,36 @@ def structure_generation_ref(
         raise ValueError("document_id is required")
     if not isinstance(binary, bytes) or not binary:
         raise ValueError("complete source bytes are required")
-    source_sha256 = hashlib.sha256(binary).hexdigest()
+    return _structure_generation_ref_from_source_sha256(
+        document_id,
+        hashlib.sha256(binary).hexdigest(),
+        adr044_conversion_receipt=adr044_conversion_receipt,
+    )
+
+
+def _structure_generation_ref_from_source_sha256(
+    document_id: str,
+    source_sha256: str,
+    *,
+    adr044_conversion_receipt: dict[str, str] | None = None,
+) -> str:
+    """Derive identity from an already verified source snapshot."""
+    from rag.app.tabular_structure import (
+        ENUMERATION_RULE_VERSION,
+        PRODUCER_SCHEMA_VERSION,
+        PROJECTION_VERSION,
+        STRUCTURE_PRODUCER_ALGORITHM_VERSION,
+        _validate_adr044_conversion_receipt,
+    )
+
+    if not isinstance(document_id, str) or not document_id:
+        raise ValueError("document_id is required")
+    if (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in source_sha256)
+    ):
+        raise ValueError("source SHA-256 is invalid")
     has_adr044_receipt = _validate_adr044_conversion_receipt(
         adr044_conversion_receipt,
         source_sha256,
@@ -120,6 +149,11 @@ def structure_generation_ref(
             f"{document_id}:{source_identity}",
         )
     )
+
+
+def structure_generation_ref_from_source_sha256(document_id: str, source_sha256: str) -> str:
+    """Expose the source-bound identity for queue responses and tests."""
+    return _structure_generation_ref_from_source_sha256(document_id, source_sha256)
 
 
 def _generation_task_service():
@@ -253,7 +287,7 @@ def enqueue_tabular_structure_generation(
     dataset_id: str,
     document_id: str,
     filename: str,
-    source_sha256: str | None = None,
+    source_sha256: str,
     task_service=None,
     queue: Callable[[dict[str, Any]], Any] | None = None,
 ) -> dict[str, Any]:
@@ -265,8 +299,10 @@ def enqueue_tabular_structure_generation(
     """
     if not all(isinstance(value, str) and value for value in (tenant_id, dataset_id, document_id, filename)):
         raise ValueError("generation task scope is required")
-    if source_sha256 is not None and (
-        not isinstance(source_sha256, str) or not source_sha256 or len(source_sha256) != 64
+    if (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in source_sha256)
     ):
         raise ValueError("source SHA-256 is invalid")
     task_service = task_service or _generation_task_service()
@@ -281,7 +317,7 @@ def enqueue_tabular_structure_generation(
         "progress": 0.0,
         "from_page": 0,
         "to_page": 0,
-        "digest": source_sha256 or "source-pending",
+        "digest": source_sha256,
         "progress_msg": "Tabular structure generation queued.",
     }
     outcome = task_service.find_or_insert_generation_task(
@@ -291,11 +327,13 @@ def enqueue_tabular_structure_generation(
     existing = outcome.get("task") if isinstance(outcome, dict) else None
     if existing is not None and not outcome.get("created", False):
         task = {**task, **existing}
-        return {
-            "status": "queued",
-            "task_id": task["id"],
-            "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
-        }
+        if task.get("progress") != 0:
+            return {
+                "status": "queued",
+                "task_id": task["id"],
+                "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
+                "source_sha256": task.get("digest", source_sha256),
+            }
     if isinstance(existing, dict):
         task = {**task, **existing}
 
@@ -307,12 +345,21 @@ def enqueue_tabular_structure_generation(
             settings.get_svr_queue_name(0, "common"),
             message=message,
         )
-    if queue(task) is False:
+    try:
+        queued = queue(task)
+    except Exception:
+        # Keep the durable queued task for a later idempotent reconciliation.
+        # The delivery outcome is unknown, so do not mark it failed.
+        logging.exception("Tabular structure generation queue outcome unknown task=%s", task["id"])
+        raise
+    if queued is False:
         task_service.fail_generation_task(
             task["id"],
             message="Tabular structure generation could not be queued.",
         )
         raise RuntimeError("tabular structure generation task could not be queued")
+    if queued is not True:
+        raise RuntimeError("tabular structure generation queue outcome unknown")
     return {
         "status": "queued",
         "task_id": task["id"],
@@ -802,4 +849,5 @@ __all__ = [
     "publish_tabular_structure_from_source",
     "publish_tabular_structure_generation",
     "structure_generation_ref",
+    "structure_generation_ref_from_source_sha256",
 ]

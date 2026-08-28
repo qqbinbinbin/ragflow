@@ -1792,7 +1792,7 @@ async def do_handle_task(task):
                 await asyncio.to_thread(
                     enqueue_tabular_structure_generation_if_complete,
                     completed_task,
-                    await get_storage_binary(*File2DocumentService.get_storage_address(doc_id=task_doc_id)),
+                    binary,
                     task_list_provider=TaskService.get_tasks,
                 )
             except Exception:

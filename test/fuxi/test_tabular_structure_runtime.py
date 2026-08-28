@@ -21,6 +21,7 @@ from rag.app.tabular_structure_runtime import (
     publish_tabular_structure_generation,
     retry_tabular_structure_generation_task,
     structure_generation_ref,
+    structure_generation_ref_from_source_sha256,
 )
 
 
@@ -45,7 +46,7 @@ def test_generation_enqueue_returns_without_reading_or_building_source(monkeypat
         filename="workbook.xlsx",
         source_sha256="a" * 64,
         task_service=Service,
-        queue=lambda task: calls.append(("queue", task)),
+        queue=lambda task: calls.append(("queue", task)) or True,
     )
 
     assert result["status"] == "queued"
@@ -77,6 +78,19 @@ def test_generation_enqueue_returns_source_bound_generation_reference(monkeypatc
     assert "producer_generation_ref" not in result
 
 
+def test_generation_enqueue_requires_a_source_snapshot():
+    with pytest.raises(ValueError, match="source SHA-256 is invalid"):
+        enqueue_tabular_structure_generation(
+            tenant_id="tenant-1",
+            dataset_id="dataset-1",
+            document_id="document-1",
+            filename="workbook.xlsx",
+            source_sha256=None,
+            task_service=object(),
+            queue=lambda _task: True,
+        )
+
+
 def test_generation_enqueue_reuses_the_existing_atomic_task_without_requeueing():
     calls = []
 
@@ -93,11 +107,37 @@ def test_generation_enqueue_reuses_the_existing_atomic_task_without_requeueing()
         filename="workbook.xlsx",
         source_sha256="a" * 64,
         task_service=Service,
-        queue=lambda task: calls.append(("queue", task)),
+        queue=lambda task: calls.append(("queue", task)) or True,
     )
 
     assert result["task_id"] == "existing-task"
-    assert [entry[0] for entry in calls] == ["find_or_insert"]
+    assert [entry[0] for entry in calls] == ["find_or_insert", "queue"]
+
+
+def test_generation_enqueue_keeps_unknown_delivery_recoverable():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def find_or_insert_generation_task(task, *, source_sha256):
+            calls.append(("find_or_insert", task, source_sha256))
+            return {"created": True, "task": task}
+
+    def queue(_task):
+        calls.append(("queue",))
+        raise TimeoutError("delivery outcome unknown")
+
+    with pytest.raises(TimeoutError, match="delivery outcome unknown"):
+        enqueue_tabular_structure_generation(
+            tenant_id="tenant-1",
+            dataset_id="dataset-1",
+            document_id="document-1",
+            filename="workbook.xlsx",
+            source_sha256="a" * 64,
+            task_service=Service,
+            queue=queue,
+        )
+    assert [entry[0] for entry in calls] == ["find_or_insert", "queue"]
 
 
 def test_generation_enqueue_closes_the_task_when_queue_delivery_fails():
@@ -221,6 +261,14 @@ def test_generation_job_skips_completed_sheet_checkpoints_and_does_not_activate_
     assert {2} in calls
     assert calls[-1] == "shadow"
     assert "activate" not in calls
+
+
+def test_generation_ref_from_source_snapshot_matches_worker_bytes_ref():
+    source = b"workbook"
+    digest = hashlib.sha256(source).hexdigest()
+    assert structure_generation_ref_from_source_sha256("document-1", digest) == structure_generation_ref(
+        "document-1", source
+    )
 
 
 def test_generation_progress_never_reports_complete_before_activation():
@@ -1377,6 +1425,41 @@ def test_task_executor_never_downgrades_to_the_legacy_mutation_path():
     assert "unsupported TE_RUN_MODE" in method_source
     assert "do_handle_task(task)" not in method_source
     assert method_source.count("TaskManager.run_refactored_task(") == 1
+
+
+def test_ordinary_table_completion_reuses_the_already_loaded_source_for_generation_queue():
+    repo_root = Path(runtime.__file__).parents[2]
+    source = (repo_root / "rag" / "svr" / "task_executor.py").read_text(encoding="utf-8")
+    module = ast.parse(source)
+    handle_task = next(
+        node for node in module.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "do_handle_task"
+    )
+    method_source = ast.get_source_segment(source, handle_task)
+    assert method_source is not None
+    hook = method_source[method_source.index("enqueue_tabular_structure_generation_if_complete"):]
+    assert "await get_storage_binary" not in hook
+    assert "                    binary," in hook
+
+
+def test_refactored_table_completion_reuses_the_already_loaded_source_for_generation_queue():
+    repo_root = Path(runtime.__file__).parents[2]
+    source = (repo_root / "rag" / "svr" / "task_executor_refactor" / "task_handler.py").read_text(encoding="utf-8")
+    module = ast.parse(source)
+    handler = next(
+        node for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "TaskHandler"
+    )
+    method = next(
+        node for node in handler.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and "enqueue_tabular_structure_generation_if_complete" in (ast.get_source_segment(source, node) or "")
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    hook = method_source[method_source.index("enqueue_tabular_structure_generation_if_complete"):]
+    assert "self._get_storage_binary" not in hook
+    assert "                    binary," in hook
 
 
 def test_generation_task_is_not_recorded_as_a_parse_operation():

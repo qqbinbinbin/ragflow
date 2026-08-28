@@ -111,11 +111,10 @@ def _build_tabular_structure_shadow_from_source(**kwargs):
 def _enqueue_tabular_structure_generation(**kwargs):
     from rag.app.tabular_structure_runtime import (
         enqueue_tabular_structure_generation,
-        structure_generation_ref,
+        structure_generation_ref_from_source_sha256,
     )
 
-    binary = kwargs.pop("binary")
-    source_sha256 = hashlib.sha256(binary).hexdigest()
+    source_sha256 = kwargs.pop("source_sha256")
     result = enqueue_tabular_structure_generation(
         source_sha256=source_sha256,
         **kwargs,
@@ -123,9 +122,9 @@ def _enqueue_tabular_structure_generation(**kwargs):
     return {
         **result,
         "status": "pending",
-        "producer_generation_ref": structure_generation_ref(
+        "producer_generation_ref": structure_generation_ref_from_source_sha256(
             kwargs["document_id"],
-            binary,
+            source_sha256,
         ),
         "source_sha256": source_sha256,
     }
@@ -384,15 +383,23 @@ async def queue_tabular_structure_generation(tenant_id, dataset_id, document_id)
         reason = "provider_capability_unavailable"
         return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
     try:
-        source_bucket, source_object = File2DocumentService.get_storage_address(doc_id=document_id)
-        binary = await thread_pool_exec(settings.STORAGE_IMPL.get, source_bucket, source_object)
+        payload = await get_request_json()
+        source_sha256 = payload.get("source_sha256") if isinstance(payload, dict) else None
+        if (
+            not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in source_sha256)
+        ):
+            reason = "invalid_structure_request"
+            return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+        source_sha256 = source_sha256.lower()
         result = await thread_pool_exec(
             _enqueue_tabular_structure_generation,
             tenant_id=owner_tenant_id,
             dataset_id=dataset_id,
             document_id=document_id,
             filename=document.name,
-            binary=binary,
+            source_sha256=source_sha256,
         )
         from rag.app.tabular_structure import (
             ENUMERATION_RULE_VERSION,

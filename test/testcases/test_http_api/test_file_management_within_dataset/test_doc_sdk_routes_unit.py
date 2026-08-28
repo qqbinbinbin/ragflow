@@ -1061,7 +1061,12 @@ class TestDocRoutesUnit:
         monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1", parser_id="table", name="anonymous.xlsx")])
         monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
         monkeypatch.setattr(module.File2DocumentService, "get_storage_address", lambda **_kwargs: ("source-bucket", "source-object"))
-        monkeypatch.setattr(module.settings.STORAGE_IMPL, "get", lambda *_args: b"workbook")
+        monkeypatch.setattr(
+            module.settings.STORAGE_IMPL,
+            "get",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("queue route must not read the source")),
+        )
+        monkeypatch.setattr(module, "get_request_json", lambda: _AwaitableValue({"source_sha256": "a" * 64}))
         monkeypatch.setattr(
             module,
             "_enqueue_tabular_structure_generation",
@@ -1086,7 +1091,25 @@ class TestDocRoutesUnit:
             "enumeration_rule_version": "enumeration-rules/v9",
             "task_id": "task-1",
         }
-        assert calls[0]["binary"] == b"workbook"
+        assert calls[0]["source_sha256"] == "a" * 64
+        assert "binary" not in calls[0]
+
+    def test_structure_generation_queue_requires_source_snapshot_without_reading_storage(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1", parser_id="table", name="anonymous.xlsx")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+        monkeypatch.setattr(module, "get_request_json", lambda: _AwaitableValue({}))
+        monkeypatch.setattr(
+            module.settings.STORAGE_IMPL,
+            "get",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("invalid queue request must not read the source")),
+        )
+
+        result = _run(_route_core(module.queue_tabular_structure_generation)("tenant-1", "ds-1", "doc-1"))
+
+        assert result["code"] != 0
+        assert result["data"]["reason"] == "invalid_structure_request"
 
     def test_structure_generation_activate_and_restore_require_compare_and_swap_refs(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
