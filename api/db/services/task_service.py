@@ -669,9 +669,10 @@ class TaskService(CommonService):
                 cls.model.id == task_id,
                 cls.model.task_type == "tabular_generation",
             )
+            .dicts()
             .first()
         )
-        return task.to_dict() if task else None
+        return task if task else None
 
     @classmethod
     @DB.connection_context()
