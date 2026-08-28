@@ -268,6 +268,31 @@ def test_generation_delivery_reconciliation_requeues_unknown_tasks():
     assert [entry[0] for entry in calls] == ["list", "claim", "queue", "queued"]
 
 
+def test_generation_delivery_reconciliation_uses_stale_queued_window():
+    from api.db.services.task_service import TaskService
+
+    implementation = TaskService.list_generation_delivery_unknown_tasks.__func__
+    while hasattr(implementation, "__wrapped__"):
+        implementation = implementation.__wrapped__
+    source = Path(TaskService.__module__.replace(".", "/") + ".py")
+    source_text = source.read_text(encoding="utf-8")
+    source_tree = ast.parse(source_text)
+    method_source = ast.get_source_segment(
+        source_text,
+        next(
+            node
+            for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "list_generation_delivery_unknown_tasks"
+        ),
+    )
+    assert method_source is not None
+    assert "TABULAR_GENERATION_DELIVERY_RECONCILIATION_STALE_SECONDS" in method_source
+    assert "cls.model.update_time <= stale_before" in method_source
+    assert "cls.model.progress == 0" in method_source
+    assert implementation.__name__ == "list_generation_delivery_unknown_tasks"
+
+
 def test_generation_job_rejects_legacy_source_pending_tasks():
     result = run_tabular_structure_generation_job(
         {

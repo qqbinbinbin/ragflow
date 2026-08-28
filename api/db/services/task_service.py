@@ -188,9 +188,16 @@ class TaskService(CommonService):
     @classmethod
     @DB.connection_context()
     def list_generation_delivery_unknown_tasks(cls, *, limit: int = 20):
-        """Return source-bound generation tasks whose queue result is uncertain."""
+        """Return generation tasks whose queue delivery may need reconciliation.
+
+        A task inserted before the process failed can have no uncertainty
+        marker even though it was never published to Redis. Once its queued
+        timestamp is older than the reconciliation lease, it is safe to
+        redeliver through the same idempotent task-id path.
+        """
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("limit must be a positive integer")
+        stale_before = current_timestamp() - TABULAR_GENERATION_DELIVERY_RECONCILIATION_STALE_SECONDS * 1000
         return list(
             cls.model.select(cls.model.id, cls.model.task_type)
             .where(
@@ -199,6 +206,10 @@ class TaskService(CommonService):
                 & (
                     cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER)
                     | cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER)
+                    | (
+                        cls.model.update_time.is_null(False)
+                        & (cls.model.update_time <= stale_before)
+                    )
                 )
             )
             .order_by(cls.model.create_time.asc())
