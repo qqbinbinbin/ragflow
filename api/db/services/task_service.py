@@ -340,8 +340,8 @@ class TaskService(CommonService):
             if key in task
         }
         fields["task_type"] = "tabular_generation"
-        record = cls.insert(**fields)
-        return record.to_dict()
+        cls.insert(**fields)
+        return fields
 
     @classmethod
     @DB.connection_context()

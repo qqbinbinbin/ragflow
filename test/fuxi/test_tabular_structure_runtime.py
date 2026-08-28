@@ -27,6 +27,38 @@ from rag.app.tabular_structure_runtime import (
 )
 
 
+def test_generation_task_insert_returns_task_fields_after_peewee_insert_count():
+    from api.db.services.task_service import TaskService
+
+    implementation = TaskService.insert_generation_task.__func__
+    while hasattr(implementation, "__wrapped__"):
+        implementation = implementation.__wrapped__
+
+    inserted = {}
+
+    class Service(TaskService):
+        insert = staticmethod(lambda **fields: inserted.update(fields) or 1)
+
+    task = {
+        "id": "generation-task-1",
+        "doc_id": "document-1",
+        "from_page": 0,
+        "to_page": 0,
+        "task_type": "tabular_generation",
+        "priority": 0,
+        "begin_at": None,
+        "progress": 0.0,
+        "progress_msg": "queued",
+        "digest": "a" * 64,
+    }
+
+    result = implementation(Service, task)
+
+    assert result == inserted
+    assert inserted["id"] == "generation-task-1"
+    assert inserted["task_type"] == "tabular_generation"
+
+
 def test_generation_enqueue_returns_without_reading_or_building_source(monkeypatch):
     calls = []
 
