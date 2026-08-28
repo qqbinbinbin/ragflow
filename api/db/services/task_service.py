@@ -42,6 +42,9 @@ DOC_CHUNKING_COUNTER_TTL_SECONDS = 7 * 24 * 3600
 TABULAR_GENERATION_RUNNING_PROGRESS = 0.000001
 TABULAR_GENERATION_MAX_ATTEMPTS = 5
 TABULAR_GENERATION_STALE_SECONDS = 60 * 60 * 3
+TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER = "Tabular structure generation delivery outcome unknown."
+TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER = "Tabular structure generation delivery reconciliation claimed."
+TABULAR_GENERATION_DELIVERY_RECONCILIATION_STALE_SECONDS = 300
 
 
 def _doc_chunking_pending_key(doc_id: str) -> str:
@@ -181,6 +184,118 @@ class TaskService(CommonService):
             query = query.where(cls.model.digest == source_sha256)
         task = query.first()
         return task.to_dict() if task else None
+
+    @classmethod
+    @DB.connection_context()
+    def list_generation_delivery_unknown_tasks(cls, *, limit: int = 20):
+        """Return source-bound generation tasks whose queue result is uncertain."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        return list(
+            cls.model.select(cls.model.id, cls.model.task_type)
+            .where(
+                (cls.model.task_type == "tabular_generation")
+                & (cls.model.progress == 0)
+                & (
+                    cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER)
+                    | cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER)
+                )
+            )
+            .order_by(cls.model.create_time.asc())
+            .limit(limit)
+            .dicts()
+        )
+
+    @classmethod
+    @DB.connection_context()
+    def claim_generation_delivery_reconciliation(cls, task_id: str) -> bool:
+        """Claim one uncertain delivery without claiming the generation attempt."""
+        with DB.lock("tabular_generation_delivery_reconciliation", -1):
+            task = cls.model.get_or_none(
+                (cls.model.id == task_id)
+                & (cls.model.task_type == "tabular_generation")
+                & (cls.model.progress == 0)
+            )
+            if task is None:
+                return False
+            message_before = task.progress_msg or ""
+            is_unknown = TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER in message_before
+            is_claimed = TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER in message_before
+            claimed_is_stale = is_claimed and (
+                task.update_time is None
+                or current_timestamp() - task.update_time
+                > TABULAR_GENERATION_DELIVERY_RECONCILIATION_STALE_SECONDS * 1000
+            )
+            if not is_unknown and not claimed_is_stale:
+                return False
+            message = (task.progress_msg or "").replace(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER, "")
+            if TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER not in message:
+                message = trim_header_by_lines(message + "\n" + TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER, TASK_MAX_LOG_LENGTH)
+            return (
+                cls.model.update(progress_msg=message)
+                .where(
+                    (cls.model.id == task_id)
+                    & (cls.model.task_type == "tabular_generation")
+                    & (cls.model.progress == 0)
+                    & (
+                        cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER)
+                        | cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER)
+                    )
+                )
+                .execute()
+                == 1
+            )
+
+    @classmethod
+    @DB.connection_context()
+    def mark_generation_delivery_unknown(cls, task_id: str, *, message: str | None = None) -> bool:
+        """Keep an uncertain queue outcome eligible for automatic reconciliation."""
+        with DB.lock("tabular_generation_delivery_reconciliation", -1):
+            task = cls.model.get_or_none(
+                (cls.model.id == task_id)
+                & (cls.model.task_type == "tabular_generation")
+                & (cls.model.progress == 0)
+            )
+            if task is None:
+                return False
+            progress_msg = task.progress_msg or ""
+            progress_msg = progress_msg.replace(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER, "")
+            if TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER not in progress_msg:
+                progress_msg = trim_header_by_lines(
+                    progress_msg + "\n" + (message or TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER),
+                    TASK_MAX_LOG_LENGTH,
+                )
+            return (
+                cls.model.update(progress_msg=progress_msg)
+                .where(
+                    (cls.model.id == task_id)
+                    & (cls.model.task_type == "tabular_generation")
+                    & (cls.model.progress == 0)
+                )
+                .execute()
+                == 1
+            )
+
+    @classmethod
+    @DB.connection_context()
+    def mark_generation_delivery_queued(cls, task_id: str) -> bool:
+        """Remove an uncertain-delivery marker after queue acknowledgement."""
+        with DB.lock("tabular_generation_delivery_reconciliation", -1):
+            task = cls.model.get_or_none(
+                (cls.model.id == task_id)
+                & (cls.model.task_type == "tabular_generation")
+                & (cls.model.progress == 0)
+            )
+            if task is None:
+                return False
+            progress_msg = (task.progress_msg or "").replace(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER, "")
+            progress_msg = progress_msg.replace(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER, "")
+            updated = cls.model.update(progress_msg=progress_msg).where(
+                (cls.model.id == task_id)
+                & (cls.model.task_type == "tabular_generation")
+                & (cls.model.progress == 0)
+            ).execute()
+            return updated == 1
 
     @classmethod
     @DB.connection_context()

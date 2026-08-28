@@ -1917,6 +1917,14 @@ async def report_status():
     redis_lock = RedisDistributedLock("clean_task_executor", lock_value=CONSUMER_NAME, timeout=60)
 
     while True:
+        try:
+            from rag.app.tabular_structure_runtime import reconcile_tabular_structure_generation_tasks
+
+            reconciled = await asyncio.to_thread(reconcile_tabular_structure_generation_tasks)
+            if reconciled:
+                logging.info("Reconciled %s uncertain tabular generation deliveries", reconciled)
+        except Exception:
+            logging.exception("Failed to reconcile uncertain tabular generation deliveries")
         now = datetime.now()
         now_ts = now.timestamp()
 

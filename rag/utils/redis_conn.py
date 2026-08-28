@@ -401,16 +401,21 @@ class RedisDB:
             self.__open__()
         return False
 
+    def queue_product_outcome(self, queue, message) -> str:
+        """Return ``queued`` or ``unknown`` without guessing after XADD errors."""
+        try:
+            payload = {"message": json.dumps(message)}
+            self.REDIS.xadd(queue, payload)
+            return "queued"
+        except Exception as e:
+            # XADD may have committed before the client lost its response.
+            logging.exception("RedisDB.queue_product_outcome " + str(queue) + " got exception: " + str(e))
+            self.__open__()
+            return "unknown"
+
     def queue_product(self, queue, message) -> bool:
-        for _ in range(3):
-            try:
-                payload = {"message": json.dumps(message)}
-                self.REDIS.xadd(queue, payload)
-                return True
-            except Exception as e:
-                logging.exception("RedisDB.queue_product " + str(queue) + " got exception: " + str(e))
-                self.__open__()
-        return False
+        """Compatibility wrapper for callers that only need success/failure."""
+        return self.queue_product_outcome(queue, message) == "queued"
 
     def queue_consumer(self, queue_name, group_name, consumer_name, msg_id=b">") -> RedisMsg:
         """https://redis.io/docs/latest/commands/xreadgroup/"""

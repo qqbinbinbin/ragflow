@@ -2,6 +2,7 @@ import hashlib
 import ast
 import uuid
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from rag.app.tabular_structure_runtime import (
     publish_tabular_structure_from_source,
     publish_tabular_structure_generation,
     retry_tabular_structure_generation_task,
+    reconcile_tabular_structure_generation_tasks,
     structure_generation_ref,
     structure_generation_ref_from_source_sha256,
 )
@@ -52,6 +54,44 @@ def test_generation_enqueue_returns_without_reading_or_building_source(monkeypat
     assert result["status"] == "queued"
     assert result["task_type"] == TABULAR_STRUCTURE_GENERATION_TASK_TYPE
     assert [entry[0] for entry in calls] == ["find_or_insert", "queue"]
+
+
+def test_generation_enqueue_uses_outcome_aware_default_queue(monkeypatch):
+    calls = []
+
+    class Service:
+        @staticmethod
+        def find_or_insert_generation_task(task, *, source_sha256):
+            return {"created": True, "task": task}
+
+        @staticmethod
+        def mark_generation_delivery_queued(task_id):
+            calls.append(("queued", task_id))
+            return True
+
+    class Redis:
+        @staticmethod
+        def queue_product_outcome(queue, *, message):
+            calls.append(("queue", queue, message))
+            return "queued"
+
+        def queue_product(self, *_args, **_kwargs):
+            raise AssertionError("tabular generation must use the outcome-aware queue")
+
+    monkeypatch.setitem(sys.modules, "rag.utils.redis_conn", type("RedisModule", (), {"REDIS_CONN": Redis()})())
+    monkeypatch.setattr("common.settings.get_svr_queue_name", lambda *_args, **_kwargs: "common")
+
+    result = enqueue_tabular_structure_generation(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="workbook.xlsx",
+        source_sha256="a" * 64,
+        task_service=Service,
+    )
+
+    assert result["status"] == "queued"
+    assert [entry[0] for entry in calls] == ["queue", "queued"]
 
 
 def test_generation_enqueue_returns_source_bound_generation_reference(monkeypatch):
@@ -123,11 +163,15 @@ def test_generation_enqueue_keeps_unknown_delivery_recoverable():
             calls.append(("find_or_insert", task, source_sha256))
             return {"created": True, "task": task}
 
+        @staticmethod
+        def mark_generation_delivery_unknown(task_id, *, message):
+            calls.append(("unknown", task_id, message))
+
     def queue(_task):
         calls.append(("queue",))
         raise TimeoutError("delivery outcome unknown")
 
-    with pytest.raises(TimeoutError, match="delivery outcome unknown"):
+    with pytest.raises(TabularGenerationRetryUnavailable):
         enqueue_tabular_structure_generation(
             tenant_id="tenant-1",
             dataset_id="dataset-1",
@@ -137,10 +181,10 @@ def test_generation_enqueue_keeps_unknown_delivery_recoverable():
             task_service=Service,
             queue=queue,
         )
-    assert [entry[0] for entry in calls] == ["find_or_insert", "queue"]
+    assert [entry[0] for entry in calls] == ["find_or_insert", "queue", "unknown"]
 
 
-def test_generation_enqueue_closes_the_task_when_queue_delivery_fails():
+def test_generation_enqueue_keeps_a_false_delivery_outcome_recoverable():
     calls = []
 
     class Service:
@@ -149,10 +193,10 @@ def test_generation_enqueue_closes_the_task_when_queue_delivery_fails():
             return {"created": True, "task": {**task, "digest": source_sha256}}
 
         @staticmethod
-        def fail_generation_task(task_id, *, message):
+        def mark_generation_delivery_unknown(task_id, *, message):
             calls.append((task_id, message))
 
-    with pytest.raises(RuntimeError, match="could not be queued"):
+    with pytest.raises(TabularGenerationRetryUnavailable):
         enqueue_tabular_structure_generation(
             tenant_id="tenant-1",
             dataset_id="dataset-1",
@@ -164,7 +208,51 @@ def test_generation_enqueue_closes_the_task_when_queue_delivery_fails():
         )
 
     assert len(calls) == 1
-    assert calls[0][1] == "Tabular structure generation could not be queued."
+    assert calls[0][1] == "Tabular structure generation delivery outcome unknown. queue returned no delivery confirmation"
+
+
+def test_generation_delivery_reconciliation_requeues_unknown_tasks():
+    calls = []
+
+    class Service:
+        @staticmethod
+        def list_generation_delivery_unknown_tasks(*, limit):
+            calls.append(("list", limit))
+            return [{"id": "generation-task", "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE}]
+
+        @staticmethod
+        def claim_generation_delivery_reconciliation(task_id):
+            calls.append(("claim", task_id))
+            return True
+
+        @staticmethod
+        def mark_generation_delivery_queued(task_id):
+            calls.append(("queued", task_id))
+
+    assert reconcile_tabular_structure_generation_tasks(
+        task_service=Service,
+        queue=lambda task: calls.append(("queue", task)) or True,
+    ) == 1
+    assert [entry[0] for entry in calls] == ["list", "claim", "queue", "queued"]
+
+
+def test_generation_job_rejects_legacy_source_pending_tasks():
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+            "digest": "source-pending",
+        },
+        b"workbook",
+        service=object(),
+    )
+
+    assert result == {
+        "status": "failed",
+        "safe_error_code": "legacy_generation_task_requires_source_snapshot",
+    }
 
 
 def test_generation_job_skips_completed_sheet_checkpoints_and_does_not_activate_early():
@@ -698,8 +786,8 @@ def test_generation_retry_preserves_delivery_when_retry_queue_returns_false():
             return {"status": "retry", "retry_count": 1}
 
         @staticmethod
-        def fail_generation_retry_delivery(*_args, **_kwargs):
-            return False
+        def mark_generation_delivery_unknown(task_id, *, message):
+            calls.append(("unknown", task_id, message))
 
     with pytest.raises(TabularGenerationRetryUnavailable):
         retry_tabular_structure_generation_task(
@@ -707,50 +795,8 @@ def test_generation_retry_preserves_delivery_when_retry_queue_returns_false():
             task_service=Service,
             queue=lambda _task: False,
         )
-    assert calls == [
-        ("transition", "generation-task", "tabular_generation_failed", TABULAR_GENERATION_MAX_ATTEMPTS, True),
-    ]
-
-
-def test_generation_retry_accepts_ack_only_after_explicit_false_is_finalized():
-    calls = []
-
-    class Service:
-        @staticmethod
-        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
-            return {"status": "retry", "retry_count": 1}
-
-        @staticmethod
-        def fail_generation_retry_delivery(task_id, *, message):
-            calls.append((task_id, message))
-            return True
-
-    assert retry_tabular_structure_generation_task(
-        "generation-task",
-        task_service=Service,
-        queue=lambda _task: False,
-    ) is False
-    assert calls == [
-        ("generation-task", "Tabular structure generation retry could not be queued."),
-    ]
-
-
-def test_generation_retry_keeps_delivery_unknown_when_explicit_false_cannot_be_finalized():
-    class Service:
-        @staticmethod
-        def fail_generation_attempt_and_reserve_retry(*_args, **_kwargs):
-            return {"status": "retry", "retry_count": 1}
-
-        @staticmethod
-        def fail_generation_retry_delivery(*_args, **_kwargs):
-            return False
-
-    with pytest.raises(TabularGenerationRetryUnavailable):
-        retry_tabular_structure_generation_task(
-            "generation-task",
-            task_service=Service,
-            queue=lambda _task: False,
-        )
+    assert calls[0][0] == "transition"
+    assert calls[1][0] == "unknown"
 
 
 def test_generation_retry_preserves_delivery_when_retry_queue_raises():

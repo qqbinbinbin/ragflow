@@ -23,10 +23,12 @@ TABULAR_GENERATION_MAX_ATTEMPTS = 5
 TABULAR_GENERATION_NON_RETRYABLE_ERRORS = frozenset(
     {
         "source_changed",
+        "legacy_generation_task_requires_source_snapshot",
         "invalid_generation_task",
         "task_cancelled",
     }
 )
+TABULAR_GENERATION_DELIVERY_UNKNOWN_MESSAGE = "Tabular structure generation delivery outcome unknown."
 
 
 class TabularGenerationClaimUnavailable(RuntimeError):
@@ -341,25 +343,20 @@ def enqueue_tabular_structure_generation(
         from common import settings
         from rag.utils.redis_conn import REDIS_CONN
 
-        queue = lambda message: REDIS_CONN.queue_product(  # noqa: E731
+        queue = lambda message: REDIS_CONN.queue_product_outcome(  # noqa: E731
             settings.get_svr_queue_name(0, "common"),
             message=message,
         )
     try:
         queued = queue(task)
-    except Exception:
-        # Keep the durable queued task for a later idempotent reconciliation.
-        # The delivery outcome is unknown, so do not mark it failed.
+    except Exception as error:
+        _mark_generation_delivery_unknown(task_service, task["id"], str(error))
         logging.exception("Tabular structure generation queue outcome unknown task=%s", task["id"])
-        raise
-    if queued is False:
-        task_service.fail_generation_task(
-            task["id"],
-            message="Tabular structure generation could not be queued.",
-        )
-        raise RuntimeError("tabular structure generation task could not be queued")
-    if queued is not True:
-        raise RuntimeError("tabular structure generation queue outcome unknown")
+        raise TabularGenerationRetryUnavailable(task["id"]) from error
+    if queued is not True and queued != "queued":
+        _mark_generation_delivery_unknown(task_service, task["id"], "queue returned no delivery confirmation")
+        raise TabularGenerationRetryUnavailable(task["id"])
+    _mark_generation_delivery_queued(task_service, task["id"])
     return {
         "status": "queued",
         "task_id": task["id"],
@@ -399,7 +396,7 @@ def retry_tabular_structure_generation_task(
         from common import settings
         from rag.utils.redis_conn import REDIS_CONN
 
-        queue = lambda message: REDIS_CONN.queue_product(  # noqa: E731
+        queue = lambda message: REDIS_CONN.queue_product_outcome(  # noqa: E731
             settings.get_svr_queue_name(0, "common"),
             message=message,
         )
@@ -407,20 +404,73 @@ def retry_tabular_structure_generation_task(
         queued = queue({"id": task_id, "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE})
     except Exception as error:
         raise TabularGenerationRetryUnavailable(task_id) from error
-    if queued is False:
-        try:
-            closed = task_service.fail_generation_retry_delivery(
-                task_id,
-                message="Tabular structure generation retry could not be queued.",
-            )
-        except Exception as error:
-            raise TabularGenerationRetryUnavailable(task_id) from error
-        if not closed:
-            raise TabularGenerationRetryUnavailable(task_id)
-        return False
-    if queued is not True:
+    if queued is False or queued == "unknown":
+        _mark_generation_delivery_unknown(task_service, task_id, "retry queue returned no delivery confirmation")
         raise TabularGenerationRetryUnavailable(task_id)
+    if queued is not True and queued != "queued":
+        raise TabularGenerationRetryUnavailable(task_id)
+    _mark_generation_delivery_queued(task_service, task_id)
     return True
+
+
+def _mark_generation_delivery_unknown(task_service, task_id: str, detail: str = "") -> None:
+    message = TABULAR_GENERATION_DELIVERY_UNKNOWN_MESSAGE
+    if detail:
+        message = f"{message} {detail}"
+    try:
+        updated = task_service.mark_generation_delivery_unknown(task_id, message=message)
+    except Exception as error:
+        raise TabularGenerationRetryUnavailable(task_id) from error
+    if not updated:
+        raise TabularGenerationRetryUnavailable(task_id)
+
+
+def _mark_generation_delivery_queued(task_service, task_id: str) -> None:
+    marker = getattr(task_service, "mark_generation_delivery_queued", None)
+    if marker is None:
+        return
+    try:
+        if not marker(task_id):
+            raise TabularGenerationRetryUnavailable(task_id)
+    except TabularGenerationRetryUnavailable:
+        raise
+    except Exception as error:
+        raise TabularGenerationRetryUnavailable(task_id) from error
+
+
+def reconcile_tabular_structure_generation_tasks(
+    *, task_service=None, queue: Callable[[dict[str, Any]], Any] | None = None, limit: int = 20
+) -> int:
+    """Re-deliver uncertain generation tasks from the worker's durable recovery tick."""
+    task_service = task_service or _generation_task_service()
+    tasks = task_service.list_generation_delivery_unknown_tasks(limit=limit)
+    if queue is None:
+        from common import settings
+        from rag.utils.redis_conn import REDIS_CONN
+
+        queue = lambda message: REDIS_CONN.queue_product_outcome(  # noqa: E731
+            settings.get_svr_queue_name(0, "common"),
+            message=message,
+        )
+    recovered = 0
+    for task in tasks:
+        task_id = task.get("id") if isinstance(task, dict) else None
+        if not isinstance(task_id, str) or not task_service.claim_generation_delivery_reconciliation(task_id):
+            continue
+        try:
+            queued = queue({"id": task_id, "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE})
+        except Exception as error:
+            task_service.mark_generation_delivery_unknown(task_id, message=str(error))
+            continue
+        if queued is True or queued == "queued":
+            task_service.mark_generation_delivery_queued(task_id)
+            recovered += 1
+        else:
+            task_service.mark_generation_delivery_unknown(
+                task_id,
+                message="reconciliation delivery remains unknown",
+            )
+    return recovered
 
 
 def claim_tabular_structure_generation_attempt(task_id: str, *, task_service=None) -> bool:
@@ -459,7 +509,12 @@ def run_tabular_structure_generation_job(
     document_id = task["doc_id"]
     source_sha256 = hashlib.sha256(binary).hexdigest()
     expected_source_sha256 = task.get("digest")
-    if expected_source_sha256 and expected_source_sha256 != "source-pending" and expected_source_sha256 != source_sha256:
+    if expected_source_sha256 == "source-pending":
+        return {
+            "status": "failed",
+            "safe_error_code": "legacy_generation_task_requires_source_snapshot",
+        }
+    if expected_source_sha256 and expected_source_sha256 != source_sha256:
         return {
             "status": "failed",
             "safe_error_code": "source_changed",
@@ -848,6 +903,7 @@ __all__ = [
     "run_tabular_structure_generation_job",
     "publish_tabular_structure_from_source",
     "publish_tabular_structure_generation",
+    "reconcile_tabular_structure_generation_tasks",
     "structure_generation_ref",
     "structure_generation_ref_from_source_sha256",
 ]
