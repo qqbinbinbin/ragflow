@@ -648,7 +648,7 @@ class TaskService(CommonService):
             Document.type,
             Document.location,
             Document.size,
-            Knowledgebase.tenant_id,
+            Knowledgebase.tenant_id.alias("tenant_id"),
             Knowledgebase.language,
             Knowledgebase.embd_id,
             Knowledgebase.tenant_embd_id,

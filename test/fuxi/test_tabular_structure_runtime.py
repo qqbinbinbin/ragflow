@@ -335,6 +335,7 @@ def test_generation_task_read_preserves_joined_execution_context():
     assert method_source is not None
     assert ".dicts()" in method_source
     assert "return task.to_dict()" not in method_source
+    assert 'Knowledgebase.tenant_id.alias("tenant_id")' in method_source
     assert implementation.__name__ == "get_generation_task"
 
 
