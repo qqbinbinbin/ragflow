@@ -43,6 +43,7 @@ INIT_MODEL_PROVIDER_TABLES=0
 CONSUMER_NO_BEG=0
 CONSUMER_NO_END=0
 WORKERS=1
+TABULAR_WORKERS="${TABULAR_WORKERS:-2}"
 
 MCP_HOST="127.0.0.1"
 MCP_PORT=9382
@@ -235,6 +236,17 @@ function tabular_task_exe() {
     done
 }
 
+function start_tabular_workers() {
+    local host_id="$1"
+    if ! [[ "${TABULAR_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Invalid TABULAR_WORKERS: ${TABULAR_WORKERS}" >&2
+        exit 1
+    fi
+    for ((tabular_consumer_id = 0; tabular_consumer_id < TABULAR_WORKERS; tabular_consumer_id++)); do
+        tabular_task_exe "${tabular_consumer_id}" "${host_id}" &
+    done
+}
+
 function start_mcp_server() {
     echo "Starting MCP Server on ${MCP_HOST}:${MCP_PORT} with base URL ${MCP_BASE_URL}..."
     "$PY" "${MCP_SCRIPT_PATH}" \
@@ -391,7 +403,8 @@ if [[ "${ENABLE_TASKEXECUTOR}" -eq 1 ]]; then
     # Keep tabular generation out of the shared document-ingestion workers.
     if [[ "${API_PROXY_SCHEME}" == "hybrid" ]] || [[ "${API_PROXY_SCHEME}" == "python" ]]; then
         echo "Starting dedicated tabular generation task executor..."
-        tabular_task_exe "0" "${HOST_ID}" &
+        echo "Starting ${TABULAR_WORKERS} dedicated tabular generation task executor(s)..."
+        start_tabular_workers "${HOST_ID}"
     fi
 fi
 

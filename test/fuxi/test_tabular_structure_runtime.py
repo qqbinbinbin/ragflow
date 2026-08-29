@@ -9,6 +9,14 @@ import pytest
 
 import rag.app.tabular_structure as tabular_structure
 import rag.app.tabular_structure_runtime as runtime
+
+
+def test_entrypoint_supports_bounded_configurable_tabular_workers():
+    entrypoint = Path(__file__).parents[2] / "docker" / "entrypoint.sh"
+    source = entrypoint.read_text(encoding="utf-8")
+    assert 'TABULAR_WORKERS="${TABULAR_WORKERS:-2}"' in source
+    assert 'start_tabular_workers "${HOST_ID}"' in source
+    assert 'tabular_task_exe "${tabular_consumer_id}" "${host_id}" &' in source
 from rag.app.tabular_structure_runtime import (
     TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
     TABULAR_GENERATION_MAX_ATTEMPTS,
