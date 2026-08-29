@@ -202,7 +202,8 @@ class TaskService(CommonService):
             cls.model.select(cls.model.id, cls.model.task_type)
             .where(
                 (cls.model.task_type == "tabular_generation")
-                & (cls.model.progress == 0)
+                & (cls.model.progress >= 0)
+                & (cls.model.progress < 1)
                 & (
                     cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER)
                     | cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER)
@@ -225,7 +226,8 @@ class TaskService(CommonService):
             task = cls.model.get_or_none(
                 (cls.model.id == task_id)
                 & (cls.model.task_type == "tabular_generation")
-                & (cls.model.progress == 0)
+                & (cls.model.progress >= 0)
+                & (cls.model.progress < 1)
             )
             if task is None:
                 return False
@@ -241,7 +243,8 @@ class TaskService(CommonService):
             unmarked_is_stale = not is_unknown and not is_claimed and (
                 task.update_time is not None and task.update_time <= stale_before
             )
-            if not is_unknown and not claimed_is_stale and not unmarked_is_stale:
+            marked_is_queued = (is_unknown or is_claimed) and task.progress == 0
+            if not marked_is_queued and not claimed_is_stale and not unmarked_is_stale:
                 return False
             message = (task.progress_msg or "").replace(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER, "")
             if TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER not in message:
@@ -251,7 +254,8 @@ class TaskService(CommonService):
                 .where(
                     (cls.model.id == task_id)
                     & (cls.model.task_type == "tabular_generation")
-                    & (cls.model.progress == 0)
+                    & (cls.model.progress >= 0)
+                    & (cls.model.progress < 1)
                     & (
                         cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_UNKNOWN_MARKER)
                         | cls.model.progress_msg.contains(TABULAR_GENERATION_DELIVERY_CLAIMED_MARKER)

@@ -331,7 +331,8 @@ def test_generation_delivery_reconciliation_uses_stale_queued_window():
     assert method_source is not None
     assert "TABULAR_GENERATION_DELIVERY_RECONCILIATION_STALE_SECONDS" in method_source
     assert "cls.model.update_time <= stale_before" in method_source
-    assert "cls.model.progress == 0" in method_source
+    assert "cls.model.progress >= 0" in method_source
+    assert "cls.model.progress < 1" in method_source
     assert implementation.__name__ == "list_generation_delivery_unknown_tasks"
 
 
@@ -353,6 +354,7 @@ def test_generation_delivery_reconciliation_claim_accepts_stale_unmarked_tasks()
     method_source = ast.get_source_segment(source_text, method)
     assert method_source is not None
     assert "claimed_is_stale" in method_source
+    assert "task.progress == 0" in method_source
     assert "current_timestamp() - task.update_time" in method_source
     assert "cls.model.update_time <= stale_before" in method_source
     assert implementation.__name__ == "claim_generation_delivery_reconciliation"
