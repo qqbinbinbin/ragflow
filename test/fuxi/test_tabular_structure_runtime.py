@@ -555,7 +555,6 @@ def test_generation_job_keeps_a_sheet_that_exceeds_the_legacy_budget():
         projection_builder=lambda *_args, **_kwargs: projection(),
         sheet_count_provider=lambda *_args: 1,
         source_context_provider=lambda _binary: {"workbook": Workbook()},
-        sheet_budget_seconds=0,
     )
 
     assert result["status"] == "shadow"

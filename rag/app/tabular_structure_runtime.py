@@ -17,7 +17,6 @@ from rag.app.tabular_structure import (
 
 TABULAR_STRUCTURE_GENERATION_TASK_TYPE = "tabular_generation"
 TABULAR_GENERATION_CHECKPOINT_VERSION = "tabular-generation-checkpoint/v1"
-TABULAR_GENERATION_SHEET_BUDGET_SECONDS = 120
 TABULAR_GENERATION_MAX_ATTEMPTS = 5
 TABULAR_GENERATION_NON_RETRYABLE_ERRORS = frozenset(
     {
@@ -531,7 +530,6 @@ def run_tabular_structure_generation_job(
     source_context_provider: Callable[[bytes], dict[str, Any]] | None = None,
     progress_callback: Callable[[float, str], Any] | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    sheet_budget_seconds: int = TABULAR_GENERATION_SHEET_BUDGET_SECONDS,
 ) -> dict[str, Any]:
     """Resume a source-bound Sheet job and publish a shadow for CAS activation."""
     if not isinstance(binary, bytes) or not binary:
