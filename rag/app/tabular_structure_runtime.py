@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 import uuid
 from typing import Any, Callable
 
@@ -628,7 +627,6 @@ def run_tabular_structure_generation_job(
                         _generation_progress((sheet_ordinal - 1) / sheet_count),
                         f"Building worksheet {sheet_ordinal}/{sheet_count}.",
                     )
-                started = time.monotonic()
                 built = projection_builder(
                     task["name"],
                     binary,
@@ -641,8 +639,6 @@ def run_tabular_structure_generation_job(
                     projection, audit = built
                 else:
                     projection, audit = built, {}
-                if time.monotonic() - started > sheet_budget_seconds:
-                    raise TimeoutError(f"Sheet {sheet_ordinal} exceeded its generation budget")
                 if cancelled():
                     return cancelled_result()
                 checkpoint = {

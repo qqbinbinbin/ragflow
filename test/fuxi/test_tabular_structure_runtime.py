@@ -493,6 +493,73 @@ def test_generation_job_skips_completed_sheet_checkpoints_and_does_not_activate_
     assert result["status"] == "shadow"
     assert {2} in calls
     assert calls[-1] == "shadow"
+
+
+def test_generation_job_keeps_a_sheet_that_exceeds_the_legacy_budget():
+    """A slow Sheet remains resumable; the legacy budget is observational only."""
+    calls = []
+    generation_ref = structure_generation_ref("document-1", b"workbook")
+    source_sha256 = hashlib.sha256(b"workbook").hexdigest()
+
+    class Workbook:
+        sheetnames = ["Sheet 1"]
+
+    class Storage:
+        def __init__(self):
+            self.objects = {}
+
+        def obj_exist(self, _bucket, name, tenant_id=None):
+            return name in self.objects
+
+        def get(self, _bucket, name, tenant_id=None):
+            return self.objects[name]
+
+        def put(self, _bucket, name, payload, tenant_id=None):
+            self.objects[name] = payload
+            calls.append("checkpoint")
+
+    class Service:
+        class StructureSnapshotMissing(LookupError):
+            pass
+
+        @staticmethod
+        def get_active_generation(**_kwargs):
+            raise Service.StructureSnapshotMissing()
+
+        @staticmethod
+        def persist_shadow_generation(*_args, **_kwargs):
+            calls.append("shadow")
+
+    def projection():
+        return {
+            "version": "tabular-structure-projection/v6",
+            "producer_schema_version": "table-producer/v6",
+            "producer_generation_ref": generation_ref,
+            "structure_algorithm_version": "region-producer/v22",
+            "enumeration_rule_version": "enumeration-rules/v9",
+            "source_sha256": source_sha256,
+            "tables": [],
+            "rows": [],
+        }, {}
+
+    result = run_tabular_structure_generation_job(
+        {
+            "tenant_id": "tenant-1",
+            "kb_id": "dataset-1",
+            "doc_id": "document-1",
+            "name": "workbook.xlsx",
+        },
+        b"workbook",
+        storage=Storage(),
+        service=Service,
+        projection_builder=lambda *_args, **_kwargs: projection(),
+        sheet_count_provider=lambda *_args: 1,
+        source_context_provider=lambda _binary: {"workbook": Workbook()},
+        sheet_budget_seconds=0,
+    )
+
+    assert result["status"] == "shadow"
+    assert calls == ["checkpoint", "shadow"]
     assert "activate" not in calls
 
 
