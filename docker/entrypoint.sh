@@ -222,6 +222,19 @@ function task_exe() {
     done
 }
 
+function tabular_task_exe() {
+    local consumer_id="$1"
+    local host_id="$2"
+
+    JEMALLOC_PATH="$(pkg-config --variable=libdir jemalloc)/libjemalloc.so"
+    while true; do
+        LD_PRELOAD="$JEMALLOC_PATH" \
+        "$PY" rag/svr/task_executor.py -i "${host_id}_${consumer_id}" -t "tabular" &
+        wait;
+        sleep 1;
+    done
+}
+
 function start_mcp_server() {
     echo "Starting MCP Server on ${MCP_HOST}:${MCP_PORT} with base URL ${MCP_BASE_URL}..."
     "$PY" "${MCP_SCRIPT_PATH}" \
@@ -373,6 +386,12 @@ if [[ "${ENABLE_TASKEXECUTOR}" -eq 1 ]]; then
               done &
           fi
         done
+    fi
+
+    # Keep tabular generation out of the shared document-ingestion workers.
+    if [[ "${API_PROXY_SCHEME}" == "hybrid" ]] || [[ "${API_PROXY_SCHEME}" == "python" ]]; then
+        echo "Starting dedicated tabular generation task executor..."
+        tabular_task_exe "0" "${HOST_ID}" &
     fi
 fi
 

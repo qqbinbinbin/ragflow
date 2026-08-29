@@ -369,7 +369,7 @@ def enqueue_tabular_structure_generation(
         from rag.utils.redis_conn import REDIS_CONN
 
         queue = lambda message: REDIS_CONN.queue_product_outcome(  # noqa: E731
-            settings.get_svr_queue_name(0, "common"),
+            settings.get_svr_queue_name(0, "tabular"),
             message=message,
         )
     try:
@@ -431,7 +431,7 @@ def retry_tabular_structure_generation_task(
         from rag.utils.redis_conn import REDIS_CONN
 
         queue = lambda message: REDIS_CONN.queue_product_outcome(  # noqa: E731
-            settings.get_svr_queue_name(0, "common"),
+            settings.get_svr_queue_name(0, "tabular"),
             message=message,
         )
     try:
@@ -483,7 +483,7 @@ def reconcile_tabular_structure_generation_tasks(
         from rag.utils.redis_conn import REDIS_CONN
 
         queue = lambda message: REDIS_CONN.queue_product_outcome(  # noqa: E731
-            settings.get_svr_queue_name(0, "common"),
+            settings.get_svr_queue_name(0, "tabular"),
             message=message,
         )
     recovered = 0

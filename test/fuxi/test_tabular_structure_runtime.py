@@ -111,7 +111,7 @@ def test_generation_enqueue_uses_outcome_aware_default_queue(monkeypatch):
             raise AssertionError("tabular generation must use the outcome-aware queue")
 
     monkeypatch.setitem(sys.modules, "rag.utils.redis_conn", type("RedisModule", (), {"REDIS_CONN": Redis()})())
-    monkeypatch.setattr("common.settings.get_svr_queue_name", lambda *_args, **_kwargs: "common")
+    monkeypatch.setattr("common.settings.get_svr_queue_name", lambda *_args, **_kwargs: "tabular")
 
     result = enqueue_tabular_structure_generation(
         tenant_id="tenant-1",
@@ -124,6 +124,7 @@ def test_generation_enqueue_uses_outcome_aware_default_queue(monkeypatch):
 
     assert result["status"] == "queued"
     assert [entry[0] for entry in calls] == ["queue", "queued"]
+    assert calls[0][1] == "tabular"
 
 
 def test_generation_enqueue_returns_source_bound_generation_reference(monkeypatch):
