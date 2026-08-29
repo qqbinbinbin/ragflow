@@ -318,22 +318,30 @@ class TaskService(CommonService):
 
     @classmethod
     @DB.connection_context()
-    def find_or_insert_generation_task(cls, task: dict, *, source_sha256: str | None = None):
+    def find_or_insert_generation_task(
+        cls,
+        task: dict,
+        *,
+        source_sha256: str | None = None,
+        force_generation: bool = False,
+    ):
         """Atomically deduplicate and insert a structure-generation task."""
         with DB.lock("tabular_generation_enqueue", -1):
-            query = (
-                cls.model.select()
-                .where(
-                    cls.model.doc_id == task["doc_id"],
-                    cls.model.task_type == "tabular_generation",
-                    cls.model.progress >= 0,
-                    cls.model.progress < 1,
+            existing = None
+            if not force_generation:
+                query = (
+                    cls.model.select()
+                    .where(
+                        cls.model.doc_id == task["doc_id"],
+                        cls.model.task_type == "tabular_generation",
+                        cls.model.progress >= 0,
+                        cls.model.progress < 1,
+                    )
+                    .order_by(cls.model.create_time.desc())
                 )
-                .order_by(cls.model.create_time.desc())
-            )
-            if source_sha256:
-                query = query.where(cls.model.digest == source_sha256)
-            existing = query.first()
+                if source_sha256:
+                    query = query.where(cls.model.digest == source_sha256)
+                existing = query.first()
             if existing is not None:
                 return {"created": False, "task": existing.to_dict()}
             return {"created": True, "task": cls.insert_generation_task(task)}

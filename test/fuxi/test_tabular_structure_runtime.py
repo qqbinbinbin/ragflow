@@ -150,6 +150,48 @@ def test_generation_enqueue_returns_source_bound_generation_reference(monkeypatc
     assert "producer_generation_ref" not in result
 
 
+def test_force_generation_enqueue_creates_a_distinct_task_identity():
+    source_sha256 = hashlib.sha256(b"workbook").hexdigest()
+    queued = []
+
+    class Service:
+        @staticmethod
+        def find_or_insert_generation_task(task, *, source_sha256, force_generation=False):
+            queued.append(task)
+            return {"created": True, "task": task}
+
+    result = enqueue_tabular_structure_generation(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="workbook.xlsx",
+        source_sha256=source_sha256,
+        force_generation=True,
+        task_service=Service,
+        queue=lambda task: True,
+    )
+
+    assert result["status"] == "queued"
+    assert queued[0]["digest"].startswith("force:")
+    assert result["producer_generation_ref"] != structure_generation_ref(
+        "document-1", b"workbook"
+    )
+
+
+def test_force_generation_ref_is_stable_for_the_same_task():
+    source = b"workbook"
+    source_sha256 = hashlib.sha256(source).hexdigest()
+    first = runtime.structure_generation_ref_from_source_sha256(
+        "document-1", source_sha256, force_nonce="task-1"
+    )
+    second = runtime.structure_generation_ref_from_source_sha256(
+        "document-1", source_sha256, force_nonce="task-1"
+    )
+
+    assert first == second
+    assert first != structure_generation_ref("document-1", source)
+
+
 def test_generation_enqueue_requires_a_source_snapshot():
     with pytest.raises(ValueError, match="source SHA-256 is invalid"):
         enqueue_tabular_structure_generation(

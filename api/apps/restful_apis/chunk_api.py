@@ -115,17 +115,20 @@ def _enqueue_tabular_structure_generation(**kwargs):
     )
 
     source_sha256 = kwargs.pop("source_sha256")
+    force_generation = kwargs.pop("force_generation", False)
     result = enqueue_tabular_structure_generation(
         source_sha256=source_sha256,
+        force_generation=force_generation,
         **kwargs,
     )
     return {
         **result,
         "status": "pending",
-        "producer_generation_ref": structure_generation_ref_from_source_sha256(
-            kwargs["document_id"],
-            source_sha256,
-        ),
+        **({
+            "producer_generation_ref": structure_generation_ref_from_source_sha256(
+                kwargs["document_id"], source_sha256, force_nonce=result["task_id"]
+            )
+        } if force_generation else {}),
         "source_sha256": source_sha256,
     }
 
@@ -385,6 +388,7 @@ async def queue_tabular_structure_generation(tenant_id, dataset_id, document_id)
     try:
         payload = await get_request_json()
         source_sha256 = payload.get("source_sha256") if isinstance(payload, dict) else None
+        force_generation = payload.get("force") is True if isinstance(payload, dict) else False
         if (
             not isinstance(source_sha256, str)
             or len(source_sha256) != 64
@@ -400,6 +404,7 @@ async def queue_tabular_structure_generation(tenant_id, dataset_id, document_id)
             document_id=document_id,
             filename=document.name,
             source_sha256=source_sha256,
+            force_generation=force_generation,
         )
         from rag.app.tabular_structure import (
             ENUMERATION_RULE_VERSION,

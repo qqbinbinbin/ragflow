@@ -115,6 +115,7 @@ def _structure_generation_ref_from_source_sha256(
     source_sha256: str,
     *,
     adr044_conversion_receipt: dict[str, str] | None = None,
+    force_nonce: str | None = None,
 ) -> str:
     """Derive identity from an already verified source snapshot."""
     from rag.app.tabular_structure import (
@@ -143,19 +144,41 @@ def _structure_generation_ref_from_source_sha256(
         if has_adr044_receipt
         else source_sha256
     )
+    identity_suffix = f":force:{force_nonce}" if force_nonce else ""
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"fuxi:tabular-generation:{PRODUCER_SCHEMA_VERSION}:{PROJECTION_VERSION}:"
             f"{STRUCTURE_PRODUCER_ALGORITHM_VERSION}:{ENUMERATION_RULE_VERSION}:"
-            f"{document_id}:{source_identity}",
+            f"{document_id}:{source_identity}{identity_suffix}",
         )
     )
 
 
-def structure_generation_ref_from_source_sha256(document_id: str, source_sha256: str) -> str:
+def structure_generation_ref_from_source_sha256(
+    document_id: str,
+    source_sha256: str,
+    *,
+    force_nonce: str | None = None,
+) -> str:
     """Expose the source-bound identity for queue responses and tests."""
-    return _structure_generation_ref_from_source_sha256(document_id, source_sha256)
+    return _structure_generation_ref_from_source_sha256(
+        document_id, source_sha256, force_nonce=force_nonce
+    )
+
+
+def _force_task_digest(source_sha256: str, task_id: str) -> str:
+    return f"force:{source_sha256}:{task_id}"
+
+
+def _source_snapshot_from_task(task: dict[str, Any], actual_source_sha256: str) -> tuple[str, str | None]:
+    expected = task.get("digest")
+    if isinstance(expected, str) and expected.startswith("force:"):
+        parts = expected.split(":")
+        if len(parts) == 3 and len(parts[1]) == 64 and parts[2] == task.get("id"):
+            return parts[1], parts[2]
+        return "", None
+    return expected or actual_source_sha256, None
 
 
 def _generation_task_service():
@@ -290,6 +313,7 @@ def enqueue_tabular_structure_generation(
     document_id: str,
     filename: str,
     source_sha256: str,
+    force_generation: bool = False,
     task_service=None,
     queue: Callable[[dict[str, Any]], Any] | None = None,
 ) -> dict[str, Any]:
@@ -308,8 +332,11 @@ def enqueue_tabular_structure_generation(
     ):
         raise ValueError("source SHA-256 is invalid")
     task_service = task_service or _generation_task_service()
+    if not isinstance(force_generation, bool):
+        raise ValueError("force_generation must be a boolean")
+    task_id = uuid.uuid4().hex
     task = {
-        "id": uuid.uuid4().hex,
+        "id": task_id,
         "doc_id": document_id,
         "tenant_id": tenant_id,
         "kb_id": dataset_id,
@@ -319,13 +346,13 @@ def enqueue_tabular_structure_generation(
         "progress": 0.0,
         "from_page": 0,
         "to_page": 0,
-        "digest": source_sha256,
+        "digest": _force_task_digest(source_sha256, task_id) if force_generation else source_sha256,
         "progress_msg": "Tabular structure generation queued.",
     }
-    outcome = task_service.find_or_insert_generation_task(
-        task,
-        source_sha256=source_sha256,
-    )
+    find_kwargs = {"source_sha256": source_sha256}
+    if force_generation:
+        find_kwargs["force_generation"] = True
+    outcome = task_service.find_or_insert_generation_task(task, **find_kwargs)
     existing = outcome.get("task") if isinstance(outcome, dict) else None
     if existing is not None and not outcome.get("created", False):
         task = {**task, **existing}
@@ -362,6 +389,15 @@ def enqueue_tabular_structure_generation(
         "task_id": task["id"],
         "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
         "source_sha256": source_sha256,
+        **(
+            {
+                "producer_generation_ref": structure_generation_ref_from_source_sha256(
+                    document_id, source_sha256, force_nonce=task["id"]
+                )
+            }
+            if force_generation
+            else {}
+        ),
     }
 
 
@@ -508,8 +544,8 @@ def run_tabular_structure_generation_job(
     dataset_id = task["kb_id"]
     document_id = task["doc_id"]
     source_sha256 = hashlib.sha256(binary).hexdigest()
-    expected_source_sha256 = task.get("digest")
-    if expected_source_sha256 == "source-pending":
+    expected_source_sha256, force_nonce = _source_snapshot_from_task(task, source_sha256)
+    if expected_source_sha256 in {"", "source-pending"}:
         return {
             "status": "failed",
             "safe_error_code": "legacy_generation_task_requires_source_snapshot",
@@ -519,7 +555,9 @@ def run_tabular_structure_generation_job(
             "status": "failed",
             "safe_error_code": "source_changed",
         }
-    generation_ref = structure_generation_ref(document_id, binary)
+    generation_ref = structure_generation_ref_from_source_sha256(
+        document_id, source_sha256, force_nonce=force_nonce
+    )
 
     if service is None:
         from api.db.services.tabular_structure_service import TabularStructureService
@@ -572,7 +610,7 @@ def run_tabular_structure_generation_job(
             dataset_id=dataset_id,
             document_id=document_id,
         )
-        if active == generation_ref:
+        if force_nonce is None and active == generation_ref:
             return {"status": "active", "producer_generation_ref": generation_ref}
         actual_sheet_count = len(getattr(workbook, "sheetnames", ()))
         sheet_count = int(sheet_count_provider(task["name"], binary))
