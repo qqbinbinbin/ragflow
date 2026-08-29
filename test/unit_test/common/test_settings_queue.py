@@ -45,7 +45,7 @@ class TestGetSvrQueueName:
         result = get_svr_queue_name(0, "common")
         assert result == "te.0.common"
 
-    def test_suffix_parameter_ignored(self):
+    def test_suffix_parameter_selects_queue(self):
         """Test that suffix parameter is currently ignored (hardcoded to 'common').
 
         Note: The function signature accepts a suffix parameter but currently
@@ -57,8 +57,9 @@ class TestGetSvrQueueName:
         result_resume = get_svr_queue_name(0, "resume")
         result_graphrag = get_svr_queue_name(0, "graphrag")
 
-        # All should return the same value since suffix is hardcoded
-        assert result_default == result_resume == result_graphrag == "te.0.common"
+        assert result_default == "te.0.common"
+        assert result_resume == "te.0.resume"
+        assert result_graphrag == "te.0.graphrag"
 
     def test_format_structure(self):
         """Test that queue name follows expected format: {SVR_QUEUE_NAME}.{priority}.common."""
@@ -147,10 +148,9 @@ class TestGetSvrQueueNames:
         result_resume = get_svr_queue_names("resume")
         result_graphrag = get_svr_queue_names("graphrag")
 
-        expected = ["te.1.common", "te.0.common"]
-        assert result_common == expected
-        assert result_resume == expected  # suffix is currently ignored
-        assert result_graphrag == expected  # suffix is currently ignored
+        assert result_common == ["te.1.common", "te.0.common"]
+        assert result_resume == ["te.1.resume", "te.0.resume"]
+        assert result_graphrag == ["te.1.graphrag", "te.0.graphrag"]
 
     def test_all_elements_are_strings(self):
         """Test that all elements in the returned list are strings."""
@@ -172,8 +172,7 @@ class TestGetSvrQueueNames:
         """Test with empty string suffix."""
 
         result = get_svr_queue_names("")
-        # Should still work since suffix is ignored
-        assert result == ["te.1.common", "te.0.common"]
+        assert result == ["te.1.", "te.0."]
 
 
 class TestGetSvrQueueNameWithMockedConstant:

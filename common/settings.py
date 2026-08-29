@@ -152,7 +152,7 @@ def get_svr_queue_name(priority: int, suffix: str = "common") -> str:
         get_svr_queue_name(0) -> "te.0.common"  # default suffix="common"
 
     """
-    return f"{SVR_QUEUE_NAME}.{priority}.common"
+    return f"{SVR_QUEUE_NAME}.{priority}.{suffix}"
 
 
 def get_svr_queue_names(suffix: str):
