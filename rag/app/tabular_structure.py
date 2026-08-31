@@ -72,6 +72,23 @@ PROJECTION_FIELDS = frozenset(
         "rows",
     }
 )
+_DELETE_MANIFEST_BASE_FIELDS = frozenset(
+    {
+        "version",
+        "producer_schema_version",
+        "producer_generation_ref",
+        "source_sha256",
+        "row_count",
+        "tables",
+        "parts",
+    }
+)
+_CURRENT_DELETE_MANIFEST_FIELDS = _DELETE_MANIFEST_BASE_FIELDS | frozenset(
+    {
+        "structure_algorithm_version",
+        "enumeration_rule_version",
+    }
+)
 
 DEFAULT_CONTEXT_ENTRY_LIMIT = 8
 DEFAULT_CONTEXT_VALUE_BYTES = 128
@@ -7168,18 +7185,10 @@ def list_tabular_structure_projection_objects(
     if hashlib.sha256(manifest_payload).hexdigest() != manifest_sha256:
         raise StructureSnapshotChanged("manifest digest changed")
     manifest = _decode_snapshot_json(manifest_payload, "manifest")
-    expected_manifest_fields = {
-        "version",
-        "producer_schema_version",
-        "producer_generation_ref",
-        "structure_algorithm_version",
-        "enumeration_rule_version",
-        "source_sha256",
-        "row_count",
-        "tables",
-        "parts",
-    }
-    if set(manifest) != expected_manifest_fields:
+    if set(manifest) not in {
+        _DELETE_MANIFEST_BASE_FIELDS,
+        _CURRENT_DELETE_MANIFEST_FIELDS,
+    }:
         raise StructureSnapshotChanged("manifest schema changed")
     if manifest["producer_generation_ref"] != producer_generation_ref:
         raise StructureSnapshotChanged("manifest generation changed")

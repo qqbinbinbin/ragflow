@@ -234,6 +234,27 @@ def _stored_generation_with_contract(
     return storage, projection, receipt
 
 
+def _stored_generation_with_historical_delete_manifest(table_parser):
+    storage, projection, receipt = _stored_generation(table_parser)
+    old_manifest_name = receipt["manifest_object_name"]
+    manifest = json.loads(storage.objects[("dataset-1", old_manifest_name)])
+    del manifest["structure_algorithm_version"]
+    del manifest["enumeration_rule_version"]
+    manifest_payload = tabular_structure._canonical_json(manifest)
+    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+    manifest_object_name = (
+        old_manifest_name.rsplit("manifest-", 1)[0]
+        + f"manifest-{manifest_sha256}.json"
+    )
+    del storage.objects[("dataset-1", old_manifest_name)]
+    storage.put("dataset-1", manifest_object_name, manifest_payload)
+    receipt.update(
+        manifest_object_name=manifest_object_name,
+        manifest_sha256=manifest_sha256,
+    )
+    return storage, projection, receipt
+
+
 def _active_generation_record(projection, receipt, *, document_id: str):
     return {
         "producer_generation_ref": projection["producer_generation_ref"],
@@ -3466,6 +3487,94 @@ def test_projection_object_inventory_is_manifest_bound(service_module, table_par
             producer_generation_ref=projection["producer_generation_ref"],
             manifest_object_name=receipt["manifest_object_name"],
             manifest_sha256=receipt["manifest_sha256"],
+            expected_part_count=receipt["part_count"],
+            tenant_id="tenant-owner",
+        )
+
+
+def test_projection_object_inventory_accepts_historical_manifest_for_delete_only(
+    service_module,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation_with_historical_delete_manifest(
+        table_parser
+    )
+
+    inventory = tabular_structure.list_tabular_structure_projection_objects(
+        storage,
+        bucket="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        manifest_object_name=receipt["manifest_object_name"],
+        manifest_sha256=receipt["manifest_sha256"],
+        expected_part_count=receipt["part_count"],
+        tenant_id="tenant-owner",
+    )
+
+    assert inventory["object_names"] == [
+        *inventory["part_object_names"],
+        receipt["manifest_object_name"],
+    ]
+    assert tabular_structure.delete_tabular_structure_projection_objects(
+        storage,
+        bucket="dataset-1",
+        document_id="document-1",
+        producer_generation_ref=projection["producer_generation_ref"],
+        manifest_object_name=receipt["manifest_object_name"],
+        manifest_sha256=receipt["manifest_sha256"],
+        expected_part_count=receipt["part_count"],
+        tenant_id="tenant-owner",
+    ) == receipt["part_count"] + 1
+    assert storage.objects == {}
+
+
+def test_current_projection_reader_rejects_historical_delete_manifest(
+    service_module,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation_with_historical_delete_manifest(
+        table_parser
+    )
+
+    with pytest.raises(service_module.StructureSnapshotChanged, match="manifest schema changed"):
+        tabular_structure.load_tabular_structure_projection(
+            storage,
+            bucket="dataset-1",
+            document_id="document-1",
+            producer_generation_ref=projection["producer_generation_ref"],
+            manifest_object_name=receipt["manifest_object_name"],
+            manifest_sha256=receipt["manifest_sha256"],
+            expected_part_count=receipt["part_count"],
+            tenant_id="tenant-owner",
+        )
+
+
+def test_projection_object_inventory_rejects_unknown_historical_manifest_schema(
+    service_module,
+    table_parser,
+):
+    storage, projection, receipt = _stored_generation_with_historical_delete_manifest(
+        table_parser
+    )
+    old_manifest_name = receipt["manifest_object_name"]
+    manifest = json.loads(storage.objects[("dataset-1", old_manifest_name)])
+    manifest["unexpected_contract_field"] = "unknown"
+    manifest_payload = tabular_structure._canonical_json(manifest)
+    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+    manifest_object_name = (
+        old_manifest_name.rsplit("manifest-", 1)[0]
+        + f"manifest-{manifest_sha256}.json"
+    )
+    storage.put("dataset-1", manifest_object_name, manifest_payload)
+
+    with pytest.raises(service_module.StructureSnapshotChanged, match="manifest schema changed"):
+        tabular_structure.list_tabular_structure_projection_objects(
+            storage,
+            bucket="dataset-1",
+            document_id="document-1",
+            producer_generation_ref=projection["producer_generation_ref"],
+            manifest_object_name=manifest_object_name,
+            manifest_sha256=manifest_sha256,
             expected_part_count=receipt["part_count"],
             tenant_id="tenant-owner",
         )
