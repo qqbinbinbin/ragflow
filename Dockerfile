@@ -287,8 +287,8 @@ COPY bin bin
 COPY tools/scripts tools/scripts
 
 COPY docker/service_conf.yaml.template ./conf/service_conf.yaml.template
-COPY docker/entrypoint.sh ./
-RUN chmod +x ./entrypoint*.sh
+COPY docker/entrypoint.sh /ragflow/docker/entrypoint.sh
+RUN chmod +x /ragflow/docker/entrypoint.sh
 
 # Copy nginx configuration for frontend serving
 COPY docker/nginx/ragflow.conf.golang docker/nginx/ragflow.conf.python docker/nginx/ragflow.conf.hybrid docker/nginx/nginx.conf docker/nginx/proxy.conf /etc/nginx/
@@ -301,4 +301,4 @@ RUN mv /etc/nginx/ragflow.conf.golang /etc/nginx/conf.d/ragflow.conf.golang && \
 COPY --from=builder /ragflow/web/dist /ragflow/web/dist
 
 COPY --from=builder /ragflow/VERSION /ragflow/VERSION
-ENTRYPOINT ["./entrypoint.sh"]
+ENTRYPOINT ["/ragflow/docker/entrypoint.sh"]
