@@ -1053,6 +1053,65 @@ class TestDocRoutesUnit:
         }
         assert len(calls) == 2
 
+    def test_direct_generation_projection_failure_returns_safe_stage_and_class(self, monkeypatch, caplog):
+        module = _load_restful_chunk_module(monkeypatch)
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(
+            module.DocumentService,
+            "query",
+            lambda **_kwargs: [_DummyDoc(kb_id="ds-1", parser_id="table", name="anonymous.xlsx")],
+        )
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+        monkeypatch.setattr(module.File2DocumentService, "get_storage_address", lambda **_kwargs: ("source-bucket", "source-object"))
+        monkeypatch.setattr(module.settings.STORAGE_IMPL, "get", lambda *_args: b"workbook")
+
+        async def _thread_pool(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(module, "thread_pool_exec", _thread_pool)
+        monkeypatch.setattr(
+            module,
+            "_build_tabular_structure_shadow_from_source",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("private source text")),
+        )
+
+        result = _run(_route_core(module.build_tabular_structure_generation)("tenant-1", "ds-1", "doc-1"))
+
+        assert result["message"] == "provider_failure"
+        assert result["data"] == {
+            "reason": "provider_failure",
+            "failure_stage": "generation_projection_build",
+            "failure_class": "unknown",
+        }
+        assert "private source text" not in str(result)
+        assert "private source text" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("error", "failure_class"),
+        [
+            (FileNotFoundError(), "source_missing"),
+            (PermissionError(), "access_denied"),
+            (TimeoutError(), "timeout"),
+            (OSError(), "io_error"),
+            (MemoryError(), "resource_exhausted"),
+            (type("BadZipFile", (Exception,), {})(), "source_format_invalid"),
+            (RuntimeError(), "unknown"),
+        ],
+    )
+    def test_direct_generation_failure_class_is_allowlisted(self, monkeypatch, error, failure_class):
+        module = _load_restful_chunk_module(monkeypatch)
+
+        response = module._tabular_structure_error_response(
+            error,
+            failure_stage="generation_projection_build",
+        )
+
+        assert response["data"] == {
+            "reason": "provider_failure",
+            "failure_stage": "generation_projection_build",
+            "failure_class": failure_class,
+        }
+
     def test_structure_generation_queue_returns_pending_without_building(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
         calls = []

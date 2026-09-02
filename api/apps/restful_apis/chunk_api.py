@@ -151,7 +151,31 @@ async def _expected_active_generation_ref(*, required: bool):
     return True, expected_ref
 
 
-def _tabular_structure_error_response(error, *, active_generation_ref=None):
+_DIRECT_GENERATION_FAILURE_STAGES = frozenset({
+    "generation_source_lookup",
+    "generation_source_read",
+    "generation_projection_build",
+    "generation_manifest_read",
+})
+
+
+def _tabular_structure_failure_class(error):
+    if isinstance(error, FileNotFoundError):
+        return "source_missing"
+    if isinstance(error, PermissionError):
+        return "access_denied"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, OSError):
+        return "io_error"
+    if isinstance(error, MemoryError):
+        return "resource_exhausted"
+    if type(error).__name__ in {"BadZipFile", "InvalidFileException", "XLRDError"}:
+        return "source_format_invalid"
+    return "unknown"
+
+
+def _tabular_structure_error_response(error, *, active_generation_ref=None, failure_stage=None):
     from rag.app.tabular_structure import StructureGenerationConflict, StructureSnapshotChanged, StructureSnapshotMissing
 
     if isinstance(error, StructureSnapshotMissing):
@@ -164,6 +188,9 @@ def _tabular_structure_error_response(error, *, active_generation_ref=None):
         logging.error("Tabular structure read failed: provider_failure")
         reason = "provider_failure"
     data = {"reason": reason}
+    if reason == "provider_failure" and failure_stage in _DIRECT_GENERATION_FAILURE_STAGES:
+        data["failure_stage"] = failure_stage
+        data["failure_class"] = _tabular_structure_failure_class(error)
     if reason == "structure_snapshot_changed":
         active_ref = active_generation_ref or getattr(error, "active_generation_ref", None)
         if isinstance(active_ref, str) and active_ref.strip():
@@ -338,9 +365,12 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
     if str(getattr(document, "parser_id", "")).lower() != "table":
         reason = "provider_capability_unavailable"
         return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+    failure_stage = "generation_source_lookup"
     try:
         source_bucket, source_object = File2DocumentService.get_storage_address(doc_id=document_id)
+        failure_stage = "generation_source_read"
         binary = await thread_pool_exec(settings.STORAGE_IMPL.get, source_bucket, source_object)
+        failure_stage = "generation_projection_build"
         result = await thread_pool_exec(
             _build_tabular_structure_shadow_from_source,
             tenant_id=owner_tenant_id,
@@ -355,6 +385,7 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
             if key in result
         }
         if result.get("status") == "shadow":
+            failure_stage = "generation_manifest_read"
             manifest = _get_tabular_structure_service().read_generation_manifest(
                 settings.STORAGE_IMPL,
                 tenant_id=owner_tenant_id,
@@ -370,7 +401,7 @@ async def build_tabular_structure_generation(tenant_id, dataset_id, document_id)
             })
         return get_result(data=safe_result)
     except Exception as error:
-        return _tabular_structure_error_response(error)
+        return _tabular_structure_error_response(error, failure_stage=failure_stage)
 
 
 @manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations/queue", methods=["POST"])  # noqa: F821
