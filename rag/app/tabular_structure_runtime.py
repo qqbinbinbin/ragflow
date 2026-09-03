@@ -352,17 +352,21 @@ def enqueue_tabular_structure_generation(
         find_kwargs["force_generation"] = True
     outcome = task_service.find_or_insert_generation_task(task, **find_kwargs)
     existing = outcome.get("task") if isinstance(outcome, dict) else None
-    if existing is not None and not outcome.get("created", False):
-        task = {**task, **existing}
-        if task.get("progress") != 0:
-            return {
-                "status": "queued",
-                "task_id": task["id"],
-                "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
-                "source_sha256": task.get("digest", source_sha256),
-            }
     if isinstance(existing, dict):
         task = {**task, **existing}
+    generation_ref = structure_generation_ref_from_source_sha256(
+        document_id,
+        source_sha256,
+        force_nonce=task["id"] if force_generation else None,
+    )
+    if existing is not None and not outcome.get("created", False) and task.get("progress") != 0:
+        return {
+            "status": "queued",
+            "task_id": task["id"],
+            "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
+            "source_sha256": task.get("digest", source_sha256),
+            "producer_generation_ref": generation_ref,
+        }
 
     if queue is None:
         from common import settings
@@ -387,15 +391,7 @@ def enqueue_tabular_structure_generation(
         "task_id": task["id"],
         "task_type": TABULAR_STRUCTURE_GENERATION_TASK_TYPE,
         "source_sha256": source_sha256,
-        **(
-            {
-                "producer_generation_ref": structure_generation_ref_from_source_sha256(
-                    document_id, source_sha256, force_nonce=task["id"]
-                )
-            }
-            if force_generation
-            else {}
-        ),
+        "producer_generation_ref": generation_ref,
     }
 
 

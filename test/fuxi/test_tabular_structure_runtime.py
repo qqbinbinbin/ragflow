@@ -156,7 +156,44 @@ def test_generation_enqueue_returns_source_bound_generation_reference(monkeypatc
 
     assert result["status"] == "queued"
     assert result["source_sha256"] == source_sha256
-    assert "producer_generation_ref" not in result
+    assert result["producer_generation_ref"] == structure_generation_ref_from_source_sha256(
+        "document-1", source_sha256
+    )
+
+
+def test_generation_enqueue_coalesced_task_returns_the_same_source_bound_reference():
+    source_sha256 = hashlib.sha256(b"workbook").hexdigest()
+
+    class Service:
+        @staticmethod
+        def find_or_insert_generation_task(task, *, source_sha256):
+            return {
+                "created": False,
+                "task": {
+                    **task,
+                    "id": "existing-generation-task",
+                    "digest": source_sha256,
+                    "progress": 0.5,
+                },
+            }
+
+    result = enqueue_tabular_structure_generation(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        filename="workbook.xlsx",
+        source_sha256=source_sha256,
+        task_service=Service,
+        queue=lambda _task: (_ for _ in ()).throw(
+            AssertionError("an existing generation task must not be requeued")
+        ),
+    )
+
+    assert result["status"] == "queued"
+    assert result["task_id"] == "existing-generation-task"
+    assert result["producer_generation_ref"] == structure_generation_ref_from_source_sha256(
+        "document-1", source_sha256
+    )
 
 
 def test_force_generation_enqueue_creates_a_distinct_task_identity():
