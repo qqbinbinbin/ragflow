@@ -2170,6 +2170,50 @@ class TabularStructureService:
         return _managed_generation_result(record, projection)
 
     @classmethod
+    def read_generation_by_source_sha256(
+        cls,
+        storage,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        document_id: str,
+        source_sha256: str,
+        repository=None,
+    ) -> dict[str, Any]:
+        """Read one current-contract shadow or Active generation by source identity.
+
+        The source-bound reference remains an internal Producer implementation
+        detail.  Consumers receive only a fully validated immutable snapshot.
+        """
+        if (
+            not isinstance(source_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+        ):
+            raise ValueError("source SHA-256 is invalid")
+        from rag.app.tabular_structure_runtime import (
+            structure_generation_ref_from_source_sha256,
+        )
+
+        generation = cls.read_generation(
+            storage,
+            tenant_id=tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            producer_generation_ref=structure_generation_ref_from_source_sha256(
+                document_id,
+                source_sha256,
+            ),
+            repository=repository,
+        )
+        if generation["status"] not in {"shadow", "active"}:
+            raise StructureSnapshotMissing(
+                "source-bound structure generation is unavailable"
+            )
+        if generation["source_sha256"] != source_sha256:
+            raise StructureSnapshotChanged("source-bound generation identity changed")
+        return generation
+
+    @classmethod
     def read_generation_rows(
         cls,
         storage,

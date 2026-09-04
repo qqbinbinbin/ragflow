@@ -480,6 +480,38 @@ async def get_tabular_structure_generation(tenant_id, dataset_id, document_id, p
         return _tabular_structure_error_response(error)
 
 
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations/source/<source_sha256>", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def get_tabular_structure_generation_by_source_sha256(
+    tenant_id,
+    dataset_id,
+    document_id,
+    source_sha256,
+):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    if (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in source_sha256)
+    ):
+        reason = "invalid_structure_request"
+        return construct_json_result(code=RetCode.DATA_ERROR, message=reason, data={"reason": reason})
+    try:
+        result = _get_tabular_structure_service().read_generation_by_source_sha256(
+            settings.STORAGE_IMPL,
+            tenant_id=owner_tenant_id,
+            dataset_id=dataset_id,
+            document_id=document_id,
+            source_sha256=source_sha256.lower(),
+        )
+        return get_result(data=result)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
 @manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/generations/<producer_generation_ref>/activate", methods=["POST"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs

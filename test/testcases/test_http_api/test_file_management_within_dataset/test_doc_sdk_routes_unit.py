@@ -1346,6 +1346,63 @@ class TestDocRoutesUnit:
             )
         ]
 
+    def test_structure_generation_by_source_uses_the_authorized_runtime_lookup(self, monkeypatch):
+        module = _load_restful_chunk_module(monkeypatch)
+        calls = []
+
+        monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)
+        monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc(kb_id="ds-1")])
+        monkeypatch.setattr(module.KnowledgebaseService, "get_by_id", lambda _id: (True, SimpleNamespace(tenant_id="owner-tenant")))
+
+        class _Service:
+            @staticmethod
+            def read_generation_by_source_sha256(storage, **kwargs):
+                calls.append((storage, kwargs))
+                return {
+                    "status": "shadow",
+                    "producer_generation_ref": "generation-derived-server-side",
+                    "source_sha256": kwargs["source_sha256"],
+                    "row_count": 3,
+                    "projection_version": "tabular-structure-projection/v2",
+                    "producer_schema_version": "table-producer/v4",
+                    "structure_algorithm_version": "region-producer/v7",
+                    "enumeration_rule_version": "enumeration-rules/v1",
+                }
+
+        monkeypatch.setattr(module, "_get_tabular_structure_service", lambda: _Service)
+        source_sha256 = "b" * 64
+
+        result = _run(
+            _route_core(module.get_tabular_structure_generation_by_source_sha256)(
+                "tenant-1",
+                "ds-1",
+                "doc-1",
+                source_sha256,
+            )
+        )
+
+        assert result["data"] == {
+            "status": "shadow",
+            "producer_generation_ref": "generation-derived-server-side",
+            "source_sha256": source_sha256,
+            "row_count": 3,
+            "projection_version": "tabular-structure-projection/v2",
+            "producer_schema_version": "table-producer/v4",
+            "structure_algorithm_version": "region-producer/v7",
+            "enumeration_rule_version": "enumeration-rules/v1",
+        }
+        assert calls == [
+            (
+                module.settings.STORAGE_IMPL,
+                {
+                    "tenant_id": "owner-tenant",
+                    "dataset_id": "ds-1",
+                    "document_id": "doc-1",
+                    "source_sha256": source_sha256,
+                },
+            )
+        ]
+
     def test_structure_only_build_rejects_non_table_document_before_storage_read(self, monkeypatch):
         module = _load_restful_chunk_module(monkeypatch)
         monkeypatch.setattr(module.KnowledgebaseService, "accessible", lambda **_kwargs: True)

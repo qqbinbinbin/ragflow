@@ -49,6 +49,40 @@ def _load_authorized_document_source_name(document_service):
     return namespace["_authorized_document_source_name"]
 
 
+def _load_source_bound_generation_route(
+    authorized_owner,
+    structure_service,
+):
+    module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
+    route = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "get_tabular_structure_generation_by_source_sha256"
+    )
+    route.decorator_list = []
+    namespace = {
+        "_authorized_structure_owner": authorized_owner,
+        "_get_tabular_structure_service": lambda: structure_service,
+        "settings": SimpleNamespace(STORAGE_IMPL="storage"),
+        "RetCode": SimpleNamespace(DATA_ERROR="data_error"),
+        "construct_json_result": lambda **kwargs: kwargs,
+        "get_result": lambda *, data: {"data": data},
+        "_tabular_structure_error_response": lambda error: {
+            "error": str(error),
+        },
+    }
+    exec(
+        compile(
+            ast.Module(body=[route], type_ignores=[]),
+            str(CHUNK_API_PATH),
+            "exec",
+        ),
+        namespace,
+    )
+    return route, namespace["get_tabular_structure_generation_by_source_sha256"]
+
+
 class _Storage:
     def __init__(self):
         self.objects = {}
@@ -5341,6 +5375,129 @@ def test_managed_generation_receipts_preserve_validated_source_identity(
     assert first_active["source_sha256"] == first_projection["source_sha256"]
     assert second_active["source_sha256"] == second_projection["source_sha256"]
     assert restored["source_sha256"] == first_projection["source_sha256"]
+
+
+def test_source_bound_generation_lookup_derives_the_ref_inside_ragflow_and_reads_the_immutable_manifest(
+    service_module,
+    generation_repository,
+    table_parser,
+):
+    from rag.app.tabular_structure_runtime import structure_generation_ref_from_source_sha256
+
+    source_probe = tabular_structure.build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _workbook_bytes(include_note=False),
+        producer_generation_ref=str(uuid.uuid4()),
+        parser=table_parser,
+    )
+    generation_ref = structure_generation_ref_from_source_sha256(
+        "document-1",
+        source_probe["source_sha256"],
+    )
+    storage, projection, receipt = _stored_generation(
+        table_parser,
+        generation_ref=generation_ref,
+    )
+    service_module.TabularStructureService.register_shadow_generation(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        receipt=receipt,
+        repository=generation_repository,
+    )
+
+    resolved = service_module.TabularStructureService.read_generation_by_source_sha256(
+        storage,
+        tenant_id="tenant-owner",
+        dataset_id="dataset-1",
+        document_id="document-1",
+        source_sha256=projection["source_sha256"],
+        repository=generation_repository,
+    )
+
+    assert resolved == {
+        "status": "shadow",
+        "producer_generation_ref": generation_ref,
+        "source_sha256": projection["source_sha256"],
+        "row_count": len(projection["rows"]),
+        "producer_schema_version": projection["producer_schema_version"],
+        "projection_version": projection["version"],
+        "structure_algorithm_version": projection["structure_algorithm_version"],
+        "enumeration_rule_version": projection["enumeration_rule_version"],
+    }
+
+
+def test_source_bound_generation_route_requires_authorization_and_reads_only_the_exact_source():
+    route_module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
+    route_node = next(
+        node
+        for node in route_module.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "get_tabular_structure_generation_by_source_sha256"
+    )
+    route_path = next(
+        decorator.args[0].value
+        for decorator in route_node.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Attribute)
+        and isinstance(decorator.func.value, ast.Name)
+        and decorator.func.value.id == "manager"
+        and decorator.func.attr == "route"
+    )
+    decorator_names = {
+        decorator.id
+        for decorator in route_node.decorator_list
+        if isinstance(decorator, ast.Name)
+    }
+    assert route_path == (
+        "/datasets/<dataset_id>/documents/<document_id>/"
+        "tabular-structure/generations/source/<source_sha256>"
+    )
+    assert {"login_required", "add_tenant_id_to_kwargs"} <= decorator_names
+
+    authorization_calls = []
+    service_calls = []
+
+    def authorized_owner(tenant_id, dataset_id, document_id):
+        authorization_calls.append((tenant_id, dataset_id, document_id))
+        return "owner-tenant", None
+
+    class _Service:
+        @staticmethod
+        def read_generation_by_source_sha256(storage, **kwargs):
+            service_calls.append((storage, kwargs))
+            return {
+                "status": "shadow",
+                "producer_generation_ref": "generation-derived-server-side",
+                "source_sha256": kwargs["source_sha256"],
+                "row_count": 3,
+                "producer_schema_version": "table-producer/v4",
+                "projection_version": "tabular-structure-projection/v2",
+                "structure_algorithm_version": "table-structure/v5",
+                "enumeration_rule_version": "enumeration/v3",
+            }
+
+    _, route = _load_source_bound_generation_route(authorized_owner, _Service)
+    result = asyncio.run(route("request-tenant", "dataset-1", "document-1", "A" * 64))
+
+    assert result["data"]["producer_generation_ref"] == "generation-derived-server-side"
+    assert authorization_calls == [("request-tenant", "dataset-1", "document-1")]
+    assert service_calls == [
+        (
+            "storage",
+            {
+                "tenant_id": "owner-tenant",
+                "dataset_id": "dataset-1",
+                "document_id": "document-1",
+                "source_sha256": "a" * 64,
+            },
+        )
+    ]
+
+    invalid = asyncio.run(route("request-tenant", "dataset-1", "document-1", "not-a-sha"))
+    assert invalid["data"] == {"reason": "invalid_structure_request"}
+    assert len(service_calls) == 1
 
 
 def test_active_generation_public_identity_preserves_source_sha256(
