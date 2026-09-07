@@ -39,7 +39,7 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v22"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v23"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -4868,6 +4868,33 @@ def test_record_key_axis_accepts_lossless_mixed_numeric_storage():
     assert [row[1][0] for row in rows] == original_keys
 
 
+def test_record_key_axis_accepts_structured_numeric_identifiers():
+    rows = [
+        (1, ["0-1", "A"], False),
+        (2, ["0-2", "B"], False),
+        (3, ["1.0", "C"], False),
+        (4, ["1.1", "D"], False),
+    ]
+    assert tabular_structure._record_key_axis_proven(rows, {0}) is True
+
+
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        (["-1", -2], True),
+        (["-2", "-1"], False),
+        (["1e-2", "2e-2"], False),
+        (["2e-2", 0.01], True),
+        (["0-1", "0-2", "1.0"], True),
+    ],
+)
+def test_record_key_axis_preserves_scalar_sign_and_exponent_semantics(values, expected):
+    rows = [(index, [value, "Record"], False) for index, value in enumerate(values, 1)]
+
+    assert tabular_structure._record_key_axis_proven(rows, {0}) is expected
+    assert [row[1][0] for row in rows] == values
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -4878,6 +4905,9 @@ def test_record_key_axis_accepts_lossless_mixed_numeric_storage():
         ["１", "2", 3],
         ["1", "2", "3"],
         [True, 2, 3],
+        ["0-1", "0-1"],
+        ["0-2", "0-1"],
+        ["0-A", "0-B"],
     ],
 )
 def test_record_key_axis_rejects_non_numeric_duplicate_or_non_monotonic_values(values):
@@ -7243,6 +7273,44 @@ def test_context_is_bounded_and_removes_controls_without_a_language_allowlist(ta
     assert "\u0085" not in json.dumps(context, ensure_ascii=False)
     assert "\u202e" not in json.dumps(context, ensure_ascii=False)
     assert "\u9879\u76ee \u00b5\u03a9\u2103" in json.dumps(context, ensure_ascii=False)
+
+
+def test_legacy_measurement_plan_with_auxiliary_vertical_merge_keeps_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "10、尺寸测量计划"
+    sheet["A14"] = "编号"
+    sheet["B14"] = "描述"
+    sheet["H14"] = "规范/公差"
+    sheet["J14"] = "检验用具"
+    sheet["K14"] = "检验频次"
+    sheet["L14"] = "图示"
+    sheet.merge_cells("A14:G14")
+    sheet.merge_cells("H14:I14")
+    sheet.merge_cells("L15:Q73")
+    record_keys = ["0-1", "0-2", "0-3", "0-4", "0-5"] + [f"{index}.0" for index in range(1, 28)]
+    record_keys += ["28-1", "28-2", "29-1", "29-2"] + [f"{index}.0" for index in range(30, 44)]
+    record_keys += ["44-1", "44-2", "45-1", "45-2", "46-1", "46-2", "47-1", "47-2", "48"]
+    assert len(record_keys) == 59
+    for row, record_key in zip(range(15, 74), record_keys):
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+        sheet.merge_cells(start_row=row, start_column=8, end_row=row, end_column=9)
+        sheet.cell(row=row, column=1, value=record_key)
+        sheet.cell(row=row, column=8, value="10±0.5")
+        sheet.cell(row=row, column=10, value="游标卡尺")
+        sheet.cell(row=row, column=11, value="5件/批")
+
+    projection = build_tabular_structure_projection(
+        "measurement-plan.xlsx",
+        _save_workbook(workbook),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+    target = next(
+        table for table in projection["tables"] if table["table_label"] == "10、尺寸测量计划"
+    )
+    assert target["source_total_count"] == 59, target
+    assert target["enumeration_status"] == "supported_complete"
 
 
 def test_global_indices_and_totals_survive_projection_part_boundaries(table_parser):

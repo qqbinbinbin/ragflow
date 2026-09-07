@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from openpyxl import Workbook
 
 
@@ -13,14 +14,31 @@ def _load_excel_parser_class():
     rag_nlp.find_codec = lambda *_args, **_kwargs: "utf-8"
     lazy_image = types.ModuleType("rag.utils.lazy_image")
     lazy_image.LazyImage = object
-    sys.modules.setdefault("rag.nlp", rag_nlp)
-    sys.modules.setdefault("rag.utils.lazy_image", lazy_image)
     path = Path("deepdoc/parser/excel_parser.py")
     spec = importlib.util.spec_from_file_location("fuxi_excel_parser", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    with pytest.MonkeyPatch.context() as dependencies:
+        dependencies.setitem(sys.modules, "rag.nlp", rag_nlp)
+        dependencies.setitem(sys.modules, "rag.utils.lazy_image", lazy_image)
+        spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("already_loaded", [False, True])
+def test_parser_loader_restores_dependency_modules(monkeypatch, already_loaded):
+    names = ("rag.nlp", "rag.utils.lazy_image")
+    for name in names:
+        if already_loaded:
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        else:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    before = {name: sys.modules.get(name) for name in names}
+
+    module = _load_excel_parser_class()
+
+    assert module.RAGFlowExcelParser is not None
+    assert {name: sys.modules.get(name) for name in names} == before
 
 
 def test_calamine_fallback_preserves_raw_rows_merges_and_empty_cells(monkeypatch):

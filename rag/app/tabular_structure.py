@@ -34,7 +34,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v22"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v23"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v1"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -57,6 +57,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v19", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v20", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v21", "enumeration-rules/v9"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v22", "enumeration-rules/v9"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -143,6 +144,7 @@ _UNTRUSTED_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u206
 _ASCII_DECIMAL_SCALAR_RE = re.compile(
     r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
 )
+_STRUCTURED_NUMERIC_KEY_RE = re.compile(r"^[0-9]+(?:-[0-9]+)+$")
 
 
 class StructureGenerationConflict(RuntimeError):
@@ -578,7 +580,31 @@ def _record_key_axis_proven(
         for value in source_values
         if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
     ]
-    text_numeric = [value for value in source_values if isinstance(value, str)]
+    text_numeric = [value.strip() for value in source_values if isinstance(value, str)]
+    # A scalar sign or exponent is not a segmented identifier. Keep those
+    # values on the existing scalar proof path, including descending axes.
+    has_structured_text = any(
+        _STRUCTURED_NUMERIC_KEY_RE.fullmatch(value) for value in text_numeric
+    )
+    if has_structured_text:
+        if not all(
+            _STRUCTURED_NUMERIC_KEY_RE.fullmatch(value)
+            or _ASCII_DECIMAL_SCALAR_RE.fullmatch(value)
+            for value in text_numeric
+        ):
+            return False
+        structured = []
+        for value in source_values:
+            if isinstance(value, str) and _STRUCTURED_NUMERIC_KEY_RE.fullmatch(value.strip()):
+                structured.append(tuple(int(part) for part in value.strip().split("-")))
+            else:
+                scalar = _record_key_numeric_value(value)
+                if scalar is None:
+                    return False
+                structured.append((scalar,))
+        return len(set(structured)) == len(structured) and all(
+            left < right for left, right in zip(structured, structured[1:])
+        )
     if text_numeric and not native_numeric:
         return False
     values = [_record_key_numeric_value(value) for value in source_values]

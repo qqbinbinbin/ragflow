@@ -4304,9 +4304,18 @@ def test_backfill_ignores_active_generations_outside_the_current_contract(
     }
 
 
+@pytest.mark.parametrize(
+    ("historical_algorithm", "historical_rules"),
+    [
+        ("region-producer/v10", "enumeration-rules/v3"),
+        ("region-producer/v22", "enumeration-rules/v9"),
+    ],
+)
 def test_backfill_validates_known_historical_inner_contract_and_indexes_current_only(
     service_module,
     table_parser,
+    historical_algorithm,
+    historical_rules,
 ):
     repository = service_module.InMemoryTabularStructureRepository()
     current_storage, current_projection, current_receipt = _stored_generation(
@@ -4317,8 +4326,8 @@ def test_backfill_validates_known_historical_inner_contract_and_indexes_current_
         _stored_generation_with_contract(
             table_parser,
             document_id="document-historical",
-            structure_algorithm_version="region-producer/v10",
-            enumeration_rule_version="enumeration-rules/v3",
+            structure_algorithm_version=historical_algorithm,
+            enumeration_rule_version=historical_rules,
         )
     )
     storage = _Storage()
@@ -5428,7 +5437,8 @@ def test_source_bound_generation_lookup_derives_the_ref_inside_ragflow_and_reads
     }
 
 
-def test_source_bound_generation_route_requires_authorization_and_reads_only_the_exact_source():
+@pytest.mark.asyncio
+async def test_source_bound_generation_route_requires_authorization_and_reads_only_the_exact_source():
     route_module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
     route_node = next(
         node
@@ -5479,7 +5489,7 @@ def test_source_bound_generation_route_requires_authorization_and_reads_only_the
             }
 
     _, route = _load_source_bound_generation_route(authorized_owner, _Service)
-    result = asyncio.run(route("request-tenant", "dataset-1", "document-1", "A" * 64))
+    result = await route("request-tenant", "dataset-1", "document-1", "A" * 64)
 
     assert result["data"]["producer_generation_ref"] == "generation-derived-server-side"
     assert authorization_calls == [("request-tenant", "dataset-1", "document-1")]
@@ -5495,7 +5505,7 @@ def test_source_bound_generation_route_requires_authorization_and_reads_only_the
         )
     ]
 
-    invalid = asyncio.run(route("request-tenant", "dataset-1", "document-1", "not-a-sha"))
+    invalid = await route("request-tenant", "dataset-1", "document-1", "not-a-sha")
     assert invalid["data"] == {"reason": "invalid_structure_request"}
     assert len(service_calls) == 1
 
