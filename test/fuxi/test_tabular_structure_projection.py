@@ -4744,6 +4744,47 @@ def test_separated_footer_does_not_pollute_a_proven_record_axis(table_parser):
     assert all(row["source_total_count_int"] == 3 for row in rows)
 
 
+def test_effective_record_width_treats_a_merged_footer_as_a_note(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:J1")
+    sheet["A1"] = "Anonymous register"
+    sheet["K1"] = "Navigation"
+    for column in range(1, 11):
+        sheet.cell(2, column, f"Field {column}")
+    sheet["K2"] = "Navigation"
+    for row, sequence in ((3, 1), (4, 2)):
+        sheet.cell(row, 1, sequence)
+        sheet.cell(row, 2, f"Item {sequence}")
+        sheet.cell(row, 4, "Y")
+        sheet.cell(row, 6, f"Reason {sequence}")
+        sheet.cell(row, 10, f"Remark {sequence}")
+    sheet.merge_cells("A5:J5")
+    sheet["A5"] = "Prepared by / approved by / date"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 2
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    footer = next(row for row in rows if row["row_ordinal_int"] == 5)
+    assert footer["row_role_kwd"] == "note"
+    assert footer["data_row_index_int"] is None
+
+
 def test_unseparated_footer_still_invalidates_completeness(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -6157,6 +6198,95 @@ def test_vertical_record_merge_proves_an_axis_across_an_empty_display_row(table_
         for row in projection["rows"]
         if row["row_role_kwd"] == "data"
     ] == [2, 3, 5, 6]
+
+
+def test_shared_vertical_record_group_keeps_detail_rows_out_of_the_record_count(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous grouped register"
+    sheet.append(["Sequence", "Part", "Requirement", "Result"])
+    for start_row, sequence, part, details in (
+        (2, 1, "Part A", ("A-1", "A-2")),
+        (4, 2, "Part B", ("B-1", "B-2")),
+        (6, 3, "Part C", ("C-1", "C-2")),
+    ):
+        sheet.merge_cells(start_row=start_row, start_column=1, end_row=start_row + 1, end_column=1)
+        sheet.merge_cells(start_row=start_row, start_column=2, end_row=start_row + 1, end_column=2)
+        sheet.cell(start_row, 1, sequence)
+        sheet.cell(start_row, 2, part)
+        for offset, detail in enumerate(details):
+            sheet.cell(start_row + offset, 3, detail)
+            sheet.cell(start_row + offset, 4, "OK")
+    sheet.merge_cells("A10:B10")
+    sheet["A10"] = "Role"
+    sheet.merge_cells("C10:D10")
+    sheet["C10"] = "Approver"
+    sheet.merge_cells("A11:B11")
+    sheet["A11"] = "Prepared"
+    sheet.merge_cells("C11:D11")
+    sheet["C11"] = "Owner"
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 3
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    assert [row["row_role_kwd"] for row in rows] == [
+        "data",
+        "note",
+        "data",
+        "note",
+        "data",
+        "note",
+    ]
+    assert [
+        row["data_row_index_int"]
+        for row in rows
+        if row["row_role_kwd"] == "data"
+    ] == [1, 2, 3]
+    assert all(
+        len(json.loads(row["ordered_fields_list"])) == 4
+        for row in rows
+        if row["row_role_kwd"] == "note"
+    )
+
+
+def test_single_record_without_a_key_cannot_hide_later_structural_blocks(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Anonymous unkeyed blocks"
+    sheet.append(["Sequence", "Part", "Value"])
+    for start_row, part in ((2, "Part A"), (4, "Part B"), (6, "Part C")):
+        sheet.merge_cells(start_row=start_row, start_column=2, end_row=start_row + 1, end_column=2)
+        sheet.cell(start_row, 2, part)
+        sheet.cell(start_row, 3, "OK")
+        sheet.cell(start_row + 1, 3, "OK")
+
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx",
+        _save_workbook(workbook),
+        producer_generation_ref=_generation_ref(),
+        parser=table_parser,
+    )
+
+    assert all(
+        table["enumeration_status"] != "supported_complete"
+        for table in projection["tables"]
+    )
 
 
 def test_context_sidecar_cannot_turn_a_proven_multilevel_table_into_an_empty_axis(

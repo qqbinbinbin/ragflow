@@ -450,6 +450,24 @@ def _is_full_width_merge(row_ordinal: int, width: int, merged_ranges) -> bool:
     )
 
 
+def _effective_record_axis_width(body_rows, merged_ranges, fallback_width: int) -> int:
+    """Return the populated body span without widening it for inert sidecars."""
+
+    populated_widths = [
+        max(
+            _record_field_offsets(
+                values,
+                row_ordinal=row_ordinal,
+                merged_ranges=merged_ranges,
+            ),
+            default=-1,
+        )
+        + 1
+        for row_ordinal, values, _follows_body_gap in body_rows
+    ]
+    return max((width for width in populated_widths if width > 0), default=fallback_width)
+
+
 def _has_partial_row_merge(row_ordinal: int, width: int, merged_ranges) -> bool:
     return any(
         merged.min_row <= row_ordinal <= merged.max_row
@@ -633,6 +651,79 @@ def _record_key_only_slots(
         for row, offsets in zip(rows, row_offsets)
         if set(offsets) == {key_offset}
     )
+
+
+def _shared_vertical_record_groups(
+    rows: list[tuple[int, list[object], bool]],
+    required_offsets: set[int],
+    merged_ranges,
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Prove grouped records from a numeric key and a shared vertical dimension."""
+
+    if len(rows) < 2 or not required_offsets:
+        return None
+    key_offset = min(required_offsets)
+    groups = []
+    for row_ordinal, _values, _follows_body_gap in rows:
+        key_column = key_offset + 1
+        key_merge = next(
+            (
+                merged
+                for merged in merged_ranges
+                if merged.min_col <= key_column <= merged.max_col
+                and merged.min_row <= row_ordinal <= merged.max_row
+                and merged.max_row > merged.min_row
+            ),
+            None,
+        )
+        if key_merge is None:
+            return None
+        group = (key_merge.min_row, key_merge.max_row)
+        if not groups or groups[-1] != group:
+            groups.append(group)
+    if len(groups) < 2:
+        return None
+    if any(
+        not any(
+            group_start <= row_ordinal <= group_end
+            for group_start, group_end in groups
+        )
+        for row_ordinal, _values, _follows_body_gap in rows
+    ):
+        return None
+    row_ordinals = {row_ordinal for row_ordinal, _values, _follows_body_gap in rows}
+    if any(
+        any(row not in row_ordinals for row in range(group_start, group_end + 1))
+        for group_start, group_end in groups
+    ):
+        return None
+    supporting_offsets = [offset for offset in required_offsets if offset != key_offset]
+    if not supporting_offsets:
+        return None
+    if not any(
+        all(
+            any(
+                merged.min_col <= offset + 1 <= merged.max_col
+                and (merged.min_row, merged.max_row) == group
+                and merged.max_row > merged.min_row
+                for merged in merged_ranges
+            )
+            for group in groups
+        )
+        for offset in supporting_offsets
+    ):
+        return None
+    rows_by_ordinal = {row[0]: row for row in rows}
+    anchors = tuple(group_start for group_start, _group_end in groups)
+    anchor_rows = [rows_by_ordinal[row_ordinal] for row_ordinal in anchors]
+    if not _record_key_axis_proven(anchor_rows, {key_offset}):
+        return None
+    continuations = tuple(
+        row_ordinal
+        for group_start, group_end in groups
+        for row_ordinal in range(group_start + 1, group_end + 1)
+    )
+    return anchors, continuations
 
 
 def _is_repeated_header_row(headers: list[str], values: list[object]) -> bool:
@@ -2569,7 +2660,116 @@ def _record_axis_evidence(
     if not body_rows:
         return None
 
+    effective_width = _effective_record_axis_width(
+        body_rows,
+        merged_ranges,
+        len(headers),
+    )
+
+    def is_full_record_axis_merge(row_ordinal: int) -> bool:
+        if _is_full_width_merge(row_ordinal, len(headers), merged_ranges):
+            return True
+        # Narrowing the merge width is only reliable when the populated body
+        # nearly spans the declared header axis.  Sparse forms often contain
+        # legitimate vertically merged record fields plus inert side columns;
+        # treating their shorter span as a full-row merge would invalidate an
+        # otherwise proven record axis.
+        if effective_width == len(headers) - 1:
+            pass
+        elif effective_width >= len(headers):
+            return False
+        if len(body_rows) > 10:
+            return False
+        if any(
+            merged.min_row <= row_ordinal <= merged.max_row
+            and merged.max_col > effective_width
+            for merged in merged_ranges
+        ):
+            return False
+        # A vertically merged key/identity column is record-group evidence,
+        # not a shortened footer axis. Preserve the legacy interpretation for
+        # such grouped forms and let the explicit group proof handle them.
+        if any(
+            merged.max_row > merged.min_row
+            and merged.min_col <= 2
+            and merged.min_row <= row_ordinal <= merged.max_row
+            for merged in merged_ranges
+        ):
+            return False
+        row = next(
+            (values for ordinal, values, _gap in body_rows if ordinal == row_ordinal),
+            (),
+        )
+        key_value = row[0] if row else None
+        has_numeric_record_before = any(
+            _record_key_numeric_value(values[0] if values else None) is not None
+            for ordinal, values, _gap in body_rows
+            if ordinal <= row_ordinal
+        )
+        return has_numeric_record_before and _is_full_width_merge(
+            row_ordinal,
+            effective_width,
+            merged_ranges,
+        )
+
     def evaluate(rows, note_rows, unknown_rows=()):
+        original_rows = rows
+        grouping_allowed = not unknown_rows and not any(
+            _is_full_width_merge(row_ordinal, len(headers), merged_ranges)
+            for row_ordinal, _values, _gap in rows
+        )
+        grouped_tail_notes = []
+        grouped_candidate_rows = list(rows)
+        key_offset = min(
+            min(
+                _record_field_offsets(
+                    values,
+                    row_ordinal=row_ordinal,
+                    merged_ranges=merged_ranges,
+                )
+                or (0,)
+            )
+            for row_ordinal, values, _gap in grouped_candidate_rows
+        )
+        while len(grouped_candidate_rows) >= 2:
+            row_ordinal, values, _gap = grouped_candidate_rows[-1]
+            key_value = values[key_offset] if key_offset < len(values) else None
+            has_vertical_key_merge = any(
+                merged.min_col <= key_offset + 1 <= merged.max_col
+                and merged.min_row <= row_ordinal <= merged.max_row
+                and merged.max_row > merged.min_row
+                for merged in merged_ranges
+            )
+            if has_vertical_key_merge or _record_key_numeric_value(key_value) is not None:
+                break
+            grouped_tail_notes.insert(0, grouped_candidate_rows.pop())
+        grouped_records = _shared_vertical_record_groups(
+            grouped_candidate_rows,
+            set(
+                _record_field_offsets(
+                    values,
+                    row_ordinal=row_ordinal,
+                    merged_ranges=merged_ranges,
+                )
+                for row_ordinal, values, _gap in grouped_candidate_rows
+            )
+            and set.intersection(
+                *(
+                    set(
+                        _record_field_offsets(
+                            values,
+                            row_ordinal=row_ordinal,
+                            merged_ranges=merged_ranges,
+                        )
+                    )
+                    for row_ordinal, values, _gap in grouped_candidate_rows
+                )
+            ),
+            merged_ranges,
+        ) if grouping_allowed else None
+        if grouped_records is not None and grouped_tail_notes:
+            rows = grouped_candidate_rows
+            note_rows = [*note_rows, *grouped_tail_notes]
         row_ordinals = [row[0] for row in rows]
         record_axis_contiguous = not any(
             not _record_rows_are_semantically_adjacent(
@@ -2580,7 +2780,7 @@ def _record_axis_evidence(
             )
             for left, right in zip(row_ordinals, row_ordinals[1:])
         )
-        if any(_is_full_width_merge(row[0], len(headers), merged_ranges) for row in rows):
+        if any(is_full_record_axis_merge(row[0]) for row in rows):
             return None
         if any(_is_repeated_header_row(headers, row[1]) for row in rows):
             return None
@@ -2613,17 +2813,53 @@ def _record_axis_evidence(
         if len({headers[offset] for offset in common_offsets}) < min(2, len(common_offsets)):
             return None
 
-        record_key_axis_proven = _record_key_axis_proven(rows, common_offsets)
+        grouped_records = _shared_vertical_record_groups(
+            rows,
+            common_offsets,
+            merged_ranges,
+        ) if grouping_allowed else None
+        grouped_record_ordinals = ()
+        grouped_continuation_ordinals = ()
+        if grouped_records is not None:
+            grouped_record_ordinals, grouped_continuation_ordinals = grouped_records
+            rows_by_ordinal = {row[0]: row for row in rows}
+            record_key_axis_proven = _record_key_axis_proven(
+                [rows_by_ordinal[row_ordinal] for row_ordinal in grouped_record_ordinals],
+                {min(common_offsets)},
+            )
+            if unknown_rows:
+                key_offset = min(common_offsets)
+                structural_tail = all(
+                    (
+                        key_offset >= len(values)
+                        or _record_key_numeric_value(values[key_offset]) is None
+                    )
+                    and any(
+                        merged.min_row <= row_ordinal <= merged.max_row
+                        and merged.max_col > merged.min_col
+                        for merged in merged_ranges
+                    )
+                    for row_ordinal, values, _gap in unknown_rows
+                )
+                if structural_tail:
+                    note_rows = [*note_rows, *unknown_rows]
+                    unknown_rows = ()
+        else:
+            record_key_axis_proven = _record_key_axis_proven(rows, common_offsets)
         key_only_slots = (
             _record_key_only_slots(rows, row_offsets, common_offsets)
-            if len(headers) > 1
+            if len(headers) > 1 and not grouped_record_ordinals
             else ()
         )
         key_only_slot_set = set(key_only_slots)
         record_row_ordinals = tuple(
             row_ordinal
             for row_ordinal in row_ordinals
-            if row_ordinal not in key_only_slot_set
+            if (
+                row_ordinal in grouped_record_ordinals
+                if grouped_record_ordinals
+                else row_ordinal not in key_only_slot_set
+            )
         )
         if not record_row_ordinals:
             return None
@@ -2633,13 +2869,26 @@ def _record_axis_evidence(
             and len(occupied_offsets) >= 2
             and _has_partial_row_merge(row_ordinals[0], len(headers), merged_ranges)
         )
+        if (
+            single_axis
+            and not record_key_axis_proven
+            and not grouped_record_ordinals
+            and not merged_ranges
+        ):
+            key_value = rows[0][1][min(common_offsets)]
+            if _record_key_numeric_value(key_value) is None:
+                return None
         if len(rows) < 2 and not single_axis:
             return None
         return {
             "record_row_ordinals": record_row_ordinals,
             "row_ordinals": tuple(row[0] for row in body_rows),
             "note_row_ordinals": tuple(
-                sorted({row[0] for row in note_rows} | key_only_slot_set)
+                sorted(
+                    {row[0] for row in note_rows}
+                    | key_only_slot_set
+                    | set(grouped_continuation_ordinals)
+                )
             ),
             "unknown_row_ordinals": tuple(row[0] for row in unknown_rows),
             "record_axis_contiguous": record_axis_contiguous,
@@ -2649,6 +2898,7 @@ def _record_axis_evidence(
             "occupied_offsets": tuple(sorted(occupied_offsets)),
             "record_key_axis_proven": record_key_axis_proven,
             "single_record_axis_proven": single_axis,
+            "group_continuation_row_ordinals": grouped_continuation_ordinals,
         }
 
     segments = []
@@ -2675,7 +2925,7 @@ def _record_axis_evidence(
             if len(segment) == 1
             or (
                 segment
-                and _is_full_width_merge(segment[0][0], len(headers), merged_ranges)
+                and is_full_record_axis_merge(segment[0][0])
             )
             else unknown_rows
         )
@@ -2683,12 +2933,12 @@ def _record_axis_evidence(
     full_width_rows = [
         row
         for row in record_rows
-        if _is_full_width_merge(row[0], len(headers), merged_ranges)
+        if is_full_record_axis_merge(row[0])
     ]
     full_width_indexes = [
         index
         for index, row in enumerate(record_rows)
-        if _is_full_width_merge(row[0], len(headers), merged_ranges)
+        if is_full_record_axis_merge(row[0])
     ]
     if full_width_indexes:
         candidate_records = [row for row in record_rows if row not in full_width_rows]
@@ -3337,6 +3587,11 @@ def _project_structure_region(
             has_unknown = has_unknown or row_role == "unknown"
         row_ordinal = local_row_ordinal + row_offset
         row_ref = f"{table_ref}:{row_ordinal}"
+        is_group_continuation = (
+            record_axis_evidence is not None
+            and local_row_ordinal
+            in record_axis_evidence.get("group_continuation_row_ordinals", ())
+        )
         pending_rows.append(
             {
                 "id": "tsr_v1_" + _versioned_digest(
@@ -3360,7 +3615,7 @@ def _project_structure_region(
                     _ordered_fields(
                         headers,
                         values,
-                        note=row_role == "note",
+                        note=row_role == "note" and not is_group_continuation,
                         sheet_ordinal=sheet_ordinal,
                         header_paths=header_paths,
                         column_ordinals=list(range(1, len(headers) + 1)),
