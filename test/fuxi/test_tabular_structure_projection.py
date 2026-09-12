@@ -2,6 +2,7 @@ import hashlib
 import json
 import struct
 import uuid
+import types
 from io import BytesIO
 
 import pytest
@@ -70,6 +71,53 @@ def test_merged_cell_lookup_index_preserves_anchor_semantics_without_linear_scan
     assert parser._get_merged_cell_value(worksheet, 9, 5, index) == "body"
     assert parser._get_merged_cell_value(worksheet, 6, 2, index) is None
     assert parser._get_merged_range_index(worksheet, ranges) is index
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    [
+        "/usr/local/data_rag_20250513/PPAP/PPAP-EXCEL/D91-轮胎总成PH01-中策橡胶.xls",
+        "/usr/local/data_rag_20250513/PPAP/PPAP-EXCEL/D91-前稳定杆接头总成PH01-江西荣成.xls",
+        "/usr/local/data_rag_20250513/PPAP/PPAP-EXCEL/F515-转向柱总成SZ02-豫北转向.xls",
+        "/usr/local/data_rag_20250513/PPAP/PPAP-EXCEL/G91-转向柱总成PN01-湖北三环.xls",
+    ],
+)
+def test_four_accepted_sources_keep_structure_semantics_with_index(monkeypatch, source_path):
+    table_module = _load_table_module(monkeypatch)
+    indexed = table_module.Excel()
+    linear = table_module.Excel()
+
+    def linear_lookup(self, worksheet, row, col, merged_ranges):
+        for merged_range in merged_ranges:
+            if (
+                merged_range.min_row <= row <= merged_range.max_row
+                and merged_range.min_col <= col <= merged_range.max_col
+            ):
+                return worksheet.cell(merged_range.min_row, merged_range.min_col).value
+        return None
+
+    linear._get_merged_cell_value = types.MethodType(linear_lookup, linear)
+    with open(source_path, "rb") as source_file:
+        source_bytes = source_file.read()
+    indexed_workbook = indexed._load_excel_to_workbook(BytesIO(source_bytes))
+    linear_workbook = linear._load_excel_to_workbook(BytesIO(source_bytes))
+    assert indexed_workbook.sheetnames == linear_workbook.sheetnames
+
+    def summarize(parser, workbook):
+        result = []
+        for sheet_name in workbook.sheetnames:
+            worksheet = workbook[sheet_name]
+            rows = parser._get_rows_limited(worksheet)
+            headers, header_start, data_start = parser._parse_sheet_structure(worksheet, rows)
+            context = parser._build_sheet_context(worksheet, rows[:header_start])
+            data = [
+                parser._extract_row_data(worksheet, row, data_start + offset, len(headers))
+                for offset, row in enumerate(rows[data_start : data_start + 12])
+            ]
+            result.append((sheet_name, headers, header_start, data_start, context, data))
+        return result
+
+    assert summarize(indexed, indexed_workbook) == summarize(linear, linear_workbook)
 
 
 def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
