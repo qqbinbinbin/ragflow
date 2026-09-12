@@ -1480,30 +1480,40 @@ def _parse_region_structure(parser, worksheet, rows):
     max_scan_rows = len(rows)
     candidates = []
     merged_ranges = list(worksheet.merged_cells.ranges)
+    nonempty_rows = [
+        not parser._is_empty_row([cell.value for cell in row])
+        for row in rows
+    ]
+    structurally_merged_rows = [False] * (max_scan_rows + 1)
+    for merged in merged_ranges:
+        if merged.max_col <= merged.min_col and merged.max_row <= merged.min_row:
+            continue
+        first = max(1, merged.min_row)
+        last = min(max_scan_rows, merged.max_row)
+        for row_ordinal in range(first, last + 1):
+            structurally_merged_rows[row_ordinal] = True
+    structural_merge_prefix = [0]
+    for row_ordinal in range(1, max_scan_rows + 1):
+        structural_merge_prefix.append(
+            structural_merge_prefix[-1] + int(structurally_merged_rows[row_ordinal])
+        )
     for start in range(max_scan_rows):
-        if parser._is_empty_row([cell.value for cell in rows[start]]):
+        if not nonempty_rows[start]:
             continue
         if (
             start > 0
             and not merged_ranges
-            and not parser._is_empty_row([cell.value for cell in rows[start - 1]])
+            and nonempty_rows[start - 1]
         ):
             # A contiguous text block has no structural evidence of a new
             # table boundary. Keep the earlier candidate or parser fallback.
             continue
         for depth in range(1, max_scan_rows - start + 1):
             end = start + depth
-            if parser._is_empty_row([cell.value for cell in rows[end - 1]]):
+            if not nonempty_rows[end - 1]:
                 continue
             parent_rows = range(start + 1, end)
-            if not all(
-                any(
-                    merged.min_row <= row_ordinal <= merged.max_row
-                    and (merged.max_col > merged.min_col or merged.max_row > merged.min_row)
-                    for merged in merged_ranges
-                )
-                for row_ordinal in parent_rows
-            ):
+            if structural_merge_prefix[end - 1] - structural_merge_prefix[start] != depth - 1:
                 continue
 
             headers = parser._build_headers_for_region(worksheet, rows, start, end)
@@ -1519,9 +1529,7 @@ def _parse_region_structure(parser, worksheet, rows):
                     (
                         row_index
                         for row_index in range(start, 0, -1)
-                        if not parser._is_empty_row(
-                            [cell.value for cell in rows[row_index - 1]]
-                        )
+                        if nonempty_rows[row_index - 1]
                     ),
                     None,
                 )
@@ -1592,8 +1600,8 @@ def _parse_region_structure(parser, worksheet, rows):
             first_following_row = next(
                 (
                     row_index
-                    for row_index, row in enumerate(rows[end:], start=end + 1)
-                    if not parser._is_empty_row([cell.value for cell in row])
+                    for row_index in range(end + 1, max_scan_rows + 1)
+                    if nonempty_rows[row_index - 1]
                 ),
                 None,
             )
