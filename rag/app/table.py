@@ -39,6 +39,26 @@ from common import settings
 logger = logging.getLogger(__name__)
 
 
+class _MergedRangeIndex:
+    """Cache merged ranges by row while preserving worksheet range order."""
+
+    def __init__(self, ranges):
+        self.ranges = tuple(ranges)
+        self.by_row = {}
+        for merged_range in self.ranges:
+            for row in range(merged_range.min_row, merged_range.max_row + 1):
+                self.by_row.setdefault(row, []).append(merged_range)
+
+    def find(self, row, col):
+        for merged_range in self.by_row.get(row, ()):
+            if merged_range.min_col <= col <= merged_range.max_col:
+                return merged_range
+        return None
+
+    def __iter__(self):
+        return iter(self.ranges)
+
+
 def _deduplicate_column_names(columns):
     reserved = {str(col) for col in columns}
     used = set()
@@ -296,7 +316,7 @@ class Excel(ExcelParser):
     def _build_headers_for_region(self, ws, rows, start, end, *, row_offset=0):
         headers = []
         max_col = max((len(row) for row in rows[start:end]), default=0)
-        merged_ranges = list(ws.merged_cells.ranges)
+        merged_ranges = self._get_merged_range_index(ws, ws.merged_cells.ranges)
         for col_idx in range(max_col):
             parts = []
             for row_idx in range(start, end):
@@ -324,22 +344,14 @@ class Excel(ExcelParser):
         """Return source-backed header segments without parsing their text."""
         paths = []
         max_col = max((len(row) for row in rows[start:end]), default=0)
-        merged_ranges = list(ws.merged_cells.ranges)
+        merged_ranges = self._get_merged_range_index(ws, ws.merged_cells.ranges)
         for col_idx in range(max_col):
             parts = []
             seen_sources = set()
             for row_idx in range(start, end):
                 row_ordinal = row_idx + 1 + row_offset
                 column_ordinal = col_idx + 1
-                merged = next(
-                    (
-                        candidate
-                        for candidate in merged_ranges
-                        if candidate.min_row <= row_ordinal <= candidate.max_row
-                        and candidate.min_col <= column_ordinal <= candidate.max_col
-                    ),
-                    None,
-                )
+                merged = merged_ranges.find(row_ordinal, column_ordinal)
                 if merged is not None:
                     source = (
                         "merge",
@@ -366,7 +378,7 @@ class Excel(ExcelParser):
 
     def _build_sheet_context(self, ws, rows):
         context_lines = []
-        merged_ranges = list(ws.merged_cells.ranges)
+        merged_ranges = self._get_merged_range_index(ws, ws.merged_cells.ranges)
         for row_idx, row in enumerate(rows, 1):
             values = []
             for col_idx, cell in enumerate(row, 1):
@@ -395,7 +407,7 @@ class Excel(ExcelParser):
     def _has_complex_header_structure(self, ws, rows):
         if len(rows) < 1:
             return False
-        merged_ranges = list(ws.merged_cells.ranges)
+        merged_ranges = self._get_merged_range_index(ws, ws.merged_cells.ranges)
         # 检查前两行是否涉及合并单元格
         for rng in merged_ranges:
             if rng.min_row <= 2:  # 只要合并区域涉及第1或第2行
@@ -487,7 +499,7 @@ class Excel(ExcelParser):
     def _build_hierarchical_headers(self, ws, rows, header_rows):
         headers = []
         max_col = max(len(row) for row in rows[:header_rows]) if header_rows > 0 else 0
-        merged_ranges = list(ws.merged_cells.ranges)
+        merged_ranges = self._get_merged_range_index(ws, ws.merged_cells.ranges)
         for col_idx in range(max_col):
             header_parts = []
             for row_idx in range(header_rows):
@@ -517,15 +529,36 @@ class Excel(ExcelParser):
             return False
         return True
 
+    def _get_merged_range_index(self, ws, merged_ranges):
+        ranges = tuple(merged_ranges)
+        signature = tuple(
+            (item.min_row, item.min_col, item.max_row, item.max_col)
+            for item in ranges
+        )
+        cached = getattr(ws, "_fuxi_merged_range_index", None)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        index = _MergedRangeIndex(ranges)
+        try:
+            ws._fuxi_merged_range_index = (signature, index)
+        except (AttributeError, TypeError):
+            pass
+        return index
+
     def _get_merged_cell_value(self, ws, row, col, merged_ranges):
-        for merged_range in merged_ranges:
-            if merged_range.min_row <= row <= merged_range.max_row and merged_range.min_col <= col <= merged_range.max_col:
-                return ws.cell(merged_range.min_row, merged_range.min_col).value
+        index = (
+            merged_ranges
+            if isinstance(merged_ranges, _MergedRangeIndex)
+            else self._get_merged_range_index(ws, merged_ranges)
+        )
+        merged_range = index.find(row, col)
+        if merged_range is not None:
+            return ws.cell(merged_range.min_row, merged_range.min_col).value
         return None
 
     def _extract_row_data(self, ws, row, absolute_row_idx, expected_cols):
         row_data = []
-        merged_ranges = list(ws.merged_cells.ranges)
+        merged_ranges = self._get_merged_range_index(ws, ws.merged_cells.ranges)
         actual_row_num = absolute_row_idx + 1
         for col_idx in range(expected_cols):
             cell_value = None
@@ -545,10 +578,7 @@ class Excel(ExcelParser):
         return row_data
 
     def _get_inherited_value(self, ws, row, col, merged_ranges):
-        for merged_range in merged_ranges:
-            if merged_range.min_row <= row <= merged_range.max_row and merged_range.min_col <= col <= merged_range.max_col:
-                return ws.cell(merged_range.min_row, merged_range.min_col).value
-        return None
+        return self._get_merged_cell_value(ws, row, col, merged_ranges)
 
     def _is_empty_row(self, row_data):
         for val in row_data:

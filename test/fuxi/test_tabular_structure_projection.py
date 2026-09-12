@@ -25,6 +25,53 @@ from rag.app.tabular_structure import (
 )
 
 
+class _MergedLookupRange:
+    def __init__(self, min_row, min_col, max_row, max_col):
+        self.min_row = min_row
+        self.min_col = min_col
+        self.max_row = max_row
+        self.max_col = max_col
+
+
+class _MergedLookupWorksheet:
+    class _MergedCells:
+        def __init__(self, ranges):
+            self.ranges = tuple(ranges)
+
+    def __init__(self, values, ranges):
+        self.values = values
+        self.merged_cells = self._MergedCells(ranges)
+
+    def cell(self, row, column):
+        class Cell:
+            pass
+
+        cell = Cell()
+        cell.value = self.values.get((row, column))
+        return cell
+
+
+def test_merged_cell_lookup_index_preserves_anchor_semantics_without_linear_scan(monkeypatch):
+    ranges = [
+        _MergedLookupRange(1, 1, 1, 4),
+        _MergedLookupRange(2, 2, 5, 2),
+        _MergedLookupRange(8, 3, 9, 5),
+    ]
+    worksheet = _MergedLookupWorksheet(
+        {(1, 1): "header", (2, 2): "vertical", (8, 3): "body"}, ranges
+    )
+    table_module = _load_table_module(monkeypatch)
+    parser = table_module.Excel.__new__(table_module.Excel)
+
+    index = parser._get_merged_range_index(worksheet, ranges)
+
+    assert parser._get_merged_cell_value(worksheet, 1, 4, index) == "header"
+    assert parser._get_merged_cell_value(worksheet, 5, 2, index) == "vertical"
+    assert parser._get_merged_cell_value(worksheet, 9, 5, index) == "body"
+    assert parser._get_merged_cell_value(worksheet, 6, 2, index) is None
+    assert parser._get_merged_range_index(worksheet, ranges) is index
+
+
 def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
     value = "A" * 126 + "  suffix"
 
