@@ -160,6 +160,16 @@ def test_axis_closure_accepts_a_value_free_footer_without_geometric_distance():
     )
 
 
+def test_effective_axis_width_ignores_single_populated_footer_sidecar():
+    body_rows = [
+        (2, [1, "A", 10], False),
+        (3, [2, "B", 11], False),
+        (4, [3, "C", 12], False),
+        (5, [None, None, None, None, None, None, None, "Printed name"], False),
+    ]
+    assert tabular_structure._effective_record_axis_width(body_rows, (), 8) == 3
+
+
 def test_axis_closure_accepts_a_non_numeric_signoff_region_without_key_values():
     earlier = _axis_closure_item(
         row_values=((2, (1, "A", 10)), (3, (2, "B", 11))),
@@ -4785,6 +4795,65 @@ def test_effective_record_width_treats_a_merged_footer_as_a_note(table_parser):
     assert footer["data_row_index_int"] is None
 
 
+def test_contiguous_numeric_axis_peels_trailing_note_without_vertical_grouping(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "DVP&R"
+    sheet.append(["序号", "试验项目", "标准"])
+    for number in range(1, 5):
+        sheet.append([number, f"试验-{number}", "标准"])
+    sheet.append(["备注：提交给重庆瑞驰文件需要加盖开发部门或公司公章。", None, None])
+
+    projection = build_tabular_structure_projection(
+        "dvp.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+    rows = [
+        row
+        for row in projection["rows"]
+        if row["table_ref_kwd"] == complete[0]["table_ref"]
+    ]
+    assert [row["row_ordinal_int"] for row in rows if row["row_role_kwd"] == "data"] == [2, 3, 4, 5]
+    note = next(row for row in rows if row["row_ordinal_int"] == 6)
+    assert note["row_role_kwd"] == "note"
+    assert note["data_row_index_int"] is None
+
+
+def test_numeric_axis_peels_full_width_merged_trailing_note(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Verification"
+    sheet.append(["序号", "试验项目", "标准"])
+    for number in range(1, 35):
+        sheet.append([number, f"试验-{number}", "标准"])
+    sheet.merge_cells("A36:C36")
+    sheet["A36"] = "备注：提交文件需要盖章"
+
+    projection = build_tabular_structure_projection(
+        "verification.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 34
+    rows = [row for row in projection["rows"] if row["table_ref_kwd"] == complete[0]["table_ref"]]
+    note = next(row for row in rows if row["row_ordinal_int"] == 36)
+    assert note["row_role_kwd"] == "note"
+
+
 def test_unseparated_footer_still_invalidates_completeness(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -5089,6 +5158,23 @@ def test_context_and_g1_splits_preserve_a_sparse_single_record_axis(table_parser
     assert [row["row_ordinal_int"] for row in complete_rows] == [12]
     assert complete[0]["ordered_columns"]
     assert all(column["header_path"] for column in complete[0]["ordered_columns"])
+
+
+def test_single_merged_non_numeric_signoff_region_is_not_complete(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Signoff"
+    sheet["A2"] = "Printed name"
+    sheet.merge_cells("A2:B2")
+    sheet["C2"] = "Prepared by"
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser
+    )
+    assert not any(
+        table["enumeration_status"] == "supported_complete"
+        and table["source_total_count"] == 1
+        for table in projection["tables"]
+    )
 
 
 def test_context_does_not_hide_a_trailing_dense_empty_record_axis(table_parser):

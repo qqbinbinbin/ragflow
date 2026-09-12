@@ -465,7 +465,16 @@ def _effective_record_axis_width(body_rows, merged_ranges, fallback_width: int) 
         + 1
         for row_ordinal, values, _follows_body_gap in body_rows
     ]
-    return max((width for width in populated_widths if width > 0), default=fallback_width)
+    nonzero_widths = [width for width in populated_widths if width > 0]
+    if not nonzero_widths:
+        return fallback_width
+    # A footer/sign-off or other inert sidecar may populate a column beyond
+    # the actual record axis.  Use the dominant populated span; ties retain
+    # the wider span so sparse, genuinely wide records remain admissible.
+    counts = Counter(nonzero_widths)
+    dominant_count = max(counts.values())
+    dominant = [width for width, count in counts.items() if count == dominant_count]
+    return max(dominant)
 
 
 def _has_partial_row_merge(row_ordinal: int, width: int, merged_ranges) -> bool:
@@ -2743,6 +2752,56 @@ def _record_axis_evidence(
             if has_vertical_key_merge or _record_key_numeric_value(key_value) is not None:
                 break
             grouped_tail_notes.insert(0, grouped_candidate_rows.pop())
+        # A numeric record axis can end with a contiguous, non-record note
+        # row. Only peel the tail when the remaining prefix independently
+        # proves a monotonic numeric key; text-key tables remain unchanged.
+        tail_is_key_only = bool(grouped_tail_notes) and all(
+            set(
+                _record_field_offsets(
+                    values,
+                    row_ordinal=row_ordinal,
+                    merged_ranges=merged_ranges,
+                )
+            )
+            <= {key_offset}
+            for row_ordinal, values, _gap in grouped_tail_notes
+        )
+        if tail_is_key_only and _record_key_axis_proven(
+            grouped_candidate_rows,
+            {key_offset},
+        ):
+            rows = grouped_candidate_rows
+            note_rows = [*note_rows, *grouped_tail_notes]
+            grouped_tail_notes = []
+
+        # A trailing full-width merged footer is a structural note when the
+        # preceding rows independently establish a scalar numeric record key.
+        # Keep this proof local to the tail so ordinary text-key and auxiliary
+        # merged measurement tables remain unchanged.
+        if len(grouped_candidate_rows) >= 3:
+            tail_ordinal, tail_values, _tail_gap = grouped_candidate_rows[-1]
+            tail_key = tail_values[key_offset] if key_offset < len(tail_values) else None
+            tail_nonempty = [
+                str(value).strip()
+                for value in tail_values
+                if value is not None and str(value).strip()
+            ]
+            repeated_full_width_note = (
+                len(tail_nonempty) >= 3
+                and len(set(tail_nonempty)) == 1
+            )
+            if (
+                _record_key_numeric_value(tail_key) is None
+                and (repeated_full_width_note or any(
+                    merged.min_row <= tail_ordinal <= merged.max_row
+                    and merged.min_col <= 1
+                    and merged.max_col >= effective_width
+                    for merged in merged_ranges
+                ))
+                and _record_key_axis_proven(grouped_candidate_rows[:-1], {key_offset})
+            ):
+                note_rows = [*note_rows, grouped_candidate_rows.pop()]
+
         grouped_records = _shared_vertical_record_groups(
             grouped_candidate_rows,
             set(
@@ -2848,7 +2907,7 @@ def _record_axis_evidence(
             record_key_axis_proven = _record_key_axis_proven(rows, common_offsets)
         key_only_slots = (
             _record_key_only_slots(rows, row_offsets, common_offsets)
-            if len(headers) > 1 and not grouped_record_ordinals
+            if len(headers) > 1
             else ()
         )
         key_only_slot_set = set(key_only_slots)
@@ -2873,7 +2932,6 @@ def _record_axis_evidence(
             single_axis
             and not record_key_axis_proven
             and not grouped_record_ordinals
-            and not merged_ranges
         ):
             key_value = rows[0][1][min(common_offsets)]
             if _record_key_numeric_value(key_value) is None:
@@ -3530,6 +3588,18 @@ def _project_structure_region(
                 merged_ranges,
                 record_axis_evidence=record_axis_evidence,
             )
+            if row_role == "data" and record_axis_evidence is not None:
+                required_offsets = record_axis_evidence.get("required_offsets", ())
+                key_offset = min(required_offsets) if required_offsets else None
+                occupied = [str(value).strip() for value in values if value is not None and str(value).strip()]
+                repeated_footer = len(occupied) >= 3 and len(set(occupied)) == 1
+                prior_numeric = sum(
+                    _record_key_numeric_value(row_values[key_offset]) is not None
+                    for _ordinal, row_values, _gap in body_rows[:body_index]
+                    if key_offset is not None and key_offset < len(row_values)
+                )
+                if repeated_footer and prior_numeric >= 2:
+                    row_role = "note"
             current_shape = _row_shape(values, distinguish_text_digits=distinguish_text_digits)
             next_shape = (
                 _row_shape(
