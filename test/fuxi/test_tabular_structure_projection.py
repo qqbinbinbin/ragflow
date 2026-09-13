@@ -5272,6 +5272,18 @@ def test_single_merged_non_numeric_signoff_region_is_not_complete(table_parser):
     )
 
 
+def test_single_record_with_merged_header_fields_remains_complete(table_parser):
+    del table_parser
+    merged = (_MergedLookupRange(2, 2, 2, 3),)
+    evidence = tabular_structure._record_axis_evidence(
+        ["Process", "Name", "Characteristic", "Spec", "Method", "Sample"],
+        [(2, [1, "Assembly", "Torque", "35N.m", "Gauge", "125 pcs"], False)],
+        merged,
+    )
+    assert evidence is not None
+    assert evidence["single_record_axis_proven"]
+
+
 def test_context_does_not_hide_a_trailing_dense_empty_record_axis(table_parser):
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",

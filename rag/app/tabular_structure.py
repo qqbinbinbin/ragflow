@@ -2915,7 +2915,7 @@ def _record_axis_evidence(
             record_key_axis_proven = _record_key_axis_proven(rows, common_offsets)
         key_only_slots = (
             _record_key_only_slots(rows, row_offsets, common_offsets)
-            if len(headers) > 1
+            if len(headers) > 1 and not grouped_record_ordinals
             else ()
         )
         key_only_slot_set = set(key_only_slots)
@@ -2940,6 +2940,7 @@ def _record_axis_evidence(
             single_axis
             and not record_key_axis_proven
             and not grouped_record_ordinals
+            and not merged_ranges
         ):
             key_value = rows[0][1][min(common_offsets)]
             if _record_key_numeric_value(key_value) is None:
