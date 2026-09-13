@@ -134,7 +134,7 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v24"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v25"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -551,6 +551,15 @@ def test_v21_projection_contract_remains_available_for_backfill_after_v22_rollov
         "table-producer/v6",
         "tabular-structure-projection/v6",
         "region-producer/v21",
+        "enumeration-rules/v9",
+    ) in tabular_structure._KNOWN_BACKFILL_PROJECTION_CONTRACTS
+
+
+def test_v24_projection_contract_remains_available_for_backfill_after_v25_rollover():
+    assert (
+        "table-producer/v6",
+        "tabular-structure-projection/v6",
+        "region-producer/v24",
         "enumeration-rules/v9",
     ) in tabular_structure._KNOWN_BACKFILL_PROJECTION_CONTRACTS
 
