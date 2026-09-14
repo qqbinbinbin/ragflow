@@ -134,7 +134,7 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v25"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v26"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -4989,6 +4989,25 @@ def test_numeric_axis_peels_contiguous_full_width_merged_tail_notes(table_parser
     assert roles[7] == "note"
 
 
+def test_merged_separator_with_multifield_tail_preserves_numeric_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    for number in range(1, 5):
+        sheet.append([number, f"I-{number}", number * 10, "Open"])
+    for row in (6, 7):
+        sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        sheet.cell(row, 1, f"Context {row}")
+    sheet.append(["Role A", "Person A", "Role B", "Person B"])
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+    )
+    complete = [t for t in projection["tables"] if t["enumeration_status"] == "supported_complete"]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+    assert [c["name"] for c in complete[0]["ordered_columns"]] == ["Sequence", "Item", "Measure", "Status"]
+
+
 def test_unseparated_footer_still_invalidates_completeness(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -5004,6 +5023,20 @@ def test_unseparated_footer_still_invalidates_completeness(table_parser):
     )
 
     assert all(table["source_total_count"] is None for table in projection["tables"])
+
+
+@pytest.mark.parametrize("key", [5, "5"])
+def test_merged_separator_cannot_hide_numeric_record_continuation(key):
+    rows = [(number + 1, [number, f"Item {number}", number * 10], False) for number in range(1, 5)]
+    rows.extend([(6, ["Context", None, None], False), (7, ["Context", None, None], False), (8, [key, "Item 5", 50], False)])
+    evidence = tabular_structure._record_axis_evidence(
+        ["Sequence", "Item", "Value"], rows,
+        [_MergedLookupRange(6, 1, 6, 3), _MergedLookupRange(7, 1, 7, 3)],
+    )
+    assert evidence is None or (
+        8 in evidence["record_row_ordinals"]
+        and 8 not in evidence["note_row_ordinals"]
+    )
 
 
 def test_candidate_selection_prefers_the_closed_record_axis_over_wider_context(

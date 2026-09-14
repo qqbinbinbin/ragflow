@@ -34,7 +34,7 @@ TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v25"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v26"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v1"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -60,6 +60,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v22", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v23", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v24", "enumeration-rules/v9"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v25", "enumeration-rules/v9"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -1667,7 +1668,10 @@ def _parse_region_structure(parser, worksheet, rows):
                 continue
             if following_rows and following_rows[0][0] != end + 1:
                 continue
-            evidence = _record_axis_evidence(candidate_headers, following_rows, merged_ranges)
+            evidence = _record_axis_evidence(
+                candidate_headers, following_rows, merged_ranges,
+                allow_separated_context_tail=False,
+            )
             if evidence is None:
                 continue
             if evidence["single_record_axis_proven"] and not _single_record_header_boundary_proven(
@@ -2673,6 +2677,8 @@ def _record_axis_evidence(
     headers: list[str],
     body_rows: list[tuple[int, list[object], bool]],
     merged_ranges,
+    *,
+    allow_separated_context_tail: bool = True,
 ) -> dict[str, Any] | None:
     """Prove one physical record axis from geometry and source-backed values."""
 
@@ -2783,6 +2789,36 @@ def _record_axis_evidence(
             rows = grouped_candidate_rows
             note_rows = [*note_rows, *grouped_tail_notes]
             grouped_tail_notes = []
+
+        # Full-width rows removed from the candidate axis can separate its
+        # numeric prefix from a final multi-field context row. Reconcile this
+        # interleaved suffix only after proving the multi-column prefix; a
+        # narrow header hypothesis must not discard other source fields.
+        if allow_separated_context_tail and unknown_rows and grouped_tail_notes and len(headers) > 1:
+            suffix = sorted([*unknown_rows, *grouped_tail_notes], key=lambda row: row[0])
+            ordinals = [grouped_candidate_rows[-1][0], *(row[0] for row in suffix)]
+            if (
+                _record_key_axis_proven(grouped_candidate_rows, {key_offset})
+                and grouped_candidate_rows[-1][0] < min(row[0] for row in unknown_rows)
+                and max(row[0] for row in unknown_rows) < grouped_tail_notes[0][0]
+                and all(_is_full_width_merge(row[0], len(headers), merged_ranges) for row in unknown_rows)
+                and all(
+                    len(_record_field_offsets(values, row_ordinal=ordinal, merged_ranges=merged_ranges)) > 1
+                    for ordinal, values, _gap in grouped_candidate_rows
+                )
+                and all(
+                    _record_rows_are_semantically_adjacent(left, right, len(headers), merged_ranges)
+                    for left, right in zip(ordinals, ordinals[1:])
+                )
+                and all(
+                    _record_key_numeric_value(values[key_offset] if key_offset < len(values) else None) is None
+                    for _ordinal, values, _gap in suffix
+                )
+            ):
+                rows = grouped_candidate_rows
+                note_rows = [*note_rows, *suffix]
+                unknown_rows = ()
+                grouped_tail_notes = []
 
         # A proven numeric axis may be followed by several contiguous,
         # full-width merged sign-off/note rows.  Treat the whole structural
