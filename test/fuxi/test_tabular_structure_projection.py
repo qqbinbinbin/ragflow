@@ -4958,6 +4958,37 @@ def test_numeric_axis_peels_full_width_merged_trailing_note(table_parser):
     assert note["row_role_kwd"] == "note"
 
 
+def test_numeric_axis_peels_contiguous_full_width_merged_tail_notes(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Verification"
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    for number in range(1, 5):
+        sheet.append([number, f"I-{number}", number * 10, "Open"])
+    sheet.merge_cells("A6:D6")
+    sheet["A6"] = "Prepared by"
+    sheet.merge_cells("A7:D7")
+    sheet["A7"] = "Approved by"
+
+    projection = build_tabular_structure_projection(
+        "verification.xlsx",
+        _save_workbook(workbook),
+        parser=table_parser,
+    )
+    complete = [
+        table
+        for table in projection["tables"]
+        if table["enumeration_status"] == "supported_complete"
+    ]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 4
+    rows = [row for row in projection["rows"] if row["table_ref_kwd"] == complete[0]["table_ref"]]
+    assert [row["row_ordinal_int"] for row in rows if row["row_role_kwd"] == "data"] == [2, 3, 4, 5]
+    roles = {row["row_ordinal_int"]: row["row_role_kwd"] for row in rows}
+    assert roles[6] == "note"
+    assert roles[7] == "note"
+
+
 def test_unseparated_footer_still_invalidates_completeness(table_parser):
     workbook = Workbook()
     sheet = workbook.active

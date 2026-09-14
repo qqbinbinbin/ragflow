@@ -2784,6 +2784,25 @@ def _record_axis_evidence(
             note_rows = [*note_rows, *grouped_tail_notes]
             grouped_tail_notes = []
 
+        # A proven numeric axis may be followed by several contiguous,
+        # full-width merged sign-off/note rows.  Treat the whole structural
+        # tail as notes only when every tail row is geometrically merged and
+        # carries no numeric key; mixed or unproven tails remain fail-closed.
+        merged_structural_tail = bool(grouped_tail_notes) and all(
+            _record_key_numeric_value(
+                values[key_offset] if key_offset < len(values) else None
+            ) is None
+            and _is_full_width_merge(row_ordinal, len(headers), merged_ranges)
+            for row_ordinal, values, _gap in grouped_tail_notes
+        )
+        if merged_structural_tail and _record_key_axis_proven(
+            grouped_candidate_rows,
+            {key_offset},
+        ):
+            rows = grouped_candidate_rows
+            note_rows = [*note_rows, *grouped_tail_notes]
+            grouped_tail_notes = []
+
         # A trailing full-width merged footer is a structural note when the
         # preceding rows independently establish a scalar numeric record key.
         # Keep this proof local to the tail so ordinary text-key and auxiliary
@@ -2887,6 +2906,30 @@ def _record_axis_evidence(
             common_offsets,
             merged_ranges,
         ) if grouping_allowed else None
+        if grouped_records is None and unknown_rows:
+            key_offset = min(common_offsets)
+            unknown_tail_is_structural = all(
+                _record_key_numeric_value(
+                    values[key_offset] if key_offset < len(values) else None
+                ) is None
+                and _is_full_width_merge(row_ordinal, len(headers), merged_ranges)
+                for row_ordinal, values, _gap in unknown_rows
+            )
+            unknown_ordinals = [row[0] for row in unknown_rows]
+            tail_is_contiguous = bool(rows) and all(
+                _record_rows_are_semantically_adjacent(left, right, len(headers), merged_ranges)
+                for left, right in zip(
+                    [rows[-1][0], *unknown_ordinals],
+                    unknown_ordinals,
+                )
+            )
+            if (
+                unknown_tail_is_structural
+                and tail_is_contiguous
+                and _record_key_axis_proven(rows, {key_offset})
+            ):
+                note_rows = [*note_rows, *unknown_rows]
+                unknown_rows = ()
         grouped_record_ordinals = ()
         grouped_continuation_ordinals = ()
         if grouped_records is not None:
