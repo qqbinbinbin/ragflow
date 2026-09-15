@@ -7,7 +7,7 @@ from io import BytesIO
 
 import pytest
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Border, PatternFill, Side
 
 from test.fuxi.test_table_semantic_rows import _load_table_module
 
@@ -118,6 +118,145 @@ def test_four_accepted_sources_keep_structure_semantics_with_index(monkeypatch, 
         return result
 
     assert summarize(indexed, indexed_workbook) == summarize(linear, linear_workbook)
+
+
+@pytest.mark.parametrize(
+    "source_path,source_sha256",
+    [
+        pytest.param(
+            "/opt/fuxi/evidence/ppap-four-file-current-identity-20260914t051021853198z-6d7431ba/remote-originals/F515-转向柱总成SZ02-豫北转向.xls",
+            "0d19cdc06b12773e963c71b367e7234e57482d5e883014e5dfdb435f57c5deb2",
+            id="original-upload",
+        ),
+        pytest.param(
+            "/opt/fuxi/evidence/f515-new-source-producer-replay-20260915-20260915t020918747155z-f573fe62/F515-new.xls",
+            "36a044c8dd2ef8f1c134eb46819477c3eca222f2f2c0bea8f18804bac22d9d37",
+            id="replacement-upload",
+        ),
+    ],
+)
+def test_uploaded_f515_pfmea_body_is_one_supported_record_axis(monkeypatch, source_path, source_sha256):
+    try:
+        with open(source_path, "rb") as source_file:
+            source_bytes = source_file.read()
+    except FileNotFoundError:
+        pytest.skip("uploaded-source evidence is not mounted")
+    assert hashlib.sha256(source_bytes).hexdigest() == source_sha256
+    projection = build_tabular_structure_projection(
+        source_path.rsplit("/", 1)[-1],
+        source_bytes,
+        parser=_load_table_module(monkeypatch).Excel(),
+        producer_generation_ref="11111111-1111-5111-8111-111111111111",
+    )
+    pfmea = [
+        table for table in projection["tables"]
+        if table.get("table_label") == "8、潜在失效模式及后果分析（PFMEA）"
+        and table.get("enumeration_status") == "supported_complete"
+    ]
+    assert len(pfmea) == 1
+    assert pfmea[0]["source_total_count"] >= 100
+    assert len(pfmea[0]["ordered_columns"]) >= 18
+
+
+def test_uploaded_xls_preserves_source_table_grid(monkeypatch):
+    # Native BIFF XF evidence: these header, dense-body and sparse-body cells
+    # all have thin borders on four sides. They must survive XLS conversion;
+    # border preservation does not itself classify a row as a business record.
+    source_path = "/opt/fuxi/evidence/f515-new-source-producer-replay-20260915-20260915t020918747155z-f573fe62/F515-new.xls"
+    try:
+        with open(source_path, "rb") as source_file:
+            source_bytes = source_file.read()
+    except FileNotFoundError:
+        pytest.skip("uploaded-source evidence is not mounted")
+    assert hashlib.sha256(source_bytes).hexdigest() == "36a044c8dd2ef8f1c134eb46819477c3eca222f2f2c0bea8f18804bac22d9d37"
+    workbook = _load_table_module(monkeypatch).Excel._load_excel_to_workbook(BytesIO(source_bytes))
+    for worksheet in workbook:
+        occupied = [cell for cell in worksheet._cells.values() if cell.value is not None]
+        max_row = max([1, *(cell.row for cell in occupied), *(item.max_row for item in worksheet.merged_cells.ranges)])
+        max_column = max([1, *(cell.column for cell in occupied), *(item.max_col for item in worksheet.merged_cells.ranges)])
+        assert worksheet.max_row == max_row
+        assert worksheet.max_column == max_column
+    sheet = workbook["8、潜在失效模式及后果分析（PFMEA）"]
+    for row in (14, 15, 146, 147, 148, 149):
+        for column in range(1, 19):
+            cell = sheet.cell(row, column)
+            actual = tuple(getattr(cell.border, side).style for side in ("left", "right", "top", "bottom"))
+            assert actual == ("thin",) * 4, (cell.coordinate, actual)
+
+
+@pytest.mark.parametrize("grid", ["complete", "absent", "broken_suffix", "missing_header"])
+def test_grid_preserves_sparse_text_records_without_guessing_unbordered_rows(monkeypatch, grid):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Operation", "Observation", "Rating"])
+    sheet.append(["Assembly", "Checked", 4])
+    sheet.append([None, "Measured", 5])
+    sheet.append([None, "Verified", 6])
+    sheet.append(["Storage", None, None])
+    sheet.append(["See dispatch analysis", None, None])
+    if grid != "absent":
+        border = Border(**{name: Side(style="thin") for name in ("left", "right", "top", "bottom")})
+        for row in sheet.iter_rows():
+            for cell in row:
+                cell.border = border
+        if grid == "broken_suffix":
+            sheet.cell(5, 2).border = Border(left=Side(style="thin"))
+        if grid == "missing_header":
+            sheet.cell(1, 2).border = Border()
+    output = BytesIO()
+    workbook.save(output)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", output.getvalue(), parser=_load_table_module(monkeypatch).Excel(),
+        producer_generation_ref="11111111-1111-5111-8111-111111111111",
+    )
+    supported = [table for table in projection["tables"] if table.get("enumeration_status") == "supported_complete"]
+    if grid == "complete":
+        assert len(supported) == 1
+        assert supported[0]["source_total_count"] == 5
+    else:
+        assert not supported
+
+
+@pytest.mark.parametrize("width", [3, 4])
+def test_empty_side_column_cannot_turn_section_band_into_records(width):
+    sheet = Workbook().active
+    sheet.merge_cells("A2:C2")
+    sheet["A2"] = "Section heading"
+    rows = [
+        (2, ["Section heading"] * 3 + [None] * (width - 3), False),
+        (3, ["Part", "Code", "Quantity"] + [None] * (width - 3), False),
+    ]
+    evidence = tabular_structure._record_axis_evidence(
+        [f"Field {index}" for index in range(width)],
+        rows,
+        list(sheet.merged_cells.ranges),
+    )
+    assert evidence is None
+
+
+@pytest.mark.parametrize("width", [3, 4])
+def test_blank_leaf_is_not_single_record_header_evidence(width):
+    sheet = Workbook().active
+    sheet.merge_cells("A1:C1")
+    sheet["A1"] = "Context"
+    sheet.merge_cells("A2:C2")
+    sheet["A2"] = "Section"
+    assert not tabular_structure._single_record_header_boundary_proven(
+        sheet, header_start=0, data_start=2, width=width,
+        merged_ranges=list(sheet.merged_cells.ranges),
+        record_axis_evidence={"record_row_ordinals": (3,), "required_offsets": (0, 1, 2)},
+    )
+
+
+def test_grid_suffix_cannot_hide_a_split_inside_the_dense_axis():
+    # Even a separately proved suffix cannot bless two independent dense axes.
+    region = {
+        "members": {(r, c) for r in (2, 3, 4) for c in (1, 4)} | {(5, 1)},
+        "g1_children": [{(r, 1) for r in (2, 3, 4)}, {(r, 4) for r in (2, 3, 4)}, {(5, 1)}],
+    }
+    assert not tabular_structure._g1_disagreement_is_outside_record_axis(
+        Workbook().active, region, {2, 3, 4, 5}, grid_suffix_row_ordinals={5},
+    )
 
 
 def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
@@ -703,6 +842,111 @@ def test_title_backed_multilevel_header_after_metadata_proves_empty_record_axis(
     assert len(complete[0]["ordered_columns"]) == 11
     assert len(projection["tables"]) == 1
     assert projection["rows"] == []
+
+
+@pytest.mark.parametrize("numeric_record", [False, True, "text_key"])
+def test_empty_single_row_merged_header_after_context_excludes_navigation(table_parser, numeric_record):
+    # Header-only source geometry: sparse form context, one blank separator,
+    # then a dense header band with independent horizontal field anchors.
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Form title"
+    sheet["D3"] = "Owner"
+    sheet["F3"] = "Review"
+    sheet["A4"] = "Part"
+    sheet["G4"] = "Return"
+    sheet["A5"] = "Revision"
+    sheet["D5"] = "Approved"
+    sheet["F5"] = "Date"
+    sheet["A7"] = "Sequence"
+    sheet["B7"] = "Instrument"
+    sheet.merge_cells("B7:C7")
+    sheet["D7"] = "Resolution"
+    sheet["E7"] = "Study"
+    sheet.merge_cells("E7:F7")
+    if numeric_record:
+        sheet["A7"] = "L01" if numeric_record == "text_key" else 1
+        sheet["B7"] = "Micrometer"
+        sheet["D7"] = 0.01
+        sheet["E7"] = "GRR"
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+        producer_generation_ref=_generation_ref(),
+    )
+    complete = [table for table in projection["tables"] if table["enumeration_status"] == "supported_complete"]
+    if numeric_record:
+        assert all(table["source_total_count"] != 0 for table in complete)
+        return
+    assert len(complete) == 1, projection["tables"]
+    assert complete[0]["source_total_count"] == 0
+    assert len(complete[0]["ordered_columns"]) == 6
+
+
+@pytest.mark.parametrize("shape", ["single_anchor", "interior_gap", "dense_context", "body_value"])
+def test_empty_merged_header_requires_independent_dense_terminal_fields(table_parser, shape):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Context"
+    sheet["A3"] = "Identifier"
+    sheet["B3"] = "Measure"
+    sheet.merge_cells("B3:C3")
+    sheet["D3"] = "Method"
+    if shape == "single_anchor":
+        sheet["B3"] = None
+        sheet["D3"] = None
+        sheet.merge_cells("A3:D3")
+    elif shape == "interior_gap":
+        sheet["B3"] = None
+    elif shape == "dense_context":
+        sheet["B1"] = "Owner"
+        sheet["C1"] = "Revision"
+    else:
+        sheet["B4"] = "unresolved body"
+    rows, populated, unresolved = tabular_structure._complete_worksheet_rows(sheet)
+    assert tabular_structure._trailing_empty_record_axis_structure(
+        table_parser, sheet, rows, populated, unresolved,
+    ) is None
+
+
+def test_trailing_signoff_band_cannot_replace_populated_table_with_empty_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Measurement", "Criterion", "Result", "Return"])
+    sheet.append([1, "Sample A", 10, "Pass"])
+    sheet.append([2, "Sample B", 20, "Pass"])
+    sheet.merge_cells("A5:D5")
+    sheet["A5"] = "Notes"
+    sheet.merge_cells("A6:B6")
+    sheet["A6"] = "Prepared"
+    sheet["C6"] = "Reviewed"
+    sheet["D6"] = "Approved"
+    rows, populated, unresolved = tabular_structure._complete_worksheet_rows(sheet)
+    assert tabular_structure._trailing_empty_record_axis_structure(
+        table_parser, sheet, rows, populated, unresolved,
+    ) is None
+
+
+@pytest.mark.parametrize("record_key", [1, "L01"])
+def test_merged_header_with_populated_body_is_not_an_empty_terminal_band(table_parser, record_key):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "Context"
+    sheet["F1"] = "Navigation"
+    sheet["A3"] = "Sequence"
+    sheet["B3"] = "Characteristic"
+    sheet.merge_cells("B3:C3")
+    sheet["D3"] = "Method"
+    sheet["E3"] = "Sample"
+    sheet.append([record_key, "Diameter", None, "Gauge", 125])
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+        producer_generation_ref=_generation_ref(),
+    )
+    assert not any(
+        table["enumeration_status"] == "supported_complete"
+        and table["source_total_count"] == 0
+        for table in projection["tables"]
+    ), projection["tables"]
 
 
 def test_empty_record_axis_ignores_a_disjoint_sidecar_outside_the_table_columns(table_parser):
@@ -5008,6 +5252,114 @@ def test_merged_separator_with_multifield_tail_preserves_numeric_axis(table_pars
     assert [c["name"] for c in complete[0]["ordered_columns"]] == ["Sequence", "Item", "Measure", "Status"]
 
 
+@pytest.mark.parametrize("with_footer", [False, True])
+def test_merged_group_separator_preserves_restarted_numeric_records(table_parser, with_footer):
+    # Uploaded-source diagnosis: F515 SHA 0d19cdc06b12773e963c71b367e7234e57482d5e883014e5dfdb435f57c5deb2
+    # has two independently proven numeric groups separated by one full-width
+    # merged context row. This anonymous fixture keeps that geometry, not its labels/counts.
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Item", "Measure", "Status"])
+    sheet.append([1, "A", 10, "Open"])
+    sheet.append([2, "B", 20, "Open"])
+    sheet.merge_cells("A4:D4")
+    sheet["A4"] = "Group context"
+    sheet.append([1, "C", 30, "Open"])
+    sheet.append([2, "D", 40, "Open"])
+    sheet.append([3, "E", 50, "Open"])
+    if with_footer:
+        for row in (8, 9):
+            sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+            sheet.cell(row, 1, "Context")
+        sheet.append(["Role A", "Person A", "Role B", "Person B"])
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+    )
+    complete = [t for t in projection["tables"] if t["enumeration_status"] == "supported_complete"]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 5
+    assert [c["name"] for c in complete[0]["ordered_columns"]] == ["Sequence", "Item", "Measure", "Status"]
+    rows = [r for r in projection["rows"] if r["table_ref_kwd"] == complete[0]["table_ref"]]
+    assert [r["row_ordinal_int"] for r in rows if r["row_role_kwd"] == "data"] == [2, 3, 5, 6, 7]
+    notes = {r["row_ordinal_int"]: r for r in rows if r["row_role_kwd"] == "note"}
+    assert 4 in notes
+    if with_footer:
+        assert set(notes) == {4, 8, 9, 10}
+        assert all(notes[i]["data_row_index_int"] is None for i in notes)
+
+
+@pytest.mark.parametrize("extra_records", [1, 2])
+def test_grouped_workbook_never_completes_without_records_after_gap(table_parser, extra_records):
+    workbook = Workbook()
+    sheet = workbook.active
+    for row in [["Sequence", "Item", "Value"], [1, "A", 10], [2, "B", 20],
+                ["Group context"], [1, "C", 30], [2, "D", 40], []]:
+        sheet.append(row)
+    sheet.merge_cells("A4:C4")
+    for key in range(3, 3 + extra_records):
+        sheet.append([key, f"Item {key}", key * 10])
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+    )
+    for table in projection["tables"]:
+        if table["enumeration_status"] == "supported_complete":
+            assert table["source_total_count"] == 4 + extra_records
+
+
+@pytest.mark.parametrize("separator", ["unmerged", "partial", "numeric", "gap"])
+def test_numeric_group_union_requires_proven_context_band(separator):
+    rows = [(2, [1, "A", 10], False), (3, [2, "B", 20], False),
+            (4, ["Context", None, None], False),
+            (5, [1, "C", 30], False), (6, [2, "D", 40], False)]
+    merges = [_MergedLookupRange(4, 1, 4, 3)]
+    if separator == "unmerged":
+        merges = []
+    elif separator == "partial":
+        merges = [_MergedLookupRange(4, 1, 4, 2)]
+    elif separator == "numeric":
+        rows[2] = (4, [3, None, None], False)
+    else:
+        rows[-2:] = [(6, [1, "C", 30], True), (7, [2, "D", 40], False)]
+    proof = tabular_structure._record_axis_evidence(["Sequence", "Item", "Value"], rows, merges)
+    assert proof is None or not (
+        proof["record_key_axis_proven"]
+        and proof["record_axis_contiguous"]
+        and not proof["unknown_row_ordinals"]
+    )
+
+
+def test_group_union_cannot_hide_numeric_record_after_gap():
+    rows = [(2, [1, "A", 10], False), (3, [2, "B", 20], False),
+            (4, ["Context", None, None], False),
+            (5, [1, "C", 30], False), (6, [2, "D", 40], False),
+            (8, [3, "E", 50], True)]
+    proof = tabular_structure._record_axis_evidence(
+        ["Sequence", "Item", "Value"], rows, [_MergedLookupRange(4, 1, 4, 3)],
+    )
+    assert proof is None or not (
+        proof["record_key_axis_proven"] and proof["record_axis_contiguous"]
+        and not proof["unknown_row_ordinals"] and 8 not in proof["record_row_ordinals"]
+    )
+
+
+def test_three_numeric_groups_preserve_all_source_rows():
+    rows = []
+    merges = []
+    for group in range(3):
+        if group:
+            ordinal = len(rows) + 2
+            rows.append((ordinal, ["Context", None, None], False))
+            merges.append(_MergedLookupRange(ordinal, 1, ordinal, 3))
+        for key in (1, 2):
+            rows.append((len(rows) + 2, [key, f"Item {group}-{key}", key], False))
+    proof = tabular_structure._record_axis_evidence(["Sequence", "Item", "Value"], rows, merges)
+    assert proof is not None
+    assert proof["record_row_ordinals"] == (2, 3, 5, 6, 8, 9)
+    assert proof["note_row_ordinals"] == (4, 7)
+    assert proof["record_key_axis_proven"]
+    assert not proof["unknown_row_ordinals"]
+
+
 def test_unseparated_footer_still_invalidates_completeness(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -5786,12 +6138,13 @@ def test_nested_sparse_header_is_not_emitted_as_a_data_row(table_parser):
         "data",
         "data",
     ]
+    # Details spans C:H; the empty H field remains part of the merged axis.
     assert [
         column["column_id"] for column in table["ordered_columns"]
-    ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 8)]
+    ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 9)]
     assert [
         column["column_ordinal"] for column in table["ordered_columns"]
-    ] == list(range(1, 8))
+    ] == list(range(1, 9))
 
 
 def test_merged_header_continuation_is_not_emitted_as_a_data_row(table_parser):
@@ -5877,6 +6230,32 @@ def test_multilevel_sparse_table_ignores_context_only_g1_disagreement(table_pars
     assert [
         column["column_id"] for column in table["ordered_columns"]
     ] == [f"col_v1:1:{ordinal}" for ordinal in range(1, 9)]
+
+
+@pytest.mark.parametrize("child_kind", ["sparse_record", "outside_axis", "no_owned_key"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_g1_singleton_uses_full_record_child_columns_and_owned_key(child_kind, nested):
+    worksheet = Workbook().active
+    worksheet.append(["Sequence", "Optional", "Value"])
+    worksheet.append([1, None, 10])
+    worksheet.append([2, None, 20])
+    record_child = {(1, 1), (1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 3)}
+    worksheet.cell(5, 1, 3)
+    if child_kind == "outside_axis":
+        child = {(5, 5)}
+        worksheet.cell(5, 5, "Annotation")
+    elif child_kind == "no_owned_key":
+        child = {(5, 2)}
+        worksheet.cell(5, 2, "Annotation")
+    else:
+        child = {(5, 1), (5, 2)}
+        worksheet.cell(5, 2, "New business value")
+    region = {"members": record_child | child, "g1_children": [record_child, child]}
+    if nested:
+        region["g1_children"].insert(1, {(2, 3), (3, 3)})
+    assert tabular_structure._g1_disagreement_is_outside_record_axis(
+        worksheet, region, {2, 3},
+    ) is (child_kind != "sparse_record")
 
 
 def test_nested_record_axis_g1_children_are_covered_by_one_dominant_axis():
@@ -6254,6 +6633,39 @@ def test_context_form_does_not_become_part_of_the_multilevel_header(
     ]
 
 
+def test_sparse_record_axis_excludes_context_without_a_matching_parser_fallback(table_parser):
+    workbook = load_workbook(BytesIO(
+        _context_form_before_multilevel_header_workbook_bytes(record_count=6)
+    ))
+    sheet = workbook.active
+    for coordinate in ("C6", "F6", "H6"):
+        sheet[coordinate] = None
+    for index, row in enumerate(range(9, 15)):
+        for column in range(1, 11):
+            sheet.cell(row, column).value = None
+        if index % 2 == 0:
+            sheet.cell(row, 1, index // 2 + 1)
+            sheet.cell(row, 2, f"Test {index // 2 + 1}")
+        sheet.cell(row, 4, f"Criterion {index}")
+        sheet.cell(row, 8, f"Observation {index}")
+    rows, _populated, _unresolved = tabular_structure._complete_worksheet_rows(sheet)
+    headers, header_start, data_start = tabular_structure._parse_region_structure(
+        table_parser, sheet, rows,
+    )
+    assert (header_start, data_start) == (6, 8), (headers, header_start, data_start)
+    assert headers[0] == "Sequence"
+    assert len(headers) == 10
+    assert headers[-1] == "Measured-Run 3"
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+        producer_generation_ref=_generation_ref(),
+    )
+    complete = [t for t in projection["tables"] if t["enumeration_status"] == "supported_complete"]
+    assert len(complete) == 1
+    assert complete[0]["source_total_count"] == 6
+    assert len(complete[0]["ordered_columns"]) == 10
+
+
 def test_context_form_pairs_metadata_by_source_merge_geometry(
     table_parser,
 ):
@@ -6282,12 +6694,74 @@ def test_context_form_pairs_metadata_by_source_merge_geometry(
     ]
 
 
+def test_populated_parent_header_groups_remain_part_of_sparse_axis_header(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    for start, label in ((1, "Identity"), (5, "Outcome")):
+        sheet.merge_cells(start_row=1, start_column=start, end_row=1, end_column=start + 3)
+        sheet.cell(1, start, label)
+    sheet.append(["Key", "Name", "Lower", "Upper", "Tool", "Procedure", "Observed", "Status"])
+    sheet.append([1, "A", None, 10, None, None, 9, None])
+    sheet.append([2, "B", None, 20, None, None, 19, None])
+    rows, _populated, _unresolved = tabular_structure._complete_worksheet_rows(sheet)
+    headers, header_start, data_start = tabular_structure._parse_region_structure(
+        table_parser, sheet, rows,
+    )
+    assert (header_start, data_start) == (0, 2)
+    assert headers[0] == "Identity-Key"
+    assert headers[6] == "Outcome-Observed"
+
+
+@pytest.mark.parametrize("numeric_footer", [False, True])
+def test_sparse_body_footer_proof_uses_header_columns_without_losing_records(table_parser, numeric_footer):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Key", "Name", "Optional", "Value", "Method", "Note"])
+    sheet.append([1, "A", None, 10])
+    sheet.append([2, "B", None, 20])
+    sheet.merge_cells("A5:F5")
+    sheet["A5"] = "Context"
+    sheet.merge_cells("A6:B6")
+    sheet["A6"] = 3 if numeric_footer else "Prepared"
+    sheet["C6"] = "Person A"
+    sheet.merge_cells("D6:E6")
+    sheet["D6"] = "Reviewed"
+    sheet["F6"] = "Person B"
+    regions = tabular_structure._worksheet_structure_regions(table_parser, sheet, 1)
+    assert len(regions) == 1
+    assert tabular_structure._g1_disagreement_is_outside_record_axis(
+        sheet, regions[0], {2, 3},
+    ) is (not numeric_footer)
+
+
+def test_same_named_disjoint_parent_headers_do_not_extend_the_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    for start in (1, 3):
+        sheet.merge_cells(start_row=1, start_column=start, end_row=1, end_column=start + 1)
+        sheet.cell(1, start, "Group")
+    sheet.append(["Key", "Value", "External A", "External B"])
+    sheet.append([1, 10])
+    sheet.append([2, 20])
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+        producer_generation_ref=_generation_ref(),
+    )
+    complete = [t for t in projection["tables"] if t["source_total_count"] == 2]
+    assert len(complete) == 1
+    assert len(complete[0]["ordered_columns"]) == 2
+
+
+@pytest.mark.parametrize("record_count", [2, 19, 20, 21])
 def test_unused_trailing_table_column_does_not_hide_right_side_context(
-    table_parser,
+    table_parser, record_count,
 ):
+    workbook = load_workbook(BytesIO(_context_form_with_an_unused_trailing_table_column_bytes()))
+    for index in range(3, record_count + 1):
+        workbook.active.append([index, "Inspect", "Surface", "Fixture", "A", "Clean", "Visual"])
     projection = build_tabular_structure_projection(
         "anonymous.xlsx",
-        _context_form_with_an_unused_trailing_table_column_bytes(),
+        _save_workbook(workbook),
         producer_generation_ref=_generation_ref(),
         parser=table_parser,
     )
@@ -6295,7 +6769,7 @@ def test_unused_trailing_table_column_does_not_hide_right_side_context(
     table = next(
         table
         for table in projection["tables"]
-        if table["source_total_count"] == 2
+        if table["source_total_count"] == record_count
     )
     assert [column["header_path"] for column in table["ordered_columns"]] == [
         ["Sequence"],
@@ -7707,6 +8181,47 @@ def test_legacy_measurement_plan_with_auxiliary_vertical_merge_keeps_record_axis
     )
     assert target["source_total_count"] == 59, target
     assert target["enumeration_status"] == "supported_complete"
+
+
+@pytest.mark.parametrize("footer_width", [1, 3, 6])
+def test_numeric_record_axis_preserves_single_anchor_merged_signoff(table_parser, footer_width):
+    # Source geometry: a multi-column measurement axis followed by key-column
+    # notes and one horizontally merged signoff anchor, not another record.
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Key", "Limit", "Sample A", "Sample B", "Result", "Comment"])
+    for key in range(1, 5):
+        sheet.append([key, "10+1", 10, 11, "pass", "checked"])
+    sheet.append(["Note"])
+    sheet.append(["Signed"])
+    if footer_width > 1:
+        sheet.merge_cells(start_row=7, start_column=1, end_row=7, end_column=footer_width)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+        producer_generation_ref=_generation_ref(),
+    )
+    complete = [table for table in projection["tables"] if table["source_total_count"] == 4]
+    assert len(complete) == 1, projection["tables"]
+    data = [row for row in projection["rows"] if row["row_role_kwd"] == "data"]
+    assert [row["row_ordinal_int"] for row in data] == [2, 3, 4, 5]
+    notes = {row["row_ordinal_int"]: row for row in projection["rows"] if row["row_role_kwd"] == "note"}
+    assert set(notes) == {6, 7}
+    for ordinal, text in [(6, "Note"), (7, "Signed")]:
+        assert notes[ordinal]["data_row_index_int"] is None
+        assert text in {field["value"] for field in json.loads(notes[ordinal]["ordered_fields_list"])}
+
+
+@pytest.mark.parametrize("key, other_value", [(5, None), ("5", None), ("Signed", "measurement")])
+def test_merged_tail_never_discards_numeric_or_multifield_record(key, other_value):
+    rows = [(i + 1, [i, "limit", "sample", "result"], False) for i in range(1, 5)]
+    rows.append((6, [key, key, None, other_value], False))
+    evidence = tabular_structure._record_axis_evidence(
+        ["Key", "Limit", "Sample", "Result"], rows,
+        [_MergedLookupRange(6, 1, 6, 2)],
+    )
+    assert evidence is None or (
+        6 in evidence["record_row_ordinals"] and 6 not in evidence["note_row_ordinals"]
+    )
 
 
 def test_global_indices_and_totals_survive_projection_part_boundaries(table_parser):

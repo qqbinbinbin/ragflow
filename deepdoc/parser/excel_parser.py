@@ -13,17 +13,97 @@
 
 import logging
 import re
+import struct
 import sys
 from io import BytesIO
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Border, Side
 
 from rag.nlp import find_codec
 from rag.utils.lazy_image import LazyImage
 
 # copied from `/openpyxl/cell/cell.py`
 ILLEGAL_CHARACTERS_RE = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]")
+
+
+def _biff8_cell_borders(stream):
+    """Read explicit cell XF border geometry without evaluating XLS formulas.
+
+    Calamine remains the authority for values and merges. Reject incomplete
+    metadata as a unit so a truncated stream cannot prove a partial grid.
+    Sheet slots include non-worksheets, matching BOUNDSHEET display order.
+    """
+    def records(offset):
+        while offset < len(stream):
+            if offset + 4 > len(stream):
+                raise ValueError("truncated BIFF record header")
+            kind, size = struct.unpack_from("<HH", stream, offset)
+            end = offset + 4 + size
+            if end > len(stream):
+                raise ValueError("truncated BIFF record")
+            yield kind, stream[offset + 4:end]
+            offset = end
+            if kind == 0x000A:
+                return
+        raise ValueError("missing BIFF EOF")
+
+    def checked_records(offset, substream_type):
+        iterator = records(offset)
+        kind, payload = next(iterator, (None, b""))
+        if kind != 0x0809 or len(payload) < 4 or struct.unpack_from("<HH", payload) != (0x0600, substream_type):
+            raise ValueError("expected BIFF8 substream")
+        return iterator
+
+    formats, sheets = [], []
+    for kind, payload in checked_records(0, 5):
+        if kind == 0x00E0:
+            if len(payload) != 20:
+                raise ValueError("invalid BIFF8 XF")
+            bits = struct.unpack_from("<I", payload, 10)[0]
+            sides = tuple((bits >> shift) & 15 for shift in (0, 4, 8, 12))
+            if any(side > 13 for side in sides):
+                raise ValueError("invalid BIFF border style")
+            formats.append(sides)
+        elif kind == 0x0085:
+            if len(payload) < 8:
+                raise ValueError("invalid BIFF BOUNDSHEET")
+            sheets.append((struct.unpack_from("<I", payload)[0], payload[5]))
+    if not sheets:
+        raise ValueError("missing BIFF sheets")
+    result = []
+    minimum_sizes = {0x0201: 6, 0x0203: 14, 0x0204: 9, 0x0205: 8, 0x00FD: 10, 0x027E: 10, 0x0006: 22}
+    for offset, sheet_type in sheets:
+        cells = {}
+        result.append(cells)
+        if sheet_type != 0:
+            continue
+
+        def add(row, column, xf):
+            if column > 255 or xf >= len(formats):
+                raise ValueError("invalid BIFF cell format reference")
+            coordinate = (row + 1, column + 1)
+            if coordinate in cells:
+                raise ValueError("duplicate BIFF cell format")
+            cells[coordinate] = formats[xf]
+
+        for kind, payload in checked_records(offset, 16):
+            if kind in minimum_sizes:
+                if len(payload) < minimum_sizes[kind]:
+                    raise ValueError("invalid BIFF cell record")
+                add(*struct.unpack_from("<HHH", payload))
+            elif kind in (0x00BE, 0x00BD):
+                if len(payload) < 8:
+                    raise ValueError("invalid BIFF multi-cell record")
+                row, first = struct.unpack_from("<HH", payload)
+                last = struct.unpack_from("<H", payload, len(payload) - 2)[0]
+                stride = 2 if kind == 0x00BE else 6
+                if last < first or len(payload) != 6 + (last - first + 1) * stride:
+                    raise ValueError("invalid BIFF multi-cell extent")
+                for index, column in enumerate(range(first, last + 1)):
+                    add(row, column, struct.unpack_from("<H", payload, 4 + index * stride)[0])
+    return result
 
 
 class RAGFlowExcelParser:
@@ -49,7 +129,27 @@ class RAGFlowExcelParser:
         workbook = Workbook()
         workbook.remove(workbook.active)
 
-        for sheet_name in source.sheet_names:
+        borders = []
+        file_like_object.seek(0)
+        if file_like_object.read(8) == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+            import olefile
+
+            file_like_object.seek(0)
+            try:
+                with olefile.OleFileIO(file_like_object) as ole:
+                    stream_name = "Workbook" if ole.exists("Workbook") else "Book"
+                    borders = _biff8_cell_borders(ole.openstream(stream_name).read())
+                if len(borders) != len(source.sheet_names):
+                    raise ValueError("BIFF/Calamine sheet count mismatch")
+            except (ValueError, OSError, struct.error):
+                # Missing visual evidence must never invent a grid. Values and
+                # merges can still be parsed by Calamine without this channel.
+                logging.warning("XLS border metadata unavailable")
+                borders = []
+        border_styles = (None, "thin", "medium", "dashed", "dotted", "thick", "double", "hair", "mediumDashed", "dashDot", "mediumDashDot", "dashDotDot", "mediumDashDotDot", "slantDashDot")
+        border_cache = {}
+
+        for sheet_index, sheet_name in enumerate(source.sheet_names):
             source_sheet = source.get_sheet_by_name(sheet_name)
             worksheet = workbook.create_sheet(title=sheet_name)
             sheet_start = getattr(source_sheet, "start", None)
@@ -61,6 +161,20 @@ class RAGFlowExcelParser:
                     cleaned = RAGFlowExcelParser._clean_cell_value(value)
                     if cleaned is not None:
                         worksheet.cell(row=row_index, column=column_index, value=cleaned)
+
+            if borders:
+                source_ranges = getattr(source_sheet, "merged_cell_ranges", [])
+                max_row = max([worksheet.max_row, *(end[0] + 1 for _start, end in source_ranges)])
+                max_column = max([worksheet.max_column, *(end[1] + 1 for _start, end in source_ranges)])
+                for (row, column), sides in borders[sheet_index].items():
+                    if row > max_row or column > max_column or not any(sides):
+                        continue
+                    if sides not in border_cache:
+                        border_cache[sides] = Border(**{
+                            name: Side(style=border_styles[style])
+                            for name, style in zip(("left", "right", "top", "bottom"), sides)
+                        })
+                    worksheet.cell(row, column).border = border_cache[sides]
 
             for start, end in getattr(source_sheet, "merged_cell_ranges", []):
                 min_row, min_col = start

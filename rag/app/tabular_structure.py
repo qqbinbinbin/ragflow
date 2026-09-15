@@ -25,6 +25,7 @@ import re
 import struct
 import uuid
 from collections import Counter, defaultdict
+from copy import copy
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
@@ -527,6 +528,8 @@ def _classify_body_row(
                 merged_ranges=merged_ranges,
             )
         )
+        if row_ordinal in record_axis_evidence.get("grid_record_row_ordinals", ()):
+            return "data" if row_offsets else "unknown"
         required_offsets = set(record_axis_evidence["required_offsets"])
         if required_offsets and required_offsets.issubset(row_offsets) and (
             len(values) == 1
@@ -1475,6 +1478,12 @@ def _copy_structure_region(parser, worksheet, region: dict[str, Any]):
         for row_ordinal, column_ordinal in region["unresolved_members"]
     }
     target._fuxi_source_column_offset = min_column - 1
+    # Blank cells carry field geometry too. Copy borders only inside the
+    # region rectangle; they do not add source values or region membership.
+    for row in worksheet.iter_rows(min_row=min_row, max_row=region["bbox"][2], min_col=min_column, max_col=region["bbox"][3]):
+        for cell in row:
+            if cell.has_style:
+                target.cell(cell.row - min_row + 1, cell.column - min_column + 1).border = copy(cell.border)
     return target, min_row - 1
 
 
@@ -1668,8 +1677,8 @@ def _parse_region_structure(parser, worksheet, rows):
                 continue
             if following_rows and following_rows[0][0] != end + 1:
                 continue
-            evidence = _record_axis_evidence(
-                candidate_headers, following_rows, merged_ranges,
+            evidence = _worksheet_record_axis_evidence(
+                worksheet, candidate_headers, following_rows, merged_ranges,
                 allow_separated_context_tail=False,
             )
             if evidence is None:
@@ -1741,6 +1750,7 @@ def _parse_region_structure(parser, worksheet, rows):
                     tuple(evidence["record_row_ordinals"]),
                     len(distinct_headers) == len(record_offsets),
                     max(record_offsets) + 1,
+                    structural_width,
                 )
             )
     if candidates:
@@ -1774,6 +1784,47 @@ def _parse_region_structure(parser, worksheet, rows):
             if not any(
                 absorbs_proven_record_rows(candidate, witness)
                 for witness in candidates
+            )
+        ]
+        def absorbs_empty_context_fields(candidate, witness):
+            if (
+                candidate[10] >= witness[10]
+                or candidate[11] != witness[11]
+                or candidate[13] != witness[13]
+                or candidate[3:6] != witness[3:6]
+                or candidate[14] != witness[14]
+            ):
+                return False
+            # The same complete record axis has an independently viable later
+            # header. Alternating source label/empty-value spans before that
+            # header are form context, not additional header levels. Populated
+            # parent-header bands do not satisfy this stronger context proof.
+            context_anchors = _source_anchors_by_row(
+                worksheet, rows, row_limit=witness[10],
+                width=len(witness[9]), merged_ranges=merged_ranges,
+            )
+            for row_ordinal in range(candidate[10] + 1, witness[10] + 1):
+                for width in {
+                    len(witness[9]),
+                    *(
+                        anchor["max_column"]
+                        for anchor in context_anchors.get(row_ordinal, [])
+                        if witness[15] <= anchor["max_column"] <= len(witness[9])
+                    ),
+                }:
+                    segments = _inline_context_segments(
+                        worksheet, row_ordinal=row_ordinal, width=width,
+                        merged_ranges=merged_ranges,
+                    )
+                    if segments and all(not segment["value"] for segment in segments[1::2]):
+                        return True
+            return False
+
+        selection_candidates = [
+            candidate for candidate in selection_candidates
+            if not any(
+                absorbs_empty_context_fields(candidate, witness)
+                for witness in selection_candidates
             )
         ]
         strongest_candidate = max(
@@ -1874,8 +1925,9 @@ def _parse_region_structure(parser, worksheet, rows):
             _record_row_ordinals,
             _record_field_identities_closed,
             _record_axis_width,
+            header_width,
         ) = selected_candidate
-        return headers, header_start, data_start
+        return headers[:header_width], header_start, data_start
     return fallback
 
 
@@ -1955,6 +2007,7 @@ def _inline_context_segments(
     width: int,
     merged_ranges,
 ) -> list[dict[str, Any]] | None:
+
     segments = []
     column = 1
     while column <= width:
@@ -2382,8 +2435,26 @@ def _trailing_empty_record_axis_structure(
         header_start,
         data_start,
     )
+    # A single dense header row can end before earlier navigation/context.
+    # Do not extend this trimming to multirow bands: those may include actual
+    # records below a header, including records with nonnumeric identifiers.
+    while (
+        trailing_start == data_start
+        and headers
+        and headers[-1].startswith("Column_")
+        and not header_paths[-1]
+    ):
+        headers.pop()
+        header_paths.pop()
     merged_ranges = list(worksheet.merged_cells.ranges)
     occupied = _logical_occupied_cells(parser, worksheet)
+    # A populated numeric key in the terminal row is record evidence, not
+    # proof of an empty header. Resolve vertical header merges first so
+    # numeric subcolumn labels do not invalidate their inherited text key.
+    if _record_key_numeric_value(
+        _cell_value(parser, worksheet, data_start, 1, merged_ranges)
+    ) is not None:
+        return None
     preceding_width = max(
         (
             len({column for row, column in occupied if row == row_ordinal})
@@ -2400,14 +2471,26 @@ def _trailing_empty_record_axis_structure(
     ]
     single_row_dense_header = (
         trailing_start == data_start
-        and preceding_width < len(headers)
+        and preceding_width < len({
+            _source_cell_anchor(data_start, column, merged_ranges)
+            for column in range(1, len(headers) + 1)
+        })
         and all(
-            _source_cell_anchor(data_start, column, merged_ranges)[0] == "cell"
+            (anchor := _source_cell_anchor(data_start, column, merged_ranges))[0] == "cell"
+            or (anchor[1] == anchor[3] == data_start)
             for column in range(1, len(headers) + 1)
         )
     )
     multilevel_structural_header = (
         trailing_start < data_start
+        # A terminal band cannot prove earlier equally wide source rows are
+        # merely form context: it may instead be a populated table's footer.
+        and preceding_width < len(headers)
+        and len({
+            _source_cell_anchor(data_start, column, merged_ranges)
+            for column in range(1, len(headers) + 1)
+            if (data_start, column) in occupied
+        }) >= 2
         and any(
             merged.max_col > merged.min_col or merged.max_row > merged.min_row
             for merged in header_merges
@@ -2463,7 +2546,7 @@ def _nonempty_record_axis_structure(
         for row_ordinal in populated_rows
         if row_ordinal > data_start
     ]
-    evidence = _record_axis_evidence(headers, body_rows, merged_ranges)
+    evidence = _worksheet_record_axis_evidence(worksheet, headers, body_rows, merged_ranges)
     if evidence is None:
         return None
     occupied_offsets = tuple(evidence["occupied_offsets"])
@@ -2478,7 +2561,7 @@ def _nonempty_record_axis_structure(
                 (row_ordinal, values[:record_width], follows_body_gap)
                 for row_ordinal, values, follows_body_gap in body_rows
             ]
-            evidence = _record_axis_evidence(headers, body_rows, merged_ranges)
+            evidence = _worksheet_record_axis_evidence(worksheet, headers, body_rows, merged_ranges)
             if evidence is None:
                 return None
     if evidence["single_record_axis_proven"] and not _single_record_header_boundary_proven(
@@ -2673,6 +2756,65 @@ def _record_axis_body_rows(
     return body_rows
 
 
+def _worksheet_record_axis_evidence(worksheet, headers, body_rows, merged_ranges, **kwargs):
+    evidence = _record_axis_evidence(headers, body_rows, merged_ranges, **kwargs)
+    if evidence is not None:
+        return evidence
+    # A closed column grid can retain sparse textual records when a dense
+    # prefix independently proves the record axis. Borders alone are never
+    # enough: header identity, adjacency, nonempty records, and prefix proof
+    # must agree. Unbordered singletons remain unknown.
+    if len(headers) < 2 or len(body_rows) < 3:
+        return None
+    first = body_rows[0][0]
+    if first < 2 or any(right[0] != left[0] + 1 for left, right in zip(body_rows, body_rows[1:])):
+        return None
+    if any(not header or header.startswith("Column_") for header in headers):
+        return None
+    if any(worksheet.cell(first - 1, col).value != header for col, header in enumerate(headers, 1)):
+        return None
+    # Header-only horizontal merges are legitimate multi-level headers.  Only
+    # reject a merge when it actually crosses into the first record row;
+    # rejecting all header merges prevents legacy BIFF PFMEA sheets from
+    # proving their otherwise continuous record axis.
+    if any(merged.max_col > merged.min_col and merged.max_row >= first for merged in merged_ranges):
+        return None
+    offsets = [_record_field_offsets(values, row_ordinal=ordinal, merged_ranges=merged_ranges) for ordinal, values, _gap in body_rows]
+    if any(not row_offsets for row_offsets in offsets):
+        return None
+    prefix_end = next((index for index, row_offsets in enumerate(offsets) if len(row_offsets) < 2), len(offsets))
+    if prefix_end < 2 or prefix_end == len(offsets):
+        return None
+    if len(set(offsets[prefix_end:])) != 1 or len(offsets[prefix_end]) != 1:
+        return None
+    width = len(headers)
+    # The prefix has independent value/merge proof; require grid evidence for
+    # the header and the sparse suffix whose field membership is otherwise lost.
+    for ordinal in (first - 1, *(row[0] for row in body_rows[prefix_end:])):
+        for column in range(1, width + 1):
+            merged = next((item for item in merged_ranges if item.min_row <= ordinal <= item.max_row and item.min_col <= column <= item.max_col), None)
+            top = merged.min_row if merged else ordinal
+            bottom = merged.max_row if merged else ordinal
+            if top < first - 1 or bottom > body_rows[-1][0]:
+                return None
+            edges = ((ordinal, column, "left"), (ordinal, column, "right"), (top, column, "top"), (bottom, column, "bottom"))
+            if any(not getattr(getattr(worksheet.cell(row, col).border, side), "style", None) for row, col, side in edges):
+                return None
+    # Numeric-only rows may be template slots, not textual process records.
+    if any(len(row_offsets) == 1 and _record_key_numeric_value(values[row_offsets[0]]) is not None for (_ordinal, values, _gap), row_offsets in zip(body_rows, offsets)):
+        return None
+    prefix = _record_axis_evidence(headers, body_rows[:prefix_end], merged_ranges, **kwargs)
+    if prefix is None or prefix["unknown_row_ordinals"] or prefix["note_row_ordinals"] or not prefix["record_axis_contiguous"]:
+        return None
+    ordinals = tuple(row[0] for row in body_rows)
+    occupied = set().union(*(set(item) for item in offsets))
+    return {**prefix, "record_row_ordinals": ordinals, "row_ordinals": ordinals,
+            "row_offsets": tuple(offsets), "occupied_offsets": tuple(sorted(occupied)),
+            "optional_offsets": tuple(sorted(occupied - set(prefix["required_offsets"]))),
+            "grid_record_row_ordinals": ordinals,
+            "grid_suffix_row_ordinals": tuple(row[0] for row in body_rows[prefix_end:])}
+
+
 def _record_axis_evidence(
     headers: list[str],
     body_rows: list[tuple[int, list[object], bool]],
@@ -2693,6 +2835,19 @@ def _record_axis_evidence(
 
     def is_full_record_axis_merge(row_ordinal: int) -> bool:
         if _is_full_width_merge(row_ordinal, len(headers), merged_ranges):
+            return True
+        # A right-side inert column can widen the declared header span beyond
+        # the actual record grid.  A horizontal merge covering that effective
+        # grid is still a section/context band, even before any numeric key
+        # row appears.
+        if any(
+            merged.min_row <= row_ordinal <= merged.max_row
+            and merged.min_col == 1
+            and merged.max_col >= effective_width
+            and merged.max_col < len(headers)
+            and merged.max_col > merged.min_col
+            for merged in merged_ranges
+        ):
             return True
         # Narrowing the merge width is only reliable when the populated body
         # nearly spans the declared header axis.  Sparse forms often contain
@@ -2771,6 +2926,8 @@ def _record_axis_evidence(
         # A numeric record axis can end with a contiguous, non-record note
         # row. Only peel the tail when the remaining prefix independently
         # proves a monotonic numeric key; text-key tables remain unchanged.
+        # A horizontal merge at that key is one source field even when its
+        # anchor value is expanded across several physical columns.
         tail_is_key_only = bool(grouped_tail_notes) and all(
             set(
                 _record_field_offsets(
@@ -2779,7 +2936,16 @@ def _record_axis_evidence(
                     merged_ranges=merged_ranges,
                 )
             )
-            <= {key_offset}
+            <= (
+                {key_offset}
+                | {
+                    offset
+                    for merged in merged_ranges
+                    if merged.min_row == merged.max_row == row_ordinal
+                    and merged.min_col == key_offset + 1
+                    for offset in range(merged.min_col - 1, merged.max_col)
+                }
+            )
             for row_ordinal, values, _gap in grouped_tail_notes
         )
         if tail_is_key_only and _record_key_axis_proven(
@@ -2952,11 +3118,18 @@ def _record_axis_evidence(
                 for row_ordinal, values, _gap in unknown_rows
             )
             unknown_ordinals = [row[0] for row in unknown_rows]
+            tail_ordinals = sorted({
+                *unknown_ordinals,
+                *(
+                    row[0] for row in note_rows
+                    if rows and rows[-1][0] < row[0] < max(unknown_ordinals)
+                ),
+            })
             tail_is_contiguous = bool(rows) and all(
                 _record_rows_are_semantically_adjacent(left, right, len(headers), merged_ranges)
                 for left, right in zip(
-                    [rows[-1][0], *unknown_ordinals],
-                    unknown_ordinals,
+                    [rows[-1][0], *tail_ordinals],
+                    tail_ordinals,
                 )
             )
             if (
@@ -3049,6 +3222,81 @@ def _record_axis_evidence(
             "group_continuation_row_ordinals": grouped_continuation_ordinals,
         }
 
+    # A full-width context band can separate independently numbered groups
+    # under the same header. Prove each complete group using this same axis
+    # classifier before combining them; never take only the first segment.
+    group_boundaries = []
+    for index, row in enumerate(body_rows):
+        if not any(
+            merged.min_col == 1
+            and merged.max_col == len(headers)
+            and merged.min_row == row[0] == merged.max_row
+            for merged in merged_ranges
+        ):
+            continue
+        if _record_key_numeric_value(row[1][0] if row[1] else None) is not None:
+            continue
+        if index == 0 or index + 1 >= len(body_rows):
+            continue
+        before, after = body_rows[index - 1], body_rows[index + 1]
+        if (
+            _record_key_numeric_value(before[1][0] if before[1] else None) is not None
+            and _record_key_numeric_value(after[1][0] if after[1] else None) is not None
+            and _record_rows_are_semantically_adjacent(before[0], row[0], len(headers), merged_ranges)
+            and _record_rows_are_semantically_adjacent(row[0], after[0], len(headers), merged_ranges)
+        ):
+            group_boundaries.append(index)
+    if group_boundaries:
+        proofs = []
+        start = 0
+        for end in [*group_boundaries, len(body_rows)]:
+            proof = _record_axis_evidence(
+                headers, body_rows[start:end], merged_ranges,
+                # The internal band proves the complete width independently
+                # of the header hypothesis; its last group can use the normal
+                # context-tail proof without truncating a wider source axis.
+                allow_separated_context_tail=True,
+            )
+            if (
+                proof is None
+                or not proof["record_key_axis_proven"]
+                or not proof["record_axis_contiguous"]
+                or proof["unknown_row_ordinals"]
+                or any(
+                    ordinal in proof["note_row_ordinals"]
+                    and _record_key_numeric_value(values[0] if values else None) is not None
+                    and len(_record_field_offsets(
+                        values, row_ordinal=ordinal, merged_ranges=merged_ranges,
+                    )) > 1
+                    for ordinal, values, _gap in body_rows[start:end]
+                )
+            ):
+                break
+            proofs.append(proof)
+            start = end + 1
+        else:
+            required = set(proofs[0]["required_offsets"]).intersection(
+                *(set(proof["required_offsets"]) for proof in proofs[1:])
+            )
+            if 0 in required:
+                occupied = set().union(*(set(proof["occupied_offsets"]) for proof in proofs))
+                return {
+                    "record_row_ordinals": tuple(r for proof in proofs for r in proof["record_row_ordinals"]),
+                    "row_ordinals": tuple(row[0] for row in body_rows),
+                    "note_row_ordinals": tuple(sorted(
+                        {body_rows[index][0] for index in group_boundaries}
+                        | {r for proof in proofs for r in proof["note_row_ordinals"]}
+                    )),
+                    "unknown_row_ordinals": (),
+                    "record_axis_contiguous": True,
+                    "row_offsets": tuple(offsets for proof in proofs for offsets in proof["row_offsets"]),
+                    "required_offsets": tuple(sorted(required)),
+                    "optional_offsets": tuple(sorted(occupied - required)),
+                    "occupied_offsets": tuple(sorted(occupied)),
+                    "record_key_axis_proven": True,
+                    "single_record_axis_proven": False,
+                    "group_continuation_row_ordinals": tuple(r for proof in proofs for r in proof["group_continuation_row_ordinals"]),
+                }
     segments = []
     current = []
     for row in body_rows:
@@ -3192,6 +3440,8 @@ def _single_record_header_boundary_proven(
     leaf_sources = {
         _source_cell_anchor(data_start, column, merged_ranges)
         for column in range(1, width + 1)
+        if worksheet.cell(data_start, column).value is not None
+        and str(worksheet.cell(data_start, column).value).strip()
     }
     contextual_boundary = (
         any(merged.max_col > merged.min_col for merged in header_merges)
@@ -3325,9 +3575,25 @@ def _g1_disagreement_is_outside_record_axis(
     worksheet,
     region: dict[str, Any],
     record_row_ordinals: set[int],
+    *,
+    grid_suffix_row_ordinals: set[int] | None = None,
 ) -> bool:
     if not record_row_ordinals:
         return False
+    if grid_suffix_row_ordinals:
+        # The independently proved dense prefix must still pass G1 closure.
+        # Only the exact grid-proved sparse suffix can bridge the disconnected
+        # value cells; never waive an ambiguous split inside the dense body.
+        prefix_rows = record_row_ordinals - grid_suffix_row_ordinals
+        if not prefix_rows or not grid_suffix_row_ordinals.issubset(record_row_ordinals):
+            return False
+        if min(grid_suffix_row_ordinals) != max(prefix_rows) + 1:
+            return False
+        prefix_members = {cell for cell in region["members"] if cell[0] not in grid_suffix_row_ordinals}
+        prefix_children = [child & prefix_members for child in region["g1_children"] if child & prefix_members]
+        return _g1_disagreement_is_outside_record_axis(
+            worksheet, {**region, "members": prefix_members, "g1_children": prefix_children}, prefix_rows,
+        )
     record_members = {
         coordinate
         for coordinate in region["members"]
@@ -3369,6 +3635,10 @@ def _g1_disagreement_is_outside_record_axis(
         len(record_children) == 1
         and record_members.issubset(record_children[0])
     ) or len(dominant_record_children) == 1
+    if len(dominant_record_children) == 1:
+        record_child_columns = {
+            column for _row, column in dominant_record_children[0]
+        }
 
     def child_is_outside_context(child: set[tuple[int, int]]) -> bool:
         child_min_row, _min_column, child_max_row, _max_column = _region_bbox(child)
@@ -3386,9 +3656,53 @@ def _g1_disagreement_is_outside_record_axis(
             )
             )
         if len({row for row, _column in child}) == 1:
+            child_row = next(iter(child))[0]
+            key_column = min(record_columns)
+            if (
+                (child_row, key_column) in child
+                and _record_key_numeric_value(worksheet.cell(child_row, key_column).value) is not None
+                and any(
+                    column != key_column
+                    and column in (record_child_columns or record_columns)
+                    and worksheet.cell(row, column).value is not None
+                    and str(worksheet.cell(row, column).value).strip()
+                    for row, column in child
+                )
+            ):
+                # A separated populated numeric record is not outside-axis
+                # context merely because it occupies a single physical row.
+                return False
             return True
         child_columns = {column for _row, column in child}
         if not child_columns.issubset(record_columns):
+            # Sparse records need not populate every header column. A bounded
+            # full-width context band followed solely by source-proven form
+            # pairs can still be outside that axis. A numeric record key or
+            # an unpaired row prevents this proof.
+            child_rows = sorted({row for row, _column in child})
+            width = max(child_columns)
+            if (
+                child_min_row > max(record_row_ordinals)
+                and min(child_columns) == min(record_columns) == 1
+                and child_columns.issubset(record_child_columns)
+                and any(
+                    merged.min_row == merged.max_row == child_min_row
+                    and merged.min_col == 1 and merged.max_col == width
+                    for merged in merged_ranges
+                )
+                and all(
+                    _record_key_numeric_value(worksheet.cell(row, 1).value) is None
+                    for row in child_rows
+                )
+                and all(
+                    _inline_context_segments(
+                        worksheet, row_ordinal=row, width=width,
+                        merged_ranges=merged_ranges,
+                    ) is not None
+                    for row in child_rows[1:]
+                )
+            ):
+                return True
             return not _members_prove_repeated_axis(child)
         return any(
             merged.min_row >= child_min_row
@@ -3608,7 +3922,7 @@ def _project_structure_region(
         merged_ranges,
     )
 
-    record_axis_evidence = _record_axis_evidence(headers, body_rows, merged_ranges)
+    record_axis_evidence = _worksheet_record_axis_evidence(worksheet, headers, body_rows, merged_ranges)
     if (
         record_axis_evidence is not None
         and record_axis_evidence["single_record_axis_proven"]
@@ -3730,6 +4044,7 @@ def _project_structure_region(
                     row_role == "data"
                     and not record_axis_evidence.get("record_key_axis_proven")
                     and not sparse_record_axis_evidence
+                    and not record_axis_evidence.get("grid_record_row_ordinals")
                     and established_required_shape is not None
                     and required_shape != established_required_shape
                     and required_shape == next_required_shape
@@ -4524,8 +4839,8 @@ def _region_structure_evidence(parser, worksheet, region: dict[str, Any]) -> dic
         body_rows,
         merged_ranges,
     )
-    record_axis_evidence = _record_axis_evidence(
-        headers,
+    record_axis_evidence = _worksheet_record_axis_evidence(
+        region_worksheet, headers,
         record_axis_body_rows,
         merged_ranges,
     )
@@ -5081,12 +5396,38 @@ def _finalize_table_manifest_evidence(item: dict[str, Any]) -> None:
     evidence_columns = sorted(evidence["headers_by_column"])
     if rows and record_axis_columns:
         # Preserve leading structural columns that have no value in a sparse
-        # record row, while stopping before disjoint trailing sidecars.
+        # record row, and empty siblings under a source-proven shared parent
+        # header, while stopping before disjoint trailing sidecars.
+        prefix_lengths = evidence.get("optional_parent_prefix_lengths_by_column", {})
+        record_parent_paths = {
+            tuple(evidence["header_paths_by_column"][column][:prefix_lengths[column]])
+            for column in record_axis_columns
+            if prefix_lengths.get(column, 0) > 0
+            and column in evidence["header_paths_by_column"]
+        }
         evidence_columns = [
             absolute_column
             for absolute_column in evidence_columns
             if absolute_column <= max(record_axis_columns)
+            or (
+                prefix_lengths.get(absolute_column, 0) > 0
+                and tuple(evidence["header_paths_by_column"][absolute_column][
+                    :prefix_lengths[absolute_column]
+                ]) in record_parent_paths
+            )
         ]
+        # The grid fallback proves the complete header width against the
+        # source header and sparse suffix borders, in addition to independent
+        # dense-prefix record proof. Record count alone proves no column
+        # membership and must never widen an unbordered table into sidecars.
+        axis = evidence.get("record_axis_evidence") or {}
+        record_rows = axis.get("record_row_ordinals", ())
+        if (
+            record_rows
+            and tuple(axis.get("grid_record_row_ordinals", ())) == tuple(record_rows)
+            and evidence.get("record_axis_width") == len(evidence.get("headers_by_column", {}))
+        ):
+            evidence_columns = sorted(evidence["headers_by_column"])
     if evidence_columns:
         # Manifest ordinals are dense over the proven table axis, while field
         # ordinals retain their source-column coordinates. Fill only structural
@@ -6715,6 +7056,12 @@ def _build_tabular_structure_projection_with_audit(
                     for row in table_rows
                     if row["row_role_kwd"] == "data"
                 }
+                grid_suffix = set()
+                if table["source_total_count"] is not None:
+                    region_evidence = _region_structure_evidence(parser, worksheet, region)
+                    axis = (region_evidence or {}).get("record_axis_evidence") or {}
+                    if {row + row_offset for row in axis.get("grid_record_row_ordinals", ())} == record_rows:
+                        grid_suffix = {row + row_offset for row in axis.get("grid_suffix_row_ordinals", ())}
                 g1_disagreement_is_safe = (
                     table["source_total_count"] is not None
                     and (
@@ -6723,6 +7070,7 @@ def _build_tabular_structure_projection_with_audit(
                             worksheet,
                             region,
                             record_rows,
+                            grid_suffix_row_ordinals=grid_suffix,
                         )
                     )
                 )
