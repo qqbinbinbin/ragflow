@@ -3118,6 +3118,20 @@ def _record_axis_evidence(
                 and _is_full_width_merge(row_ordinal, len(headers), merged_ranges)
                 for row_ordinal, values, _gap in unknown_rows
             )
+            # Sign-off blocks in legacy forms are often not merged: they use
+            # label/value pairs after the proven numeric axis.  They remain
+            # source rows, but cannot be records because they have no numeric
+            # key and occur strictly after the last data row.
+            unknown_tail_is_signoff = (
+                bool(unknown_rows)
+                and all(
+                    _record_key_numeric_value(values[key_offset] if key_offset < len(values) else None) is None
+                    for _row_ordinal, values, _gap in unknown_rows
+                )
+                and _record_key_axis_proven(rows, {key_offset})
+                and min(row[0] for row in unknown_rows) > rows[-1][0]
+                and len(unknown_rows) >= 1
+            )
             unknown_ordinals = [row[0] for row in unknown_rows]
             tail_ordinals = sorted({
                 *unknown_ordinals,
@@ -3133,8 +3147,18 @@ def _record_axis_evidence(
                     tail_ordinals,
                 )
             )
+            if not tail_is_contiguous and unknown_tail_is_signoff:
+                # Form templates may leave blank spacer rows before the
+                # signature block. No populated body row lies in that gap;
+                # retain the same source-backed tail proof.
+                tail_is_contiguous = all(
+                    right > left and right - left <= 4
+                    for left, right in zip(
+                        [rows[-1][0], *unknown_ordinals], unknown_ordinals
+                    )
+                )
             if (
-                unknown_tail_is_structural
+                (unknown_tail_is_structural or unknown_tail_is_signoff)
                 and tail_is_contiguous
                 and _record_key_axis_proven(rows, {key_offset})
             ):

@@ -4,6 +4,7 @@ import struct
 import uuid
 import types
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -4135,6 +4136,21 @@ def _context_with_trailing_dense_empty_header_bytes():
 @pytest.fixture
 def table_parser(monkeypatch):
     return _load_table_module(monkeypatch).Excel()
+
+
+def test_g91_performance_report_signoff_tail_does_not_block_complete_axis(table_parser):
+    source = Path(
+        "/opt/fuxi/evidence/ppap-four-file-current-identity-20260914t051021853198z-6d7431ba/remote-originals/"
+        "G91-转向柱总成PN01-湖北三环.xls"
+    )
+    projection = build_tabular_structure_projection(
+        source.name, source.read_bytes(), parser=table_parser, sheet_ordinals={18}
+    )
+    table = projection["tables"][0]
+    assert table["source_total_count"] == 34
+    assert table["enumeration_status"] == "supported_complete"
+    rows = [row for row in projection["rows"] if row["table_ref_kwd"] == table["table_ref"]]
+    assert all(row["row_role_kwd"] == "note" for row in rows if row["row_ordinal_int"] in {44, 47, 48})
 
 
 def test_same_bytes_keep_business_identity_but_get_a_new_generation(table_parser):
