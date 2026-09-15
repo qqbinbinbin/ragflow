@@ -742,6 +742,71 @@ def _shared_vertical_record_groups(
     return anchors, continuations
 
 
+def _sparse_numeric_record_groups(rows, merged_ranges):
+    """Prove blank-key continuations using repeated field geometry and numeric anchors."""
+    if len(rows) < 4:
+        return None
+    offsets = [set(_record_field_offsets(values, row_ordinal=ordinal, merged_ranges=merged_ranges))
+               for ordinal, values, _gap in rows]
+    if not offsets[0]:
+        return None
+    key = min(offsets[0])
+    anchors = [row for row in rows if _record_key_numeric_value(row[1][key] if key < len(row[1]) else None) is not None]
+    if len(anchors) < 2 or anchors[0] != rows[0] or not _record_key_axis_proven(anchors, {key}):
+        return None
+    anchor_ordinals = {row[0] for row in anchors}
+    anchor_offsets = [offsets[index] for index, row in enumerate(rows) if row[0] in anchor_ordinals]
+    if any(value != anchor_offsets[0] for value in anchor_offsets):
+        return None
+    continuations = []
+    tail = []
+    measurement_offsets = None
+
+    def is_tail_form(index):
+        ordinal = rows[index][0]
+        return bool(offsets[index]) and all(
+            any(m.min_row == m.max_row == ordinal and m.max_col > m.min_col
+                and m.min_col <= offset + 1 <= m.max_col for m in merged_ranges)
+            for offset in offsets[index]
+        ) and _row_merge_signature(ordinal, merged_ranges) != _row_merge_signature(anchors[-1][0], merged_ranges)
+
+    for index, row in enumerate(rows):
+        ordinal, values, gap = row
+        if ordinal in anchor_ordinals:
+            if tail or gap:
+                return None
+            continue
+        key_value = values[key] if key < len(values) else None
+        current = offsets[index]
+        if ((key_value is None or not str(key_value).strip())
+                and not tail and not gap and len(current) >= 2
+                and current < anchor_offsets[0] and key not in current
+                and not is_tail_form(index)):
+            if measurement_offsets is None:
+                measurement_offsets = current
+            if current != measurement_offsets:
+                return None
+            continuations.append(ordinal)
+        else:
+            # A differently partitioned horizontal form is a tail, not a
+            # continuation. Require every populated field to have that geometry.
+            isolated_context_before_form = (
+                current == {key}
+                and index + 1 < len(rows)
+                and is_tail_form(index + 1)
+            )
+            if (ordinal <= anchors[-1][0] or not continuations or gap
+                    or not (is_tail_form(index) or isolated_context_before_form)):
+                return None
+            tail.append(row)
+    if not continuations or measurement_offsets is None:
+        return None
+    # A second non-measurement identity field must accompany every anchor.
+    if len(anchor_offsets[0] - measurement_offsets) < 2:
+        return None
+    return tuple(row[0] for row in anchors), tuple(continuations), tail, key
+
+
 def _is_repeated_header_row(headers: list[str], values: list[object]) -> bool:
     """Treat an exact repeated header as a structural boundary."""
 
@@ -2894,6 +2959,12 @@ def _record_axis_evidence(
         )
 
     def evaluate(rows, note_rows, unknown_rows=()):
+        sparse_groups = _sparse_numeric_record_groups(rows, merged_ranges) if not unknown_rows else None
+        if sparse_groups is not None:
+            sparse_anchors, sparse_continuations, sparse_tail, sparse_key = sparse_groups
+            tail_ordinals = {row[0] for row in sparse_tail}
+            rows = [row for row in rows if row[0] not in tail_ordinals]
+            note_rows = [*note_rows, *sparse_tail]
         original_rows = rows
         grouping_allowed = not unknown_rows and not any(
             _is_full_width_merge(row_ordinal, len(headers), merged_ranges)
@@ -3171,7 +3242,7 @@ def _record_axis_evidence(
             rows_by_ordinal = {row[0]: row for row in rows}
             record_key_axis_proven = _record_key_axis_proven(
                 [rows_by_ordinal[row_ordinal] for row_ordinal in grouped_record_ordinals],
-                {min(common_offsets)},
+                {sparse_key if sparse_groups is not None else min(common_offsets)},
             )
             if unknown_rows:
                 key_offset = min(common_offsets)
@@ -3192,6 +3263,10 @@ def _record_axis_evidence(
                     unknown_rows = ()
         else:
             record_key_axis_proven = _record_key_axis_proven(rows, common_offsets)
+            if sparse_groups is not None:
+                # Sparse identity cells prove boundaries, not fewer records:
+                # every measurement-bearing continuation remains a data row.
+                record_key_axis_proven = True
         key_only_slots = (
             _record_key_only_slots(rows, row_offsets, common_offsets)
             if len(headers) > 1 and not grouped_record_ordinals

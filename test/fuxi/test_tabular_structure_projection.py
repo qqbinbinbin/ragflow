@@ -27,6 +27,45 @@ from rag.app.tabular_structure import (
 )
 
 
+@pytest.mark.parametrize("with_footer", [False, True, "blank_key_form"])
+def test_sparse_numeric_groups_do_not_become_header_with_merged_footer(monkeypatch, with_footer):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Index", "Material", None, "Measure", None, "Value"])
+    sheet.merge_cells("B1:C1")
+    sheet.merge_cells("D1:E1")
+    for index in range(1, 4):
+        sheet.append([index, f"item{index}", None, "a", None, 0.1])
+        sheet.append([None, None, None, "b", None, 0.2])
+    for row in range(2, 8):
+        sheet.merge_cells(start_row=row, start_column=2, end_row=row, end_column=3)
+        sheet.merge_cells(start_row=row, start_column=4, end_row=row, end_column=5)
+    if with_footer:
+        if with_footer == "blank_key_form":
+            sheet.append(["Supplementary context"])
+            sheet.append([None, None, "Reviewed", None, "Date", None])
+        else:
+            sheet.append(["Prepared", None, "Reviewed", None, "Date", None])
+        for first in (1, 3, 5):
+            sheet.merge_cells(start_row=sheet.max_row, start_column=first, end_row=sheet.max_row, end_column=first + 1)
+    parser = _load_table_module(monkeypatch).Excel()
+    headers, header_start, data_start = tabular_structure._parse_region_structure(parser, sheet, list(sheet.rows))
+    assert (header_start, data_start) == (0, 1)
+    assert headers == ["Index", "Material", "Material", "Measure", "Measure", "Value"]
+    output = BytesIO()
+    workbook.save(output)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", output.getvalue(), parser=parser,
+    )
+    complete = [item for item in projection["tables"] if item["enumeration_status"] == "supported_complete"]
+    assert len(complete) == 1
+    # Each measurement row has independent source values. Blank identity cells
+    # do not turn those measurements into notes or remove them from coverage.
+    assert complete[0]["source_total_count"] == 6
+    data = [row for row in projection["rows"] if row["table_ref_kwd"] == complete[0]["table_ref"] and row["row_role_kwd"] == "data"]
+    assert [row["row_ordinal_int"] for row in data] == list(range(2, 8))
+
+
 class _MergedLookupRange:
     def __init__(self, min_row, min_col, max_row, max_col):
         self.min_row = min_row
@@ -152,6 +191,18 @@ def test_uploaded_f515_pfmea_body_is_one_supported_record_axis(monkeypatch, sour
     assert len(pfmea) == 1
     assert pfmea[0]["source_total_count"] >= 100
     assert len(pfmea[0]["ordered_columns"]) >= 18
+    # Same uploaded bytes: material report has 11 numbered material anchors,
+    # with 62 independent measurement rows at source rows 11 through 72.
+    # Ni/Sn are the final two measurements, not the entire report.
+    material = [table for table in projection["tables"]
+                if table.get("table_label") == "12、材料试验报告"
+                and table.get("enumeration_status") == "supported_complete"]
+    assert len(material) == 1
+    assert material[0]["source_total_count"] == 62
+    material_rows = [row for row in projection["rows"]
+                     if row["table_ref_kwd"] == material[0]["table_ref"]
+                     and row["row_role_kwd"] == "data"]
+    assert [row["row_ordinal_int"] for row in material_rows] == list(range(11, 73))
 
 
 def test_uploaded_xls_preserves_source_table_grid(monkeypatch):
