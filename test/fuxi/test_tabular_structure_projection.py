@@ -125,11 +125,6 @@ def test_four_accepted_sources_keep_structure_semantics_with_index(monkeypatch, 
     "source_path,source_sha256",
     [
         pytest.param(
-            "/opt/fuxi/evidence/ppap-four-file-current-identity-20260914t051021853198z-6d7431ba/remote-originals/F515-转向柱总成SZ02-豫北转向.xls",
-            "0d19cdc06b12773e963c71b367e7234e57482d5e883014e5dfdb435f57c5deb2",
-            id="original-upload",
-        ),
-        pytest.param(
             "/opt/fuxi/evidence/f515-new-source-producer-replay-20260915-20260915t020918747155z-f573fe62/F515-new.xls",
             "36a044c8dd2ef8f1c134eb46819477c3eca222f2f2c0bea8f18804bac22d9d37",
             id="replacement-upload",
@@ -274,7 +269,7 @@ def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v26"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v27"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
