@@ -4309,6 +4309,7 @@ def test_backfill_ignores_active_generations_outside_the_current_contract(
     [
         ("region-producer/v10", "enumeration-rules/v3"),
         ("region-producer/v22", "enumeration-rules/v9"),
+        ("region-producer/v26", "enumeration-rules/v9"),
     ],
 )
 def test_backfill_validates_known_historical_inner_contract_and_indexes_current_only(
