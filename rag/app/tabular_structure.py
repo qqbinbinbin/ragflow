@@ -31,13 +31,13 @@ from io import BytesIO
 from typing import Any
 
 
-TABULAR_STRUCTURE_VERSION = "tabular-row/v2"
+TABULAR_STRUCTURE_VERSION = "tabular-row/v3"
 PRODUCER_SCHEMA_VERSION = "table-producer/v6"
 PROJECTION_VERSION = "tabular-structure-projection/v6"
 PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v27"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v28"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
-ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v1"
+ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v2"
 _CURRENT_PROJECTION_CONTRACT = (
     PRODUCER_SCHEMA_VERSION,
     PROJECTION_VERSION,
@@ -63,6 +63,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v24", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v25", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v26", "enumeration-rules/v9"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v27", "enumeration-rules/v9"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -136,6 +137,7 @@ PROJECTION_ROW_FIELDS = frozenset(
         "table_label_kwd",
         "table_context_list",
         "row_ref_kwd",
+        "parent_record_row_ref_kwd",
         "row_ordinal_int",
         "data_row_index_int",
         "row_role_kwd",
@@ -419,9 +421,12 @@ def _ordered_fields(
             continue
         source_anchor = source_anchors[index] if source_anchors is not None else None
         if source_anchor is not None:
-            if source_anchor in emitted_anchors:
+            # Legacy BIFF may retain distinct physical values within a merge.
+            # Collapse only repeated values, never distinct source evidence.
+            anchor_value = (source_anchor, rendered)
+            if anchor_value in emitted_anchors:
                 continue
-            emitted_anchors.add(source_anchor)
+            emitted_anchors.add(anchor_value)
         field = {"name": str(name), "value": rendered}
         if sheet_ordinal is not None:
             column_ordinal = (
@@ -660,8 +665,6 @@ def _record_key_only_slots(
     if len(required_offsets) != 1 or not _record_key_axis_proven(rows, required_offsets):
         return ()
     key_offset = next(iter(required_offsets))
-    if not any(any(offset != key_offset for offset in offsets) for offsets in row_offsets):
-        return ()
     return tuple(
         row[0]
         for row, offsets in zip(rows, row_offsets)
@@ -673,7 +676,7 @@ def _shared_vertical_record_groups(
     rows: list[tuple[int, list[object], bool]],
     required_offsets: set[int],
     merged_ranges,
-) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+) -> tuple[tuple[int, ...], tuple[int, ...], dict[int, int]] | None:
     """Prove grouped records from a numeric key and a shared vertical dimension."""
 
     if len(rows) < 2 or not required_offsets:
@@ -734,12 +737,27 @@ def _shared_vertical_record_groups(
     anchor_rows = [rows_by_ordinal[row_ordinal] for row_ordinal in anchors]
     if not _record_key_axis_proven(anchor_rows, {key_offset}):
         return None
+    # BIFF can retain physical values below a merge anchor. Geometry must
+    # not override an independently populated record identity.
+    for group_start, group_end in groups:
+        anchor_value = rows_by_ordinal[group_start][1][key_offset]
+        anchor_key = str(anchor_value).strip()
+        for ordinal in range(group_start + 1, group_end + 1):
+            child_value = rows_by_ordinal[ordinal][1][key_offset]
+            child_key = "" if child_value is None else str(child_value).strip()
+            if child_key and child_key != anchor_key:
+                return None
     continuations = tuple(
         row_ordinal
         for group_start, group_end in groups
         for row_ordinal in range(group_start + 1, group_end + 1)
     )
-    return anchors, continuations
+    parents = {
+        row_ordinal: group_start
+        for group_start, group_end in groups
+        for row_ordinal in range(group_start + 1, group_end + 1)
+    }
+    return anchors, continuations, parents
 
 
 def _sparse_numeric_record_groups(rows, merged_ranges):
@@ -1520,6 +1538,29 @@ def _copy_structure_region(parser, worksheet, region: dict[str, Any]):
             for column_ordinal in range(merged.min_col, merged.max_col + 1)
         }
         if not coordinates.issubset(members):
+            continue
+        populated_subordinates = {
+            (row, column): worksheet.cell(row, column).value
+            for row, column in coordinates
+            if (row, column) != (merged.min_row, merged.min_col)
+            and worksheet.cell(row, column).value is not None
+        }
+        if populated_subordinates:
+            from openpyxl.worksheet.cell_range import CellRange
+
+            # Preserve BIFF physical values without destructive merge_cells.
+            for row, column in coordinates:
+                target.cell(
+                    row=row - min_row + 1,
+                    column=column - min_column + 1,
+                    value=worksheet.cell(row, column).value,
+                )
+            target.merged_cells.add(CellRange(
+                min_row=merged.min_row - min_row + 1,
+                min_col=merged.min_col - min_column + 1,
+                max_row=merged.max_row - min_row + 1,
+                max_col=merged.max_col - min_column + 1,
+            ))
             continue
         value = worksheet.cell(merged.min_row, merged.min_col).value
         target.cell(
@@ -2707,7 +2748,23 @@ def _primary_record_axis_structures(
             populated_rows,
             require_record_key_axis=True,
         ) is not None
-        if record_key_axis_proven or (
+        # A data-bearing BIFF merge cannot prove an empty header over an
+        # independently established body: its subordinate cells are records.
+        populated_body_merge = any(
+            merged.min_row > record_data_start
+            and merged.max_row <= empty_data_start
+            and merged.max_row > merged.min_row
+            and any(
+                sum(
+                    worksheet.cell(row, column).value is not None
+                    and str(worksheet.cell(row, column).value).strip() != ""
+                    for row in range(merged.min_row, merged.max_row + 1)
+                ) > 1
+                for column in range(merged.min_col, merged.max_col + 1)
+            )
+            for merged in worksheet.merged_cells.ranges
+        )
+        if record_key_axis_proven or populated_body_merge or (
             duplicate_header_paths
             and not rectangular_header_merge_extends_into_record_axis
         ):
@@ -2832,6 +2889,18 @@ def _worksheet_record_axis_evidence(worksheet, headers, body_rows, merged_ranges
     # must agree. Unbordered singletons remain unknown.
     if len(headers) < 2 or len(body_rows) < 3:
         return None
+    # A BIFF merge may span physical records while retaining subordinate
+    # values. Such a range is data layout, not a header boundary signal.
+    structural_merges = []
+    for merged in merged_ranges:
+        subordinate = [
+            worksheet.cell(row, col).value
+            for row in range(merged.min_row, merged.max_row + 1)
+            for col in range(merged.min_col, merged.max_col + 1)
+            if (row, col) != (merged.min_row, merged.min_col)
+        ]
+        if not any(value is not None and str(value).strip() for value in subordinate):
+            structural_merges.append(merged)
     first = body_rows[0][0]
     if first < 2 or any(right[0] != left[0] + 1 for left, right in zip(body_rows, body_rows[1:])):
         return None
@@ -2843,7 +2912,7 @@ def _worksheet_record_axis_evidence(worksheet, headers, body_rows, merged_ranges
     # reject a merge when it actually crosses into the first record row;
     # rejecting all header merges prevents legacy BIFF PFMEA sheets from
     # proving their otherwise continuous record axis.
-    if any(merged.max_col > merged.min_col and merged.max_row >= first for merged in merged_ranges):
+    if any(merged.max_col > merged.min_col and merged.max_row >= first for merged in structural_merges):
         return None
     offsets = [_record_field_offsets(values, row_ordinal=ordinal, merged_ranges=merged_ranges) for ordinal, values, _gap in body_rows]
     if any(not row_offsets for row_offsets in offsets):
@@ -3237,8 +3306,17 @@ def _record_axis_evidence(
                 unknown_rows = ()
         grouped_record_ordinals = ()
         grouped_continuation_ordinals = ()
+        grouped_parent_ordinals = {}
+        if grouped_records is None and sparse_groups is not None and grouping_allowed:
+            # Ownership follows source-proven sparse identity boundaries,
+            # never the order in which paginated rows reach the Consumer.
+            sparse_parents = {
+                ordinal: max(anchor for anchor in sparse_anchors if anchor < ordinal)
+                for ordinal in sparse_continuations
+            }
+            grouped_records = (sparse_anchors, sparse_continuations, sparse_parents)
         if grouped_records is not None:
-            grouped_record_ordinals, grouped_continuation_ordinals = grouped_records
+            grouped_record_ordinals, grouped_continuation_ordinals, grouped_parent_ordinals = grouped_records
             rows_by_ordinal = {row[0]: row for row in rows}
             record_key_axis_proven = _record_key_axis_proven(
                 [rows_by_ordinal[row_ordinal] for row_ordinal in grouped_record_ordinals],
@@ -3320,6 +3398,7 @@ def _record_axis_evidence(
             "record_key_axis_proven": record_key_axis_proven,
             "single_record_axis_proven": single_axis,
             "group_continuation_row_ordinals": grouped_continuation_ordinals,
+            "group_parent_row_ordinals": grouped_parent_ordinals,
         }
 
     # A full-width context band can separate independently numbered groups
@@ -3396,6 +3475,10 @@ def _record_axis_evidence(
                     "record_key_axis_proven": True,
                     "single_record_axis_proven": False,
                     "group_continuation_row_ordinals": tuple(r for proof in proofs for r in proof["group_continuation_row_ordinals"]),
+                    "group_parent_row_ordinals": {
+                        row: parent for proof in proofs
+                        for row, parent in proof["group_parent_row_ordinals"].items()
+                    },
                 }
     segments = []
     current = []
@@ -4182,6 +4265,10 @@ def _project_structure_region(
                 "table_label_kwd": _sanitize_untrusted_text(sheet_name),
                 "table_context_list": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
                 "row_ref_kwd": row_ref,
+                "parent_record_row_ref_kwd": (
+                    f"{table_ref}:{record_axis_evidence['group_parent_row_ordinals'][local_row_ordinal] + row_offset}"
+                    if is_group_continuation else None
+                ),
                 "row_ordinal_int": row_ordinal,
                 "data_row_index_int": current_data_index,
                 "row_role_kwd": row_role,
@@ -5463,6 +5550,9 @@ def _rekey_projected_item(
     table["table_ref"] = table_ref
     table["table_ordinal"] = table_ordinal
     for row in item["rows"]:
+        if row.get("parent_record_row_ref_kwd") is not None:
+            parent_ordinal = row["parent_record_row_ref_kwd"].rsplit(":", 1)[1]
+            row["parent_record_row_ref_kwd"] = f"{table_ref}:{parent_ordinal}"
         row_ref = f"{table_ref}:{row['row_ordinal_int']}"
         row["table_ref_kwd"] = table_ref
         row["row_ref_kwd"] = row_ref
@@ -6206,7 +6296,7 @@ def _merge_continuation_pair(
             _ordered_fields(
                 [headers_by_column[column] for column in columns],
                 values,
-                note=row["row_role_kwd"] == "note",
+                note=row["row_role_kwd"] == "note" and row.get("parent_record_row_ref_kwd") is None,
                 sheet_ordinal=main["table"]["sheet_ordinal"],
                 header_paths=[header_paths_by_column[column] for column in columns],
                 column_ordinals=[ordinal_by_column[column] for column in columns],
@@ -6247,6 +6337,9 @@ def _merge_continuation_pair(
     _apply_enumeration_decision(table, "D1" if is_unnamed_superset else "L1-02")
     for row in rows:
         row["source_total_count_int"] = table["source_total_count"]
+        if row.get("parent_record_row_ref_kwd") is not None:
+            parent_ordinal = row["parent_record_row_ref_kwd"].rsplit(":", 1)[1]
+            row["parent_record_row_ref_kwd"] = f"{table_ref}:{parent_ordinal}"
         row_ref = f"{table_ref}:{row['row_ordinal_int']}"
         row["row_ref_kwd"] = row_ref
         row["id"] = "tsr_v1_" + _versioned_digest(
@@ -7005,6 +7098,7 @@ def _unknown_structure_region(
                 "row_ordinal_int": row_ordinal,
                 "data_row_index_int": None,
                 "row_role_kwd": "unknown",
+                "parent_record_row_ref_kwd": None,
                 "source_total_count_int": None,
                 "ordered_fields_list": json.dumps(fields, ensure_ascii=False, separators=(",", ":")),
             }
@@ -7611,10 +7705,12 @@ def _validate_tabular_structure_projection_for_contract(
     row_refs = set()
     by_table: dict[str, list[dict[str, Any]]] = {}
     ordered_fields_by_row_ref: dict[str, list[dict[str, Any]]] = {}
+    current_rows = contract == _CURRENT_PROJECTION_CONTRACT
+    row_fields = PROJECTION_ROW_FIELDS if current_rows else PROJECTION_ROW_FIELDS - {"parent_record_row_ref_kwd"}
     for row in rows:
-        if not isinstance(row, dict) or set(row) != PROJECTION_ROW_FIELDS:
+        if not isinstance(row, dict) or set(row) != row_fields:
             raise ValueError("structure projection row fields do not match the fixed schema")
-        if row["tabular_structure_version_kwd"] != TABULAR_STRUCTURE_VERSION:
+        if row["tabular_structure_version_kwd"] != (TABULAR_STRUCTURE_VERSION if current_rows else "tabular-row/v2"):
             raise ValueError("unsupported structure row version")
         if row["structure_kind_kwd"] != "table_row":
             raise ValueError("invalid structure kind")
@@ -7744,6 +7840,26 @@ def _validate_tabular_structure_projection_for_contract(
             or totals != {len(data_indices)}
         ):
             raise ValueError("source total is not generation-wide or fail-closed")
+
+    rows_by_ref = {row["row_ref_kwd"]: row for row in rows}
+    for row in rows:
+        parent_ref = row.get("parent_record_row_ref_kwd")
+        if parent_ref is None:
+            continue
+        parent = rows_by_ref.get(parent_ref) if isinstance(parent_ref, str) else None
+        if (
+            row["row_role_kwd"] != "note"
+            or parent is None
+            or parent["row_role_kwd"] != "data"
+            or parent["table_ref_kwd"] != row["table_ref_kwd"]
+            or parent["row_ordinal_int"] >= row["row_ordinal_int"]
+            or any(
+                other["row_role_kwd"] == "data"
+                and parent["row_ordinal_int"] < other["row_ordinal_int"] < row["row_ordinal_int"]
+                for other in by_table[row["table_ref_kwd"]]
+            )
+        ):
+            raise ValueError("invalid grouped detail parent record reference")
 
     tables = projection.get("tables")
     if not isinstance(tables, list):
@@ -8468,6 +8584,8 @@ def page_tabular_structure_rows(
                     [field["column_ordinal"], field["value"]]
                     for field in json.loads(row["ordered_fields_list"])
                 ],
+                (int(row["parent_record_row_ref_kwd"].rsplit(":", 1)[1])
+                 if row["parent_record_row_ref_kwd"] is not None else None),
             ]
             for row in page_rows
         ]

@@ -201,6 +201,8 @@ def _stored_generation_with_contract(
         table["table_ref"] = new_ref
         table_refs[old_ref] = new_ref
     for row in projection["rows"]:
+        row["tabular_structure_version_kwd"] = "tabular-row/v2"
+        row.pop("parent_record_row_ref_kwd", None)
         row["producer_generation_ref_kwd"] = projection[
             "producer_generation_ref"
         ]
@@ -4310,6 +4312,7 @@ def test_backfill_ignores_active_generations_outside_the_current_contract(
         ("region-producer/v10", "enumeration-rules/v3"),
         ("region-producer/v22", "enumeration-rules/v9"),
         ("region-producer/v26", "enumeration-rules/v9"),
+        ("region-producer/v27", "enumeration-rules/v9"),
     ],
 )
 def test_backfill_validates_known_historical_inner_contract_and_indexes_current_only(
@@ -4914,10 +4917,10 @@ def test_generation_bound_compact_page_is_lossless_and_smaller(table_parser):
         table_ref=table_ref,
         cursor=0,
         page_size=3,
-        row_transport_version="tabular-row-page-compact/v1",
+        row_transport_version="tabular-row-page-compact/v2",
     )
 
-    assert compact["row_transport_version"] == "tabular-row-page-compact/v1"
+    assert compact["row_transport_version"] == "tabular-row-page-compact/v2"
     assert {
         key: compact[key]
         for key in (
@@ -4956,6 +4959,7 @@ def test_generation_bound_compact_page_is_lossless_and_smaller(table_parser):
                 [field["column_ordinal"], field["value"]]
                 for field in json.loads(row["ordered_fields_list"])
             ],
+            None,
         ]
         for row in verbose["rows"]
     ]
@@ -5260,11 +5264,11 @@ def test_exact_generation_row_read_forwards_compact_transport_after_scope_bindin
         document_id="document-1",
         producer_generation_ref=projection["producer_generation_ref"],
         table_ref=table_ref,
-        row_transport_version="tabular-row-page-compact/v1",
+        row_transport_version="tabular-row-page-compact/v2",
         repository=generation_repository,
     )
 
-    assert result["row_transport_version"] == "tabular-row-page-compact/v1"
+    assert result["row_transport_version"] == "tabular-row-page-compact/v2"
     assert result["producer_generation_ref"] == projection["producer_generation_ref"]
     assert result["table_ref"] == table_ref
     assert result["rows"][0] == [
@@ -5275,6 +5279,7 @@ def test_exact_generation_row_read_forwards_compact_transport_after_scope_bindin
             [field["column_ordinal"], field["value"]]
             for field in json.loads(projection["rows"][0]["ordered_fields_list"])
         ],
+        None,
     ]
 
 

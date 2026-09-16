@@ -180,6 +180,28 @@ class RAGFlowExcelParser:
                 min_row, min_col = start
                 max_row, max_col = end
                 if min_row != max_row or min_col != max_col:
+                    # BIFF can contain a merge record while retaining distinct
+                    # values in subordinate cells (common in supplier grids).
+                    # openpyxl would discard those values when merging; retain
+                    # the physical source rows and let structure detection use
+                    # the explicit cells instead of inventing one record.
+                    subordinate_values = [
+                        worksheet.cell(row=r + 1, column=c + 1).value
+                        for r in range(min_row, max_row + 1)
+                        for c in range(min_col, max_col + 1)
+                        if (r, c) != start
+                    ]
+                    if any(value is not None for value in subordinate_values):
+                        # This is a data-bearing merge, not a header merge;
+                        # retain physical cells while preserving geometry for
+                        # region boundaries.  _cell_value prefers the physical
+                        # source cell, so the range cannot re-expand values.
+                        from openpyxl.worksheet.cell_range import CellRange
+                        worksheet.merged_cells.add(
+                            CellRange(min_row=min_row + 1, min_col=min_col + 1,
+                                      max_row=max_row + 1, max_col=max_col + 1)
+                        )
+                        continue
                     worksheet.merge_cells(
                         start_row=min_row + 1,
                         start_column=min_col + 1,

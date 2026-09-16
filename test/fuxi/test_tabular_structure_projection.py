@@ -59,11 +59,64 @@ def test_sparse_numeric_groups_do_not_become_header_with_merged_footer(monkeypat
     )
     complete = [item for item in projection["tables"] if item["enumeration_status"] == "supported_complete"]
     assert len(complete) == 1
-    # Each measurement row has independent source values. Blank identity cells
-    # do not turn those measurements into notes or remove them from coverage.
-    assert complete[0]["source_total_count"] == 6
+    # Repeated identity fields establish three records; measurements remain
+    # source-backed children, not extra business records or discarded notes.
+    assert complete[0]["source_total_count"] == 3
     data = [row for row in projection["rows"] if row["table_ref_kwd"] == complete[0]["table_ref"] and row["row_role_kwd"] == "data"]
-    assert [row["row_ordinal_int"] for row in data] == list(range(2, 8))
+    assert [row["row_ordinal_int"] for row in data] == [2, 4, 6]
+    details = [row for row in projection["rows"] if row.get("parent_record_row_ref_kwd")]
+    assert [row["row_ordinal_int"] for row in details] == [3, 5, 7]
+    assert [row["parent_record_row_ref_kwd"] for row in details] == [row["row_ref_kwd"] for row in data]
+
+
+@pytest.mark.parametrize("defect", ["independent_identity", "missing_identity", "nonmonotonic", "gap", "leading_detail"])
+def test_sparse_group_proof_rejects_ambiguous_ownership(defect):
+    rows = [
+        (2, [1, "part-a", "measure-a", 1], False),
+        (3, [None, None, "measure-b", 2], False),
+        (4, [2, "part-b", "measure-a", 3], False),
+        (5, [None, None, "measure-b", 4], False),
+    ]
+    if defect == "independent_identity":
+        rows[1][1][1] = "separate-part"
+    elif defect == "missing_identity":
+        rows[0][1][1] = None
+        rows[2][1][1] = None
+    elif defect == "nonmonotonic":
+        rows[2][1][0] = 1
+    elif defect == "gap":
+        rows[1] = (3, rows[1][1], True)
+    else:
+        rows.insert(0, (1, [None, None, "measure-z", 0], False))
+    assert tabular_structure._sparse_numeric_record_groups(rows, ()) is None
+
+
+def test_vertical_merge_cannot_group_distinct_physical_record_keys():
+    from openpyxl.worksheet.cell_range import CellRange
+    rows = [(ordinal, [ordinal - 1, chr(63 + ordinal), 10, "ok"], False)
+            for ordinal in range(2, 6)]
+    merges = [CellRange(value) for value in ("A2:A3", "B2:B3", "A4:A5", "B4:B5")]
+    proof = tabular_structure._record_axis_evidence(["ID", "Part", "Value", "Result"], rows, merges)
+    assert proof is not None
+    assert proof["record_row_ordinals"] == (2, 3, 4, 5)
+    assert not proof.get("group_parent_row_ordinals")
+
+
+def test_ordered_fields_preserves_distinct_values_inside_one_source_merge():
+    anchor = ("merge", 20, 5, 20, 6)
+    fields = _ordered_fields(
+        ["Limit", "Limit"], ["first limit", "different limit"], note=False,
+        sheet_ordinal=1, absolute_column_ordinals=[5, 6],
+        source_anchors=[anchor, anchor],
+    )
+    assert [(field["column_id"], field["value"]) for field in fields] == [
+        ("col_v1:1:5", "first limit"), ("col_v1:1:6", "different limit"),
+    ]
+    duplicate = _ordered_fields(
+        ["Limit", "Limit"], ["same", "same"], note=False,
+        source_anchors=[anchor, anchor],
+    )
+    assert duplicate == [{"name": "Limit", "value": "same"}]
 
 
 class _MergedLookupRange:
@@ -160,6 +213,130 @@ def test_four_accepted_sources_keep_structure_semantics_with_index(monkeypatch, 
     assert summarize(indexed, indexed_workbook) == summarize(linear, linear_workbook)
 
 
+def test_xls_merge_with_populated_subordinates_preserves_each_material_record(monkeypatch):
+    source = Path("/opt/fuxi/evidence/g91-source-download-20260916/G91-PN01.xls")
+    if not source.exists():
+        pytest.skip("G91 source evidence is not mounted")
+    parser = _load_table_module(monkeypatch).Excel()
+    workbook = parser._load_excel_to_workbook(BytesIO(source.read_bytes()))
+    sheet = workbook["19、材料分供方清单"]
+    # The BIFF merge spans two physical rows, but both source rows contain
+    # independent material values. Loading must not erase the subordinate.
+    assert sheet.cell(7, 10).value == "铝合金管柱"
+    assert sheet.cell(8, 10).value == "转向上轴"
+    assert sheet.cell(7, 11).value == "ADC12"
+    assert sheet.cell(8, 11).value == "35#"
+
+
+def test_xls_loading_preserves_source_merge_geometry(monkeypatch):
+    from python_calamine import CalamineWorkbook
+
+    source = Path("/opt/fuxi/evidence/g91-source-download-20260916/G91-PN01.xls")
+    if not source.exists():
+        pytest.skip("G91 source evidence is not mounted")
+    parser = _load_table_module(monkeypatch).Excel()
+    workbook = parser._load_excel_to_workbook(BytesIO(source.read_bytes()))
+    original = CalamineWorkbook.from_path(str(source))
+    for name in original.sheet_names:
+        expected = {
+            (start[0] + 1, start[1] + 1, end[0] + 1, end[1] + 1)
+            for start, end in original.get_sheet_by_name(name).merged_cell_ranges
+            if start != end
+        }
+        if not expected:
+            continue
+        actual = {
+            (r.min_row, r.min_col, r.max_row, r.max_col)
+            for r in workbook[name].merged_cells.ranges
+        }
+        assert actual == expected, name
+
+
+def test_region_copy_preserves_populated_merge_subordinates(monkeypatch):
+    from openpyxl.worksheet.cell_range import CellRange
+
+    worksheet = Workbook().active
+    worksheet.append(["part-a", "grade-a"])
+    worksheet.append(["part-b", "grade-b"])
+    worksheet.merged_cells.add(CellRange("A1:A2"))
+    worksheet.merged_cells.add(CellRange("B1:B2"))
+    region = {
+        "bbox": (1, 1, 2, 2),
+        "members": {(1, 1), (1, 2), (2, 1), (2, 2)},
+        "unresolved_members": set(),
+    }
+    copied, offset = tabular_structure._copy_structure_region(
+        _load_table_module(monkeypatch).Excel(), worksheet, region,
+    )
+    assert offset == 0
+    assert list(copied.values) == list(worksheet.values)
+    assert {str(r) for r in copied.merged_cells.ranges} == {"A1:A2", "B1:B2"}
+
+
+def test_supplier_populated_merge_axis_is_not_replaced_by_empty_header(monkeypatch):
+    source = Path("/opt/fuxi/evidence/g91-source-download-20260916/G91-PN01.xls")
+    if not source.exists():
+        pytest.skip("G91 source evidence is not mounted")
+    binary = source.read_bytes()
+    assert hashlib.sha256(binary).hexdigest() == (
+        "0f0bab58c1eb8c67541c3fae9e068f2fe274228c615ea95ff7ad9b2f99699cdc"
+    )
+    parser = _load_table_module(monkeypatch).Excel()
+    workbook = parser._load_excel_to_workbook(BytesIO(binary))
+    sheet = workbook["19、材料分供方清单"]
+    regions = tabular_structure._worksheet_structure_regions(
+        parser, sheet, workbook.sheetnames.index(sheet.title) + 1, set(), set(),
+    )
+    region = next(r for r in regions if (8, 10) in r["members"])
+    copied, _ = tabular_structure._copy_structure_region(parser, sheet, region)
+    rows, populated, _ = tabular_structure._complete_worksheet_rows(copied)
+    proven = tabular_structure._nonempty_record_axis_structure(
+        parser, copied, rows, populated,
+    )
+    assert proven is not None
+    selected, empty = tabular_structure._primary_record_axis_structures(
+        parser, copied, rows, populated, allow_context_preceded_empty_axis=True,
+    )
+    assert selected == proven
+    assert empty is None
+
+
+def test_g91_material_report_keeps_main_rows_and_continuations(monkeypatch):
+    from python_calamine import CalamineWorkbook
+
+    source = Path("/opt/fuxi/evidence/g91-source-download-20260916/G91-PN01.xls")
+    if not source.exists():
+        pytest.skip("G91 source evidence is not mounted")
+    parser = _load_table_module(monkeypatch).Excel()
+    binary = source.read_bytes()
+    assert hashlib.sha256(binary).hexdigest() == "0f0bab58c1eb8c67541c3fae9e068f2fe274228c615ea95ff7ad9b2f99699cdc"
+    source_rows = CalamineWorkbook.from_path(str(source)).get_sheet_by_name("12、材料试验报告").to_python(skip_empty_area=False)
+    anchor_rows = [11, 19, 29, 37, 43, 48, 51, 59, 68, 77]
+    assert [source_rows[row - 1][0] for row in anchor_rows] == list(range(1, 11))
+    projection = build_tabular_structure_projection("G91-PN01.xls", binary, parser=parser)
+    reports = [t for t in projection["tables"]
+               if t.get("table_label") == "12、材料试验报告"
+               and t["enumeration_status"] == "supported_complete"]
+    assert len(reports) == 1
+    assert reports[0]["source_total_count"] == 10
+    rows = [row for row in projection["rows"]
+            if row["table_ref_kwd"] == reports[0]["table_ref"]]
+    assert [row["row_ordinal_int"] for row in rows if row["row_role_kwd"] == "data"] == anchor_rows
+    body = [row for row in rows if 11 <= row["row_ordinal_int"] <= 85]
+    assert [row["row_ordinal_int"] for row in body] == list(range(11, 86))
+    assert sum(row["row_role_kwd"] == "note" for row in body) == 65
+    # Independently compare every populated physical source cell, including
+    # every continuation, rather than trusting a projection-derived total.
+    for row in body:
+        fields = {int(field["column_id"].rsplit(":", 1)[1]): field["value"]
+                  for field in json.loads(row["ordered_fields_list"])}
+        for column, value in enumerate(source_rows[row["row_ordinal_int"] - 1], start=1):
+            if value is None or value == "":
+                continue
+            expected = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value).strip()
+            assert fields.get(column) == expected, (row["row_ordinal_int"], column)
+
+
 @pytest.mark.parametrize(
     "source_path,source_sha256",
     [
@@ -191,18 +368,100 @@ def test_uploaded_f515_pfmea_body_is_one_supported_record_axis(monkeypatch, sour
     assert len(pfmea) == 1
     assert pfmea[0]["source_total_count"] >= 100
     assert len(pfmea[0]["ordered_columns"]) >= 18
-    # Same uploaded bytes: material report has 11 numbered material anchors,
-    # with 62 independent measurement rows at source rows 11 through 72.
+    # Same uploaded bytes: 11 numbered material records occupy 62 physical rows.
     # Ni/Sn are the final two measurements, not the entire report.
     material = [table for table in projection["tables"]
                 if table.get("table_label") == "12、材料试验报告"
                 and table.get("enumeration_status") == "supported_complete"]
     assert len(material) == 1
-    assert material[0]["source_total_count"] == 62
+    assert material[0]["source_total_count"] == 11
     material_rows = [row for row in projection["rows"]
                      if row["table_ref_kwd"] == material[0]["table_ref"]
-                     and row["row_role_kwd"] == "data"]
+                     and 11 <= row["row_ordinal_int"] <= 72]
     assert [row["row_ordinal_int"] for row in material_rows] == list(range(11, 73))
+    from python_calamine import CalamineWorkbook
+
+    source_sheet = CalamineWorkbook.from_path(source_path).get_sheet_by_name("12、材料试验报告")
+    source_rows = source_sheet.to_python(skip_empty_area=False)
+    anchors = [11, 17, 24, 28, 35, 39, 44, 52, 58, 62, 66]
+    assert [source_rows[row - 1][0] for row in anchors] == list(range(1, 12))
+    assert [row["row_ordinal_int"] for row in material_rows
+            if row["row_role_kwd"] == "data"] == anchors
+    parent = None
+    for row in material_rows:
+        if row["row_ordinal_int"] in anchors:
+            assert row["parent_record_row_ref_kwd"] is None
+            parent = row["row_ref_kwd"]
+        else:
+            assert row["row_role_kwd"] == "note"
+            assert row["parent_record_row_ref_kwd"] == parent
+        fields = {int(field["column_id"].rsplit(":", 1)[1]): field["value"]
+                  for field in json.loads(row["ordered_fields_list"])}
+        for column, value in enumerate(source_rows[row["row_ordinal_int"] - 1], start=1):
+            if value is None or value == "":
+                continue
+            expected = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value).strip()
+            source_column = column
+            # BIFF can store the same value twice inside a horizontal merge.
+            # Only an exact duplicate may resolve to that merge's anchor;
+            # distinct populated subordinate values must survive separately.
+            for (first_row, first_col), (last_row, last_col) in source_sheet.merged_cell_ranges:
+                if (first_row == last_row == row["row_ordinal_int"] - 1
+                        and first_col < column - 1 <= last_col
+                        and source_rows[first_row][first_col] == value):
+                    source_column = first_col + 1
+                    break
+            assert fields.get(source_column) == expected, (row["row_ordinal_int"], column)
+
+
+@pytest.mark.parametrize("filename", [
+    "D91-前稳定杆接头总成PH01-江西荣成.xls",
+    "D91-轮胎总成PH01-中策橡胶.xls",
+])
+def test_current_uploaded_d91_supported_tables_match_source_bound_baseline(monkeypatch, filename):
+    from collections import Counter
+
+    baseline_path = Path("/opt/fuxi/evidence/ppap-current-source-comparison-20260914t235728128115z-4d134f44/current.json")
+    source = Path("/opt/fuxi/evidence/ppap-four-file-current-identity-20260914t051021853198z-6d7431ba/remote-originals") / filename
+    if not baseline_path.exists() or not source.exists():
+        pytest.skip("source-bound baseline evidence is not mounted")
+    baseline = json.loads(baseline_path.read_text())[filename]
+    binary = source.read_bytes()
+    assert hashlib.sha256(binary).hexdigest() == baseline["source_sha256"]
+    projection = build_tabular_structure_projection(filename, binary, parser=_load_table_module(monkeypatch).Excel())
+    supported = [table for table in projection["tables"] if table["enumeration_status"] == "supported_complete"]
+    # Independently adjudicate the previously unsupported application form:
+    # the tire source contains one filled request and five numeric-only slots.
+    if filename == "D91-轮胎总成PH01-中策橡胶.xls":
+        from python_calamine import CalamineWorkbook
+        raw = CalamineWorkbook.from_path(str(source)).get_sheet_by_index(4).to_python(skip_empty_area=False)
+        assert raw[6][0:2] == [1, "新零件"]
+        assert all(not any(value not in (None, "") for value in raw[index][1:]) for index in range(7, 12))
+        requests = [table for table in supported if table["sheet_ordinal"] == 5 and table["source_total_count"] == 1]
+        assert len(requests) == 1
+        request_rows = [row for row in projection["rows"] if row["table_ref_kwd"] == requests[0]["table_ref"]]
+        data = [row for row in request_rows if row["row_role_kwd"] == "data"]
+        assert [row["row_ordinal_int"] for row in data] == [7]
+        assert [field["value"] for field in json.loads(data[0]["ordered_fields_list"])] == ["1", "新零件"]
+        supported = [table for table in supported if table is not requests[0]]
+    current = [{
+        "columns": [[column["column_id"], column["name"]] for column in table["ordered_columns"]],
+        "count": table["source_total_count"], "rule": table["matched_rule"],
+        "status": table["enumeration_status"],
+    } for table in supported]
+    expected = [table for table in baseline["tables"] if table["status"] == "supported_complete"]
+    # Application-list contents and columns are invariant; the proof rule
+    # changed when the enclosing form became independently recognized.
+    for table in [*current, *expected]:
+        if table["columns"] and table["columns"][0][0].startswith("col_v1:5:"):
+            table.pop("rule", None)
+    actual_counts = Counter(json.dumps(table, sort_keys=True, ensure_ascii=False) for table in current)
+    expected_counts = Counter(json.dumps(table, sort_keys=True, ensure_ascii=False) for table in expected)
+    if actual_counts != expected_counts:
+        pytest.fail(json.dumps({
+            "added": [json.loads(item) for item in (actual_counts - expected_counts).elements()],
+            "removed": [json.loads(item) for item in (expected_counts - actual_counts).elements()],
+        }, ensure_ascii=False))
 
 
 def test_uploaded_xls_preserves_source_table_grid(monkeypatch):
@@ -316,11 +575,11 @@ def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
 
 
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
-    assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v2"
+    assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v3"
     assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
     assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v27"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v28"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -5964,6 +6223,25 @@ def test_intermediate_title_belongs_to_the_following_structured_table(table_pars
     ] == [2, 2]
 
 
+def test_multicolumn_form_with_only_numeric_slots_is_not_a_single_column_list(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:F1")
+    sheet["A1"] = "Anonymous register"
+    sheet.append(["Sequence", "Item", None, "Requirement", None, "Status"])
+    sheet.merge_cells("B2:C2")
+    sheet.merge_cells("D2:E2")
+    for index in range(1, 5):
+        sheet.append([index])
+        sheet.merge_cells(start_row=index + 2, start_column=2, end_row=index + 2, end_column=3)
+        sheet.merge_cells(start_row=index + 2, start_column=4, end_row=index + 2, end_column=5)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser)
+    supported = [table for table in projection["tables"] if table["enumeration_status"] == "supported_complete"]
+    assert all(table["source_total_count"] == 0 for table in supported)
+    assert all(len(table["ordered_columns"]) > 1 for table in supported)
+
+
 def test_numeric_key_only_slots_are_preserved_but_not_counted_as_business_records(
     table_parser,
 ):
@@ -6724,8 +7002,15 @@ def test_sparse_record_axis_excludes_context_without_a_matching_parser_fallback(
     )
     complete = [t for t in projection["tables"] if t["enumeration_status"] == "supported_complete"]
     assert len(complete) == 1
-    assert complete[0]["source_total_count"] == 6
+    # Three independently numbered tests each own two physical observations.
+    assert complete[0]["source_total_count"] == 3
     assert len(complete[0]["ordered_columns"]) == 10
+    body = [row for row in projection["rows"] if row["table_ref_kwd"] == complete[0]["table_ref"]
+            and 9 <= row["row_ordinal_int"] <= 14]
+    assert [row["row_ordinal_int"] for row in body] == list(range(9, 15))
+    for anchor, detail in zip(body[::2], body[1::2]):
+        assert anchor["row_role_kwd"] == "data"
+        assert detail["parent_record_row_ref_kwd"] == anchor["row_ref_kwd"]
 
 
 def test_context_form_pairs_metadata_by_source_merge_geometry(
@@ -7002,6 +7287,53 @@ def test_vertical_record_merge_proves_an_axis_across_an_empty_display_row(table_
     ] == [2, 3, 5, 6]
 
 
+@pytest.mark.parametrize("start_row", [2, 17])
+def test_group_axis_proof_retains_each_detail_owner(start_row):
+    from openpyxl.worksheet.cell_range import CellRange
+
+    rows = []
+    merges = []
+    owners = {}
+    anchors = []
+    for sequence, length in enumerate((2, 3, 2), start=1):
+        anchor = start_row + len(rows)
+        anchors.append(anchor)
+        for column in (1, 2):
+            merges.append(CellRange(min_col=column, max_col=column,
+                                    min_row=anchor, max_row=anchor + length - 1))
+        for offset in range(length):
+            ordinal = anchor + offset
+            rows.append((ordinal, [sequence, f"Part {sequence}", f"Value {offset}", "OK"], False))
+            if offset:
+                owners[ordinal] = anchor
+
+    proof = tabular_structure._record_axis_evidence(
+        ["Sequence", "Part", "Requirement", "Result"], rows, merges,
+    )
+    assert proof is not None
+    assert proof["record_row_ordinals"] == tuple(anchors)
+    assert proof.get("group_parent_row_ordinals") == owners
+    assert set(proof["group_continuation_row_ordinals"]) == set(owners)
+
+
+@pytest.mark.parametrize("defect", ["missing_dimension", "missing_detail", "nonmonotonic_key"])
+def test_group_axis_cannot_prove_ownership_from_adjacency_alone(defect):
+    from openpyxl.worksheet.cell_range import CellRange
+
+    rows = [(r, [(r - 2) // 2 + 1, f"Part {(r - 2) // 2}", f"Value {r}"], False)
+            for r in range(2, 8)]
+    merges = [CellRange(min_col=c, max_col=c, min_row=r, max_row=r + 1)
+              for r in (2, 4, 6) for c in (1, 2)]
+    if defect == "missing_dimension":
+        merges = [m for m in merges if m.min_col == 1]
+    elif defect == "missing_detail":
+        rows = [row for row in rows if row[0] != 5]
+    else:
+        rows[-2][1][0] = 1
+        rows[-1][1][0] = 1
+    assert tabular_structure._shared_vertical_record_groups(rows, {0, 1, 2}, merges) is None
+
+
 def test_shared_vertical_record_group_keeps_detail_rows_out_of_the_record_count(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -7065,6 +7397,46 @@ def test_shared_vertical_record_group_keeps_detail_rows_out_of_the_record_count(
         for row in rows
         if row["row_role_kwd"] == "note"
     )
+    parent_refs = {
+        detail["row_ref_kwd"]: anchor["row_ref_kwd"]
+        for anchor, detail in zip(rows[::2], rows[1::2])
+    }
+    assert {
+        row["row_ref_kwd"]: row.get("parent_record_row_ref_kwd")
+        for row in rows if row["row_role_kwd"] == "note"
+    } == parent_refs
+    paged_details = {}
+    cursor = 0
+    while True:
+        page = tabular_structure.page_tabular_structure_rows(
+            projection, table_ref=complete[0]["table_ref"],
+            cursor=cursor, page_size=1,
+        )
+        for row in page["rows"]:
+            if row["row_role_kwd"] == "note":
+                paged_details[row["row_ref_kwd"]] = row.get("parent_record_row_ref_kwd")
+        if not page["has_more"]:
+            break
+        cursor = page["next_cursor"]
+    assert paged_details == parent_refs
+    compact_details = {}
+    for cursor in range(len(rows)):
+        page = tabular_structure.page_tabular_structure_rows(
+            projection, table_ref=complete[0]["table_ref"], cursor=cursor,
+            page_size=1, row_transport_version=tabular_structure.ROW_PAGE_TRANSPORT_VERSION,
+        )
+        for value in page["rows"]:
+            assert len(value) == 5
+            if value[4] is not None:
+                compact_details[f"{complete[0]['table_ref']}:{value[0]}"] = f"{complete[0]['table_ref']}:{value[4]}"
+    assert compact_details == parent_refs
+    from copy import deepcopy
+    for bad_parent in (rows[1]["row_ref_kwd"], rows[-2]["row_ref_kwd"], "missing:1", 123):
+        broken = deepcopy(projection)
+        detail = next(item for item in broken["rows"] if item["row_ref_kwd"] == rows[1]["row_ref_kwd"])
+        detail["parent_record_row_ref_kwd"] = bad_parent
+        with pytest.raises(ValueError, match="parent"):
+            validate_tabular_structure_projection(broken)
 
 
 def test_single_record_without_a_key_cannot_hide_later_structural_blocks(table_parser):
