@@ -137,10 +137,11 @@ def _stored_generation(
     generation_ref=None,
     rows_per_part=2,
     document_id="document-1",
+    source_bytes=None,
 ):
     projection = tabular_structure.build_tabular_structure_projection(
         "anonymous.xlsx",
-        _workbook_bytes(include_note=False),
+        source_bytes if source_bytes is not None else _workbook_bytes(include_note=False),
         producer_generation_ref=generation_ref or str(uuid.uuid4()),
         parser=table_parser,
     )
@@ -5399,9 +5400,12 @@ def test_source_bound_generation_lookup_derives_the_ref_inside_ragflow_and_reads
 ):
     from rag.app.tabular_structure_runtime import structure_generation_ref_from_source_sha256
 
+    # XLSX ZIP timestamps can change on each save. Identity derivation and
+    # storage must use the same upload bytes, not two equivalent workbooks.
+    source_bytes = _workbook_bytes(include_note=False)
     source_probe = tabular_structure.build_tabular_structure_projection(
         "anonymous.xlsx",
-        _workbook_bytes(include_note=False),
+        source_bytes,
         producer_generation_ref=str(uuid.uuid4()),
         parser=table_parser,
     )
@@ -5412,7 +5416,9 @@ def test_source_bound_generation_lookup_derives_the_ref_inside_ragflow_and_reads
     storage, projection, receipt = _stored_generation(
         table_parser,
         generation_ref=generation_ref,
+        source_bytes=source_bytes,
     )
+    assert projection["source_sha256"] == source_probe["source_sha256"]
     service_module.TabularStructureService.register_shadow_generation(
         storage,
         tenant_id="tenant-owner",
