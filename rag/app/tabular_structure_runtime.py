@@ -297,11 +297,41 @@ def _merge_sheet_projections(
     for projection in projections:
         if any(projection.get(key) != first.get(key) for key in required) or projection.get("producer_generation_ref") != generation_ref:
             raise RuntimeError("tabular generation checkpoints have mixed identity")
-    return {
+    result = {
         **first,
         "tables": [table for projection in projections for table in projection.get("tables", [])],
         "rows": [row for projection in projections for row in projection.get("rows", [])],
     }
+    from rag.app.source_layout import SOURCE_LAYOUT_PROJECTION_CONTRACT, validate_source_layout
+
+    contract = tuple(first[key] for key in (
+        "producer_schema_version", "version", "structure_algorithm_version", "enumeration_rule_version",
+    ))
+    if contract != SOURCE_LAYOUT_PROJECTION_CONTRACT:
+        if any("source_layouts" in projection for projection in projections):
+            raise RuntimeError("layout checkpoint uses an unsupported projection contract")
+        return result
+    layouts = []
+    seen = set()
+    last_sheet = 0
+    for projection in projections:
+        if not isinstance(projection.get("source_layouts"), list):
+            raise RuntimeError("layout checkpoint is missing source layouts")
+        for layout in projection["source_layouts"]:
+            if not isinstance(layout, dict):
+                raise RuntimeError("invalid layout checkpoint object")
+            validated = validate_source_layout(
+                layout, source_sha256=first["source_sha256"],
+                producer_generation_ref=generation_ref,
+                sheet_ordinal=layout.get("sheet_ordinal"), object_ref=layout.get("object_ref"),
+            )
+            if validated["object_ref"] in seen or validated["sheet_ordinal"] < last_sheet:
+                raise RuntimeError("duplicate or unordered layout checkpoint")
+            seen.add(validated["object_ref"])
+            last_sheet = validated["sheet_ordinal"]
+            layouts.append(validated)
+    result["source_layouts"] = layouts
+    return result
 
 
 def enqueue_tabular_structure_generation(

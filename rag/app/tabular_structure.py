@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import inspect
 import json
 import re
@@ -27,15 +28,18 @@ import uuid
 from collections import Counter, defaultdict
 from copy import copy
 from decimal import Decimal, InvalidOperation
+from datetime import date, datetime, time
 from io import BytesIO
 from typing import Any
 
+from rag.app.source_layout import SOURCE_LAYOUT_PROJECTION_CONTRACT, validate_source_layout, validate_layout_membership
+
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v3"
-PRODUCER_SCHEMA_VERSION = "table-producer/v6"
-PROJECTION_VERSION = "tabular-structure-projection/v6"
-PROJECTION_PART_VERSION = "tabular-structure-part/v3"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v28"
+PRODUCER_SCHEMA_VERSION = "table-producer/v7"
+PROJECTION_VERSION = "tabular-structure-projection/v7"
+PROJECTION_PART_VERSION = "tabular-structure-part/v4"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v29"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v2"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -43,6 +47,10 @@ _CURRENT_PROJECTION_CONTRACT = (
     PROJECTION_VERSION,
     STRUCTURE_PRODUCER_ALGORITHM_VERSION,
     ENUMERATION_RULE_VERSION,
+)
+_RETAINED_SERVING_PROJECTION_CONTRACT = (
+    "table-producer/v6", "tabular-structure-projection/v6",
+    "region-producer/v28", "enumeration-rules/v9",
 )
 _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
     {
@@ -64,6 +72,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v25", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v26", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v27", "enumeration-rules/v9"),
+        ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v28", "enumeration-rules/v9"),
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -335,6 +344,115 @@ def _cell_value(parser, worksheet, row_ordinal: int, column_ordinal: int, merged
     if value is not None:
         return value
     return parser._get_merged_cell_value(worksheet, row_ordinal, column_ordinal, merged_ranges)
+
+
+def _source_layout_memberships(worksheet, regions) -> list[set[tuple[int, int]]]:
+    """Close source merges without changing the list parser's record regions."""
+    groups = [set(region["members"]) for region in regions]
+    # Borders are visible source geometry, not proof of a label/value pairing.
+    # Preserve disconnected blank geometry separately rather than attaching it
+    # to the nearest record or filling an arbitrary bounding rectangle.
+    bordered = {
+        (cell.row, cell.column) for cell in worksheet._cells.values()
+        if any(getattr(getattr(cell.border, side, None), "style", None)
+               for side in ("left", "right", "top", "bottom"))
+    }
+    groups.extend(_connected_cell_regions(bordered, tolerance=1))
+    merges = list(worksheet.merged_cells.ranges)
+    expanded_merges = set()
+    changed = True
+    while changed:
+        changed = False
+        for members in groups:
+            for merge in merges:
+                span = (merge.min_row, merge.min_col, merge.max_row, merge.max_col)
+                if span in expanded_merges:
+                    continue
+                if not any(merge.min_row <= row <= merge.max_row
+                           and merge.min_col <= column <= merge.max_col
+                           for row, column in members):
+                    continue
+                size = len(members)
+                members.update((row, column)
+                               for row in range(merge.min_row, merge.max_row + 1)
+                               for column in range(merge.min_col, merge.max_col + 1))
+                # Other groups touching this span join through the exact set
+                # intersection below; repeating the rectangle adds no evidence.
+                expanded_merges.add(span)
+                changed |= len(members) != size
+        disjoint = []
+        for members in groups:
+            shared = [group for group in disjoint if group & members]
+            if shared:
+                changed = True
+                for group in shared:
+                    members.update(group)
+                    disjoint.remove(group)
+            disjoint.append(members)
+        groups = disjoint
+    return sorted(groups, key=lambda members: (*_region_bbox(members), sorted(members)))
+
+
+def _source_layout_cells(
+    worksheet, members: set[tuple[int, int]], *,
+    unresolved_formulas: set[tuple[int, int]] | None = None,
+    formula_values: dict[tuple[int, int], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Preserve an explicitly owned layout without asserting label/value roles.
+
+    Membership must already be proved by the caller. Never fill its bounding
+    rectangle: adjacent independent objects can have intersecting rectangles.
+    """
+    merged_ranges = list(worksheet.merged_cells.ranges)
+    unresolved_formulas = unresolved_formulas or set()
+    formula_values = formula_values or {}
+    result = []
+    emitted = set()
+    verified_merges = set()
+    for row, column in sorted(members):
+        source = _source_cell_anchor(row, column, merged_ranges)
+        if source[0] == "merge":
+            _, first_row, first_column, last_row, last_column = source
+            if source not in verified_merges:
+                if (last_row - first_row + 1) * (last_column - first_column + 1) > len(members):
+                    raise ValueError("incomplete merge membership")
+                if any((r, c) not in members
+                       for r in range(first_row, last_row + 1)
+                       for c in range(first_column, last_column + 1)):
+                    raise ValueError("incomplete merge membership")
+                verified_merges.add(source)
+        else:
+            first_row = last_row = row
+            first_column = last_column = column
+        anchor = (first_row, first_column)
+        cell = worksheet.cell(row, column)
+        merged_cell = worksheet.cell(first_row, first_column)
+        if cell.value is None:
+            cell = merged_cell
+        elif (type(cell.value), cell.value) != (type(merged_cell.value), merged_cell.value):
+            anchor = (row, column)
+        formula_anchor = (row, column) if (row, column) in unresolved_formulas else anchor
+        unresolved = formula_anchor in unresolved_formulas
+        value = formula_values.get(formula_anchor) if unresolved else cell.value
+        if unresolved:
+            anchor = formula_anchor
+        state = "formula_unresolved" if unresolved or cell.data_type == "f" else (
+            "blank" if value is None else "literal"
+        )
+        if not unresolved and type(value) in (date, datetime, time):
+            state = type(value).__name__
+            value = value.isoformat()
+        identity = (source, type(value), value, state)
+        if identity in emitted:
+            continue
+        emitted.add(identity)
+        result.append({
+            "anchor": list(anchor),
+            "span": [first_row, first_column, last_row, last_column],
+            "value": value,
+            "state": state,
+        })
+    return result
 
 
 def _source_cell_anchor(row_ordinal: int, column_ordinal: int, merged_ranges):
@@ -1075,6 +1193,25 @@ def _region_membership_sha256(sheet_ordinal: int, members: set[tuple[int, int]])
     return hashlib.sha256(payload).hexdigest()
 
 
+def _source_layout_membership_sha256(layout) -> str:
+    """Hash exact geometry in row order without allocating a merged rectangle."""
+    def coordinates(span):
+        top, left, bottom, right = span
+        for row in range(top, bottom + 1):
+            for column in range(left, right + 1):
+                yield row, column
+
+    spans = {tuple(cell["span"]) for cell in layout["cells"]}
+    digest = hashlib.sha256()
+    first = True
+    for row, column in heapq.merge(*(coordinates(span) for span in spans)):
+        if not first:
+            digest.update(b"\n")
+        digest.update(f"{layout['sheet_ordinal']}:{row}:{column}".encode("ascii"))
+        first = False
+    return digest.hexdigest()
+
+
 def _logical_occupied_cells(
     parser,
     worksheet,
@@ -1091,7 +1228,13 @@ def _logical_occupied_cells(
     }
     for merged in worksheet.merged_cells.ranges:
         anchor = worksheet.cell(merged.min_row, merged.min_col).value
-        if anchor is None or str(anchor).strip() == "":
+        formula_merge = (
+            _CURRENT_PROJECTION_CONTRACT == SOURCE_LAYOUT_PROJECTION_CONTRACT
+            and (merged.min_row, merged.min_col) in (
+                (formula_coordinates or set()) | (unresolved_formula_coordinates or set())
+            )
+        )
+        if (anchor is None or str(anchor).strip() == "") and not formula_merge:
             continue
         occupied.update(
             (row_ordinal, column_ordinal)
@@ -2536,6 +2679,15 @@ def _empty_record_axis_structure(parser, worksheet, rows, populated_rows, unreso
             and _source_cell_anchor(header_row, column, merged_ranges)[0] == "cell"
         ]
         if len(anchors) < 2 or anchors != list(range(anchors[0], anchors[-1] + 1)):
+            continue
+        # Unmerged labels beside occupied merged fields are part of a mixed
+        # form band. Their blank column tails alone cannot establish a
+        # separate record axis; require independent table-boundary evidence.
+        if any(
+            merged.min_row <= header_row <= merged.max_row
+            and str(worksheet.cell(merged.min_row, merged.min_col).value or "").strip()
+            for merged in merged_ranges
+        ):
             continue
         if (
             header_row > min(populated_rows) + 1
@@ -7471,6 +7623,7 @@ def _build_tabular_structure_projection_with_audit(
     defects = []
     audit_source_regions = []
     audit_output_objects = []
+    source_layouts = []
 
     for sheet_ordinal, sheet_name in enumerate(workbook.sheetnames, start=1):
         if selected_sheet_ordinals is not None and sheet_ordinal not in selected_sheet_ordinals:
@@ -7516,6 +7669,32 @@ def _build_tabular_structure_projection_with_audit(
             (sheet_ordinal, region_index): region
             for region_index, (region, _g1_disagreement) in enumerate(candidates, start=1)
         }
+
+        if _CURRENT_PROJECTION_CONTRACT == SOURCE_LAYOUT_PROJECTION_CONTRACT:
+            # Preserve source-region geometry independently of record-axis
+            # interpretation. This does not classify an unknown region as a form.
+            for members in _source_layout_memberships(worksheet, regions):
+                object_ref = "layout_" + _versioned_digest(
+                    "source-layout-object/v1", source_sha256, sheet_ordinal,
+                    _region_membership_sha256(sheet_ordinal, members),
+                )
+                layout = {
+                    "version": "source-layout/v1", "source_sha256": source_sha256,
+                    "producer_generation_ref": producer_generation_ref,
+                    "sheet_ordinal": sheet_ordinal, "object_ref": object_ref,
+                    "cells": _source_layout_cells(
+                        worksheet, members,
+                        unresolved_formulas=sheet_unresolved_formula_coordinates,
+                        formula_values=sheet_formula_values,
+                    ),
+                }
+                validate_source_layout(
+                    layout, source_sha256=source_sha256,
+                    producer_generation_ref=producer_generation_ref,
+                    sheet_ordinal=sheet_ordinal, object_ref=object_ref,
+                )
+                validate_layout_membership(layout, members)
+                source_layouts.append(layout)
 
         for region_index, (region, g1_disagreement) in enumerate(candidates, start=1):
             structure_region = region
@@ -7932,6 +8111,8 @@ def _build_tabular_structure_projection_with_audit(
         "tables": tables,
         "rows": records,
     }
+    if _CURRENT_PROJECTION_CONTRACT == SOURCE_LAYOUT_PROJECTION_CONTRACT:
+        projection["source_layouts"] = source_layouts
     validate_tabular_structure_projection(projection)
     audit = {
         "version": "tabular-structure-producer-audit/v1",
@@ -7984,7 +8165,9 @@ def _validate_tabular_structure_projection_for_contract(
         structure_algorithm_version,
         enumeration_rule_version,
     ) = contract
-    if not isinstance(projection, dict) or set(projection) != PROJECTION_FIELDS:
+    layout_contract = contract == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    expected_fields = PROJECTION_FIELDS | {"source_layouts"} if layout_contract else PROJECTION_FIELDS
+    if not isinstance(projection, dict) or set(projection) != expected_fields:
         raise ValueError("structure projection does not match the fixed top-level schema")
     if projection.get("version") != projection_version:
         raise ValueError("unsupported tabular structure projection version")
@@ -7999,6 +8182,29 @@ def _validate_tabular_structure_projection_for_contract(
     source_sha256 = projection.get("source_sha256")
     if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
         raise ValueError("source SHA-256 is invalid")
+    if layout_contract:
+        layouts = projection["source_layouts"]
+        if not isinstance(layouts, list):
+            raise ValueError("invalid source layouts")
+        seen_layouts = set()
+        previous_sheet = 0
+        for layout in layouts:
+            if not isinstance(layout, dict):
+                raise ValueError("invalid source layout")
+            validate_source_layout(
+                layout, source_sha256=source_sha256, producer_generation_ref=generation_ref,
+                sheet_ordinal=layout.get("sheet_ordinal"), object_ref=layout.get("object_ref"),
+            )
+            expected_layout_ref = "layout_" + _versioned_digest(
+                "source-layout-object/v1", source_sha256, layout["sheet_ordinal"],
+                _source_layout_membership_sha256(layout),
+            )
+            if layout["object_ref"] != expected_layout_ref:
+                raise ValueError("source layout membership identity mismatch")
+            if layout["object_ref"] in seen_layouts or layout["sheet_ordinal"] < previous_sheet:
+                raise ValueError("duplicate or unordered source layout")
+            seen_layouts.add(layout["object_ref"])
+            previous_sheet = layout["sheet_ordinal"]
     rows = projection.get("rows")
     if not isinstance(rows, list):
         raise ValueError("projection rows must be a list")
@@ -8007,12 +8213,17 @@ def _validate_tabular_structure_projection_for_contract(
     row_refs = set()
     by_table: dict[str, list[dict[str, Any]]] = {}
     ordered_fields_by_row_ref: dict[str, list[dict[str, Any]]] = {}
-    current_rows = contract == _CURRENT_PROJECTION_CONTRACT
-    row_fields = PROJECTION_ROW_FIELDS if current_rows else PROJECTION_ROW_FIELDS - {"parent_record_row_ref_kwd"}
+    # Row shape belongs to the released tuple, not to whichever tuple happens
+    # to be current when a retained snapshot is read after an upgrade.
+    grouped_rows = layout_contract or contract == (
+        "table-producer/v6", "tabular-structure-projection/v6",
+        "region-producer/v28", "enumeration-rules/v9",
+    )
+    row_fields = PROJECTION_ROW_FIELDS if grouped_rows else PROJECTION_ROW_FIELDS - {"parent_record_row_ref_kwd"}
     for row in rows:
         if not isinstance(row, dict) or set(row) != row_fields:
             raise ValueError("structure projection row fields do not match the fixed schema")
-        if row["tabular_structure_version_kwd"] != (TABULAR_STRUCTURE_VERSION if current_rows else "tabular-row/v2"):
+        if row["tabular_structure_version_kwd"] != ("tabular-row/v3" if grouped_rows else "tabular-row/v2"):
             raise ValueError("unsupported structure row version")
         if row["structure_kind_kwd"] != "table_row":
             raise ValueError("invalid structure kind")
@@ -8339,23 +8550,38 @@ def partition_tabular_structure_projection(
     *,
     rows_per_part: int = DEFAULT_ROWS_PER_PART,
 ) -> list[dict[str, Any]]:
-    validate_tabular_structure_projection(projection)
+    contract = tuple(projection.get(key) for key in (
+        "producer_schema_version", "version", "structure_algorithm_version", "enumeration_rule_version",
+    ))
+    if contract not in (_CURRENT_PROJECTION_CONTRACT, SOURCE_LAYOUT_PROJECTION_CONTRACT):
+        raise ValueError("unsupported projection write contract")
+    _validate_tabular_structure_projection_for_contract(projection, contract)
     if rows_per_part < 1:
         raise ValueError("rows_per_part must be positive")
     rows = projection["rows"]
+    has_layouts = contract == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    layout_cells = [
+        {"object_ref": layout["object_ref"], "cell": cell}
+        for layout in projection.get("source_layouts", []) for cell in layout["cells"]
+    ]
     parts = []
-    for offset in range(0, len(rows), rows_per_part):
-        part_rows = rows[offset : offset + rows_per_part]
+    for offset in range(0, max(len(rows), len(layout_cells)), rows_per_part):
+        row_offset = min(offset, len(rows))
+        part_rows = rows[row_offset : row_offset + rows_per_part]
         parts.append(
             {
-                "version": PROJECTION_PART_VERSION,
+                "version": "tabular-structure-part/v4" if has_layouts else PROJECTION_PART_VERSION,
                 "producer_generation_ref": projection["producer_generation_ref"],
                 "part_number": len(parts) + 1,
-                "row_offset": offset,
+                "row_offset": row_offset,
                 "row_count": len(part_rows),
                 "rows": part_rows,
             }
         )
+        if has_layouts:
+            layout_offset = min(offset, len(layout_cells))
+            entries = layout_cells[layout_offset:layout_offset + rows_per_part]
+            parts[-1].update(layout_offset=layout_offset, layout_count=len(entries), layout_cells=entries)
     return parts
 
 
@@ -8416,9 +8642,11 @@ def store_tabular_structure_projection(
                 "sha256": payload_sha256,
             }
         )
+        if "layout_cells" in part:
+            manifest_parts[-1].update(layout_offset=part["layout_offset"], layout_count=part["layout_count"])
 
     manifest = {
-        "version": PROJECTION_VERSION,
+        "version": projection["version"],
         "producer_schema_version": projection["producer_schema_version"],
         "producer_generation_ref": generation_ref,
         "structure_algorithm_version": projection["structure_algorithm_version"],
@@ -8428,6 +8656,11 @@ def store_tabular_structure_projection(
         "tables": projection["tables"],
         "parts": manifest_parts,
     }
+    if "source_layouts" in projection:
+        manifest["source_layouts"] = [
+            {**{key: value for key, value in layout.items() if key != "cells"}, "cell_count": len(layout["cells"])}
+            for layout in projection["source_layouts"]
+        ]
     manifest_payload = _canonical_json(manifest)
     manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
     manifest_object_name = f"{prefix}/manifest-{manifest_sha256}.json"
@@ -8492,10 +8725,17 @@ def list_tabular_structure_projection_objects(
     if hashlib.sha256(manifest_payload).hexdigest() != manifest_sha256:
         raise StructureSnapshotChanged("manifest digest changed")
     manifest = _decode_snapshot_json(manifest_payload, "manifest")
-    if set(manifest) not in {
+    layout_contract = (
+        manifest.get("producer_schema_version"), manifest.get("version"),
+        manifest.get("structure_algorithm_version"), manifest.get("enumeration_rule_version"),
+    ) == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    allowed_manifest_fields = {
         _DELETE_MANIFEST_BASE_FIELDS,
         _CURRENT_DELETE_MANIFEST_FIELDS,
-    }:
+    }
+    if layout_contract:
+        allowed_manifest_fields = {_CURRENT_DELETE_MANIFEST_FIELDS | {"source_layouts"}}
+    if set(manifest) not in allowed_manifest_fields:
         raise StructureSnapshotChanged("manifest schema changed")
     if manifest["producer_generation_ref"] != producer_generation_ref:
         raise StructureSnapshotChanged("manifest generation changed")
@@ -8509,12 +8749,52 @@ def list_tabular_structure_projection_objects(
     ):
         raise StructureSnapshotChanged("generation part count changed")
 
+    layout_total = 0
+    if layout_contract:
+        descriptors = manifest["source_layouts"]
+        if not isinstance(descriptors, list):
+            raise StructureSnapshotChanged("layout manifest changed")
+        seen_refs = set()
+        previous_sheet = 0
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict) or set(descriptor) != {
+                "version", "source_sha256", "producer_generation_ref", "sheet_ordinal", "object_ref", "cell_count",
+            } or type(descriptor["cell_count"]) is not int or descriptor["cell_count"] < 0:
+                raise StructureSnapshotChanged("layout descriptor changed")
+            layout = {key: value for key, value in descriptor.items() if key != "cell_count"}
+            layout["cells"] = []
+            try:
+                validate_source_layout(
+                    layout, source_sha256=manifest["source_sha256"],
+                    producer_generation_ref=producer_generation_ref,
+                    sheet_ordinal=descriptor["sheet_ordinal"], object_ref=descriptor["object_ref"],
+                )
+            except ValueError as exc:
+                raise StructureSnapshotChanged("layout descriptor changed") from exc
+            if descriptor["object_ref"] in seen_refs or descriptor["sheet_ordinal"] < previous_sheet:
+                raise StructureSnapshotChanged("layout descriptor order changed")
+            seen_refs.add(descriptor["object_ref"])
+            previous_sheet = descriptor["sheet_ordinal"]
+            layout_total += descriptor["cell_count"]
+
     part_object_names: list[str] = []
     expected_offset = 0
+    expected_layout_offset = 0
     for expected_part_number, part_manifest in enumerate(manifest["parts"], start=1):
         expected_part_fields = {"part_number", "object_name", "row_offset", "row_count", "sha256"}
+        if layout_contract:
+            expected_part_fields |= {"layout_offset", "layout_count"}
         if not isinstance(part_manifest, dict) or set(part_manifest) != expected_part_fields:
             raise StructureSnapshotChanged("part manifest changed")
+        if layout_contract:
+            if (
+                type(part_manifest["layout_offset"]) is not int
+                or type(part_manifest["layout_count"]) is not int
+                or part_manifest["layout_offset"] != expected_layout_offset
+                or part_manifest["layout_count"] < 0
+            ):
+                raise StructureSnapshotChanged("part layout count changed")
+            expected_layout_offset += part_manifest["layout_count"]
         part_sha256 = part_manifest["sha256"]
         if (
             part_manifest["part_number"] != expected_part_number
@@ -8533,6 +8813,8 @@ def list_tabular_structure_projection_objects(
         part_object_names.append(expected_part_name)
         expected_offset += part_manifest["row_count"]
 
+    if expected_layout_offset != layout_total:
+        raise StructureSnapshotChanged("manifest layout count changed")
     if (
         not isinstance(manifest["row_count"], int)
         or isinstance(manifest["row_count"], bool)
@@ -8712,6 +8994,12 @@ def _load_tabular_structure_projection_for_contracts(
         "tables",
         "parts",
     }
+    layout_contract = (
+        manifest.get("producer_schema_version"), manifest.get("version"),
+        manifest.get("structure_algorithm_version"), manifest.get("enumeration_rule_version"),
+    ) == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    if layout_contract:
+        expected_manifest_fields.add("source_layouts")
     if set(manifest) != expected_manifest_fields:
         raise StructureSnapshotChanged("manifest schema changed")
     contract = (
@@ -8734,10 +9022,33 @@ def _load_tabular_structure_projection_for_contracts(
     ):
         raise StructureSnapshotChanged("generation part count changed")
 
+    layouts = []
+    layouts_by_ref = {}
+    layout_counts = {}
+    if layout_contract:
+        if not isinstance(manifest["source_layouts"], list):
+            raise StructureSnapshotChanged("layout manifest changed")
+        for descriptor in manifest["source_layouts"]:
+            if not isinstance(descriptor, dict) or set(descriptor) != {
+                "version", "source_sha256", "producer_generation_ref", "sheet_ordinal", "object_ref", "cell_count",
+            }:
+                raise StructureSnapshotChanged("layout descriptor changed")
+            ref = descriptor["object_ref"]
+            if not isinstance(ref, str) or ref in layouts_by_ref or type(descriptor["cell_count"]) is not int or descriptor["cell_count"] < 0:
+                raise StructureSnapshotChanged("layout descriptor identity changed")
+            layout = {key: value for key, value in descriptor.items() if key != "cell_count"}
+            layout["cells"] = []
+            layouts.append(layout)
+            layouts_by_ref[ref] = layout
+            layout_counts[ref] = descriptor["cell_count"]
     rows: list[dict[str, Any]] = []
     expected_offset = 0
+    expected_layout_offset = 0
+    layout_order = []
     for expected_part_number, part_manifest in enumerate(manifest["parts"], start=1):
         expected_part_fields = {"part_number", "object_name", "row_offset", "row_count", "sha256"}
+        if layout_contract:
+            expected_part_fields |= {"layout_offset", "layout_count"}
         if not isinstance(part_manifest, dict) or set(part_manifest) != expected_part_fields:
             raise StructureSnapshotChanged("part manifest changed")
         if (
@@ -8758,10 +9069,13 @@ def _load_tabular_structure_projection_for_contracts(
         if hashlib.sha256(part_payload).hexdigest() != part_manifest["sha256"]:
             raise StructureSnapshotChanged("part digest changed")
         part = _decode_snapshot_json(part_payload, "part")
-        if set(part) != {"version", "producer_generation_ref", "part_number", "row_offset", "row_count", "rows"}:
+        part_fields = {"version", "producer_generation_ref", "part_number", "row_offset", "row_count", "rows"}
+        if layout_contract:
+            part_fields |= {"layout_offset", "layout_count", "layout_cells"}
+        if set(part) != part_fields:
             raise StructureSnapshotChanged("part schema changed")
         if (
-            part["version"] != PROJECTION_PART_VERSION
+            part["version"] != ("tabular-structure-part/v4" if layout_contract else "tabular-structure-part/v3")
             or part["producer_generation_ref"] != producer_generation_ref
             or part["part_number"] != expected_part_number
             or part["row_offset"] != expected_offset
@@ -8772,6 +9086,25 @@ def _load_tabular_structure_projection_for_contracts(
             raise StructureSnapshotChanged("part generation changed")
         rows.extend(part["rows"])
         expected_offset += part["row_count"]
+        if layout_contract:
+            if (
+                type(part["layout_offset"]) is not int or type(part["layout_count"]) is not int
+                or type(part_manifest["layout_offset"]) is not int or type(part_manifest["layout_count"]) is not int
+                or part["layout_offset"] != expected_layout_offset
+                or part_manifest["layout_offset"] != expected_layout_offset
+                or not isinstance(part["layout_cells"], list)
+                or part["layout_count"] != len(part["layout_cells"])
+                or part_manifest["layout_count"] != part["layout_count"]
+            ):
+                raise StructureSnapshotChanged("layout part count or offset changed")
+            for entry in part["layout_cells"]:
+                if not isinstance(entry, dict) or set(entry) != {"object_ref", "cell"} or not isinstance(entry["object_ref"], str) or entry["object_ref"] not in layouts_by_ref:
+                    raise StructureSnapshotChanged("layout part reference changed")
+                ref = entry["object_ref"]
+                layouts_by_ref[ref]["cells"].append(entry["cell"])
+                if not layout_order or layout_order[-1] != ref:
+                    layout_order.append(ref)
+            expected_layout_offset += part["layout_count"]
 
     if expected_offset != manifest["row_count"]:
         raise StructureSnapshotChanged("manifest row count changed")
@@ -8785,6 +9118,12 @@ def _load_tabular_structure_projection_for_contracts(
         "tables": manifest["tables"],
         "rows": rows,
     }
+    if layout_contract:
+        if any(len(layout["cells"]) != layout_counts[layout["object_ref"]] for layout in layouts):
+            raise StructureSnapshotChanged("layout cell coverage changed")
+        if layout_order != [layout["object_ref"] for layout in layouts if layout_counts[layout["object_ref"]]]:
+            raise StructureSnapshotChanged("layout part order changed")
+        projection["source_layouts"] = layouts
     try:
         _validate_tabular_structure_projection_for_contract(projection, contract)
     except ValueError as exc:
@@ -8815,6 +9154,31 @@ def load_tabular_structure_projection(
         expected_part_count=expected_part_count,
         tenant_id=tenant_id,
         accepted_contracts=frozenset({_CURRENT_PROJECTION_CONTRACT}),
+    )
+
+
+def load_tabular_structure_projection_for_serving(
+    storage,
+    *,
+    bucket: str,
+    document_id: str,
+    producer_generation_ref: str,
+    manifest_object_name: str,
+    manifest_sha256: str,
+    expected_part_count: int | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Read current or exact predecessor snapshots during atomic cutover.
+
+    Build and activation retain the current-only loader. Serving never rewrites
+    a predecessor's identity, row schema, or version tuple.
+    """
+    return _load_tabular_structure_projection_for_contracts(
+        storage, bucket=bucket, document_id=document_id,
+        producer_generation_ref=producer_generation_ref,
+        manifest_object_name=manifest_object_name, manifest_sha256=manifest_sha256,
+        expected_part_count=expected_part_count, tenant_id=tenant_id,
+        accepted_contracts=frozenset({_CURRENT_PROJECTION_CONTRACT, _RETAINED_SERVING_PROJECTION_CONTRACT}),
     )
 
 
@@ -8854,7 +9218,12 @@ def page_tabular_structure_rows(
 ) -> dict[str, Any]:
     """Return one stable offset page from an already verified generation."""
 
-    validate_tabular_structure_projection(projection)
+    contract = tuple(projection.get(key) for key in (
+        "producer_schema_version", "version", "structure_algorithm_version", "enumeration_rule_version",
+    ))
+    if contract not in {_CURRENT_PROJECTION_CONTRACT, _RETAINED_SERVING_PROJECTION_CONTRACT}:
+        raise ValueError("unsupported serving projection contract")
+    _validate_tabular_structure_projection_for_contract(projection, contract)
     if not isinstance(table_ref, str) or not table_ref:
         raise ValueError("table_ref is required")
     if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:

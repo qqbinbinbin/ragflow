@@ -169,6 +169,9 @@ def _stored_generation_with_contract(
         document_id=document_id,
     )
     projection = copy.deepcopy(projection)
+    projection["producer_schema_version"] = "table-producer/v6"
+    projection["version"] = "tabular-structure-projection/v6"
+    projection.pop("source_layouts", None)
     projection["structure_algorithm_version"] = structure_algorithm_version
     projection["enumeration_rule_version"] = enumeration_rule_version
     projection["producer_generation_ref"] = str(
@@ -202,6 +205,7 @@ def _stored_generation_with_contract(
         table["table_ref"] = new_ref
         table_refs[old_ref] = new_ref
     for row in projection["rows"]:
+        row["producer_schema_version_kwd"] = "table-producer/v6"
         row["tabular_structure_version_kwd"] = "tabular-row/v2"
         row.pop("parent_record_row_ref_kwd", None)
         row["producer_generation_ref_kwd"] = projection[
@@ -218,7 +222,7 @@ def _stored_generation_with_contract(
         )
 
     part = {
-        "version": tabular_structure.PROJECTION_PART_VERSION,
+        "version": "tabular-structure-part/v3",
         "producer_generation_ref": projection["producer_generation_ref"],
         "part_number": 1,
         "row_offset": 0,
@@ -272,7 +276,11 @@ def _stored_generation_with_contract(
 
 
 def _stored_generation_with_historical_delete_manifest(table_parser):
-    storage, projection, receipt = _stored_generation(table_parser)
+    storage, projection, receipt = _stored_generation_with_contract(
+        table_parser, document_id="document-1",
+        structure_algorithm_version="region-producer/v27",
+        enumeration_rule_version="enumeration-rules/v9",
+    )
     old_manifest_name = receipt["manifest_object_name"]
     manifest = json.loads(storage.objects[("dataset-1", old_manifest_name)])
     del manifest["structure_algorithm_version"]
@@ -310,6 +318,78 @@ def _active_generation_record(projection, receipt, *, document_id: str):
         "activated_at": None,
         "retained_at": None,
     }
+
+
+def test_successor_runtime_serves_predecessor_active_manifest_and_rows(
+    service_module, table_parser, generation_repository, monkeypatch,
+):
+    predecessor = ("table-producer/v6", "tabular-structure-projection/v6",
+                   "region-producer/v28", "enumeration-rules/v9")
+    with monkeypatch.context() as previous:
+        for key, value in zip(("PRODUCER_SCHEMA_VERSION", "PROJECTION_VERSION",
+                               "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "ENUMERATION_RULE_VERSION"), predecessor):
+            previous.setattr(tabular_structure, key, value)
+        previous.setattr(tabular_structure, "PROJECTION_PART_VERSION", "tabular-structure-part/v3")
+        previous.setattr(tabular_structure, "_CURRENT_PROJECTION_CONTRACT", predecessor)
+        storage, projection, receipt = _stored_generation(table_parser)
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v29"
+    generation_repository.inject(_active_generation_record(projection, receipt, document_id="document-1"))
+    scope = dict(tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
+                 producer_generation_ref=projection["producer_generation_ref"], repository=generation_repository)
+    manifest = service_module.TabularStructureService.read_active_manifest(storage, **scope)
+    assert manifest["structure_algorithm_version"] == "region-producer/v28"
+    assert manifest["tables"] == projection["tables"]
+    page = service_module.TabularStructureService.read_generation_rows(
+        storage, table_ref=projection["tables"][0]["table_ref"], page_size=100, **scope)
+    assert page["rows"] == [row for row in projection["rows"]
+                            if row["table_ref_kwd"] == projection["tables"][0]["table_ref"]]
+    # An already-built index must survive the runtime upgrade and a pending
+    # backfill pass while the previous Consumer still serves this generation.
+    indexed = service_module.build_tabular_discovery_index_projection(
+        tenant_id="tenant-owner", dataset_id="dataset-1",
+        document_id="document-1", projection=projection)
+    for entry in indexed:
+        generation_repository.seed_discovery_index(
+            tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
+            producer_generation_ref=entry["producer_generation_ref"],
+            table_ref=entry["table_ref"], search_text=entry["search_text"],
+            table_ordinal=entry["table_ordinal"],
+            projection_status=entry["projection_status"], unsafe_reason=entry["unsafe_reason"])
+    generation_repository.mark_backfill_pending("tenant-owner", "dataset-1")
+    service_module.TabularStructureService.backfill_active_generation_indexes(
+        storage, repository=generation_repository)
+    discovery = service_module.TabularStructureService.discover_active_tables(
+        tenant_id="tenant-owner", dataset_id="dataset-1",
+        query=indexed[0]["search_text"].split()[0], cursor=None,
+        page_size=10, max_pages=2, max_evidence_bytes=10_000,
+        max_evidence_tokens=10_000, deadline_ms=1_000,
+        repository=generation_repository)
+    assert discovery["incomplete"] is False
+    assert discovery["seeds"]
+    assert {seed["producer_generation_ref"] for seed in discovery["seeds"]} == {
+        projection["producer_generation_ref"]}
+    with pytest.raises(service_module.StructureSnapshotChanged):
+        service_module.TabularStructureService.activate_generation(
+            storage, expected_active_generation_ref=projection["producer_generation_ref"], **scope)
+    storage.objects[("dataset-1", receipt["manifest_object_name"])] += b" "
+    with pytest.raises(service_module.StructureSnapshotChanged):
+        service_module.TabularStructureService.read_active_manifest(storage, **scope)
+
+
+@pytest.mark.parametrize("version", ["region-producer/v27", "region-producer/v999"])
+def test_serving_does_not_admit_arbitrary_historical_contracts(
+    service_module, table_parser, generation_repository, version,
+):
+    storage, projection, receipt = _stored_generation_with_contract(
+        table_parser, document_id="document-1", structure_algorithm_version=version,
+        enumeration_rule_version="enumeration-rules/v9")
+    generation_repository.inject(_active_generation_record(projection, receipt, document_id="document-1"))
+    with pytest.raises(service_module.StructureSnapshotChanged):
+        service_module.TabularStructureService.read_active_manifest(
+            storage, tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
+            producer_generation_ref=projection["producer_generation_ref"], repository=generation_repository)
+    with pytest.raises(ValueError, match="unsupported serving projection contract"):
+        tabular_structure.page_tabular_structure_rows(projection, table_ref=projection["tables"][0]["table_ref"])
 
 
 def test_generation_model_has_document_scoped_control_fields():
@@ -689,7 +769,7 @@ def test_document_generation_purge_removes_every_status_and_exact_scoped_project
     assert result == {
         "generation_count": 5,
         "table_index_count": 5,
-        "object_count": 15,
+        "object_count": sum(1 + receipt["part_count"] for _, _, receipt in target_generations),
         "index_revision": 8,
     }
     assert not Generation.select().where(
@@ -4307,6 +4387,21 @@ def test_backfill_ignores_active_generations_outside_the_current_contract(
     }
 
 
+@pytest.fixture
+def legacy_schema_backfill_runtime(service_module, monkeypatch):
+    # These cases test inner-version coexistence within the released v6 schema.
+    # Pin that schema so a v7 default cannot bypass their corruption assertions
+    # through the independent outer-schema filter.
+    contract = ("table-producer/v6", "tabular-structure-projection/v6",
+                "region-producer/v28", "enumeration-rules/v9")
+    for key, value in zip(("PRODUCER_SCHEMA_VERSION", "PROJECTION_VERSION",
+                           "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "ENUMERATION_RULE_VERSION"), contract):
+        monkeypatch.setattr(tabular_structure, key, value)
+        monkeypatch.setattr(service_module, key, value)
+    monkeypatch.setattr(tabular_structure, "PROJECTION_PART_VERSION", "tabular-structure-part/v3")
+    monkeypatch.setattr(tabular_structure, "_CURRENT_PROJECTION_CONTRACT", contract)
+
+
 @pytest.mark.parametrize(
     ("historical_algorithm", "historical_rules"),
     [
@@ -4319,6 +4414,7 @@ def test_backfill_ignores_active_generations_outside_the_current_contract(
 def test_backfill_validates_known_historical_inner_contract_and_indexes_current_only(
     service_module,
     table_parser,
+    legacy_schema_backfill_runtime,
     historical_algorithm,
     historical_rules,
 ):
@@ -4381,6 +4477,7 @@ def test_backfill_validates_known_historical_inner_contract_and_indexes_current_
 def test_backfill_with_only_known_historical_inner_contract_finishes_without_candidates(
     service_module,
     table_parser,
+    legacy_schema_backfill_runtime,
 ):
     repository = service_module.InMemoryTabularStructureRepository()
     storage, projection, receipt = _stored_generation_with_contract(
@@ -4423,6 +4520,7 @@ def test_backfill_with_only_known_historical_inner_contract_finishes_without_can
 def test_backfill_rejects_unknown_inner_contract_instead_of_broadly_skipping(
     service_module,
     table_parser,
+    legacy_schema_backfill_runtime,
 ):
     repository = service_module.InMemoryTabularStructureRepository()
     storage, projection, receipt = _stored_generation_with_contract(
@@ -4457,6 +4555,7 @@ def test_backfill_rejects_unknown_inner_contract_instead_of_broadly_skipping(
 def test_historical_inner_contract_backfill_keeps_snapshot_corruption_fail_closed(
     service_module,
     table_parser,
+    legacy_schema_backfill_runtime,
     corruption,
 ):
     repository = service_module.InMemoryTabularStructureRepository()
@@ -4826,7 +4925,8 @@ def test_stored_projection_preserves_and_validates_enumeration_rule_version(
     tampered_name = receipt["manifest_object_name"].rsplit("manifest-", 1)[0] + f"manifest-{tampered_sha256}.json"
     storage.objects[("dataset-1", tampered_name)] = tampered_payload
 
-    with pytest.raises(service_module.StructureSnapshotChanged, match="manifest version"):
+    # A mixed v7 tuple cannot select the layout schema in the first place.
+    with pytest.raises(service_module.StructureSnapshotChanged, match="manifest schema changed"):
         tabular_structure.load_tabular_structure_projection(
             storage,
             bucket="dataset-1",
@@ -5160,6 +5260,67 @@ def test_active_reads_require_exact_generation_and_never_fallback(service_module
     assert "source_sha256" not in manifest
 
 
+def test_candidate_generation_manifest_exposes_layout_inventory(
+    service_module, generation_repository, table_parser, monkeypatch,
+):
+    from test.fuxi.test_source_layout_generation import _enable_candidate
+    _enable_candidate(monkeypatch)
+    storage, projection, receipt = _stored_generation(table_parser)
+    service = service_module.TabularStructureService
+    scope = dict(tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
+                 repository=generation_repository)
+    service.register_shadow_generation(storage, receipt=receipt, **scope)
+    manifest = service.read_generation_manifest(
+        storage, producer_generation_ref=projection["producer_generation_ref"], **scope,
+    )
+    expected = [{**{key: value for key, value in layout.items() if key != "cells"},
+                 "cell_count": len(layout["cells"])} for layout in projection["source_layouts"]]
+    assert expected
+    assert manifest["source_layouts"] == expected
+    assert all("cells" not in layout for layout in manifest["source_layouts"])
+    assert manifest["row_count"] == len(projection["rows"])
+    service.activate_generation(
+        storage, producer_generation_ref=projection["producer_generation_ref"],
+        expected_active_generation_ref=None, **scope,
+    )
+    active = service.read_active_manifest(
+        storage, producer_generation_ref=projection["producer_generation_ref"], **scope,
+    )
+    assert active == manifest
+    layout = projection["source_layouts"][0]
+    restored = []
+    cursor = 0
+    while True:
+        page = service.read_generation_layout(
+            storage, producer_generation_ref=projection["producer_generation_ref"],
+            object_ref=layout["object_ref"], cursor=cursor, page_size=3, **scope,
+        )
+        assert page["layout"] == expected[0]
+        assert page["cell_offset"] == cursor
+        restored.extend(page["cells"])
+        if page["next_cursor"] is None:
+            break
+        assert page["next_cursor"] > cursor
+        cursor = page["next_cursor"]
+    assert restored == layout["cells"]
+    for cursor, size in ((-1, 3), (True, 3), (0, False), (0, 3001), (len(restored) + 1, 3)):
+        with pytest.raises(ValueError):
+            service.read_generation_layout(
+                storage, producer_generation_ref=projection["producer_generation_ref"],
+                object_ref=layout["object_ref"], cursor=cursor, page_size=size, **scope,
+            )
+    with pytest.raises(service_module.StructureSnapshotMissing):
+        service.read_generation_layout(
+            storage, producer_generation_ref=projection["producer_generation_ref"],
+            object_ref=layout["object_ref"], **{**scope, "document_id": "another-document"},
+        )
+    with pytest.raises(service_module.StructureSnapshotMissing):
+        service.read_generation_layout(
+            storage, producer_generation_ref=projection["producer_generation_ref"],
+            object_ref="another-object", **scope,
+        )
+
+
 def test_exact_generation_reads_support_shadow_active_and_retained_with_scope_binding(
     service_module,
     generation_repository,
@@ -5447,6 +5608,49 @@ def test_source_bound_generation_lookup_derives_the_ref_inside_ragflow_and_reads
         "structure_algorithm_version": projection["structure_algorithm_version"],
         "enumeration_rule_version": projection["enumeration_rule_version"],
     }
+
+
+@pytest.mark.asyncio
+async def test_layout_route_binds_authorization_generation_and_bounds():
+    module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
+    route = next((node for node in module.body if isinstance(node, ast.AsyncFunctionDef)
+                  and node.name == "list_tabular_structure_layout_cells"), None)
+    assert route is not None, "layout HTTP route missing"
+    assert {"login_required", "add_tenant_id_to_kwargs"} <= {
+        node.id for node in route.decorator_list if isinstance(node, ast.Name)
+    }
+    paths = [node.args[0].value for node in route.decorator_list
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and node.func.attr == "route"]
+    assert paths == ["/datasets/<dataset_id>/documents/<document_id>/tabular-structure/layouts/<object_ref>/cells"]
+    route.decorator_list = []
+    service = SimpleNamespace(read_generation_layout=MagicMock(return_value={"version": "source-layout-page/v1"}))
+    request = SimpleNamespace(args={"generation_ref": "generation", "cursor": "3", "page_size": "5"})
+    namespace = {
+        "_authorized_structure_owner": lambda *args: ("owner", None),
+        "_get_tabular_structure_service": lambda: service,
+        "settings": SimpleNamespace(STORAGE_IMPL="storage"), "request": request,
+        "TABULAR_STRUCTURE_PAGE_SIZE_MAX": 3000,
+        "get_result": lambda **args: args, "get_error_data_result": lambda **args: args,
+        "_tabular_structure_error_response": lambda error: {"error": str(error)},
+    }
+    exec(compile(ast.Module(body=[route], type_ignores=[]), str(CHUNK_API_PATH), "exec"), namespace)
+    handler = namespace[route.name]
+    assert await handler("caller", "dataset", "document", "object") == {"data": {"version": "source-layout-page/v1"}}
+    service.read_generation_layout.assert_called_once_with(
+        "storage", tenant_id="owner", dataset_id="dataset", document_id="document",
+        producer_generation_ref="generation", object_ref="object", cursor=3, page_size=5,
+    )
+    service.read_generation_layout.reset_mock()
+    for args in ({}, {"generation_ref": "g", "cursor": "oops"},
+                 {"generation_ref": "g", "cursor": "-1"},
+                 {"generation_ref": "g", "page_size": "3001"}):
+        request.args = args
+        await handler("caller", "dataset", "document", "object")
+    service.read_generation_layout.assert_not_called()
+    namespace["_authorized_structure_owner"] = lambda *args: (None, {"error": "denied"})
+    assert await handler("caller", "dataset", "document", "object") == {"error": "denied"}
+    service.read_generation_layout.assert_not_called()
 
 
 @pytest.mark.asyncio

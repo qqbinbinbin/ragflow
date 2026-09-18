@@ -726,6 +726,32 @@ async def list_tabular_structure_rows(tenant_id, dataset_id, document_id, table_
         return _tabular_structure_error_response(error)
 
 
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/layouts/<object_ref>/cells", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def list_tabular_structure_layout_cells(tenant_id, dataset_id, document_id, object_ref):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    generation_ref = str(request.args.get("generation_ref") or "").strip()
+    if not generation_ref:
+        return get_error_data_result(message="`generation_ref` is required")
+    try:
+        cursor = int(request.args.get("cursor", 0))
+        page_size = int(request.args.get("page_size", 30))
+        if cursor < 0 or page_size < 1 or page_size > TABULAR_STRUCTURE_PAGE_SIZE_MAX:
+            raise ValueError("invalid layout pagination")
+        data = _get_tabular_structure_service().read_generation_layout(
+            settings.STORAGE_IMPL, tenant_id=owner_tenant_id,
+            dataset_id=dataset_id, document_id=document_id,
+            producer_generation_ref=generation_ref, object_ref=object_ref,
+            cursor=cursor, page_size=page_size,
+        )
+        return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
 def _strip_chunk_runtime_fields(chunk):
     for name in [name for name in chunk.keys() if re.search(r"(_vec$|_sm_|_tks|_ltks)", name)]:
         del chunk[name]

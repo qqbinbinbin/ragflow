@@ -1132,10 +1132,10 @@ def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
 
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v3"
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v6"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v6"
-    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v3"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v28"
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v7"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v7"
+    assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v4"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v29"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -1538,6 +1538,35 @@ def test_axis_closure_rejects_a_partial_context_without_structure_evidence():
     )
 
 
+def test_v28_snapshot_keeps_its_row_contract_after_successor_rollover(table_parser, monkeypatch):
+    released_contract = ("table-producer/v6", "tabular-structure-projection/v6",
+                         "region-producer/v28", "enumeration-rules/v9")
+    for key, value in zip(("PRODUCER_SCHEMA_VERSION", "PROJECTION_VERSION",
+                           "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "ENUMERATION_RULE_VERSION"),
+                          released_contract):
+        monkeypatch.setattr(tabular_structure, key, value)
+    monkeypatch.setattr(tabular_structure, "_CURRENT_PROJECTION_CONTRACT", released_contract)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Sequence", "Description"])
+    sheet.append([1, "Alpha"])
+    sheet.append([2, "Beta"])
+    source = BytesIO()
+    workbook.save(source)
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", source.getvalue(), parser=table_parser,
+    )
+    assert projection["rows"]
+    assert projection["structure_algorithm_version"] == "region-producer/v28"
+    assert "source_layouts" not in projection
+    assert all(row["tabular_structure_version_kwd"] == "tabular-row/v3" for row in projection["rows"])
+    monkeypatch.setattr(tabular_structure, "_CURRENT_PROJECTION_CONTRACT", (
+        "table-producer/test-successor", "projection/test-successor",
+        "algorithm/test-successor", "rules/test-successor",
+    ))
+    tabular_structure._validate_tabular_structure_projection_for_contract(projection, released_contract)
+
+
 def test_v20_projection_contract_remains_available_for_backfill():
     assert (
         "table-producer/v6",
@@ -1809,6 +1838,32 @@ def test_merged_header_with_populated_body_is_not_an_empty_terminal_band(table_p
         and table["source_total_count"] == 0
         for table in projection["tables"]
     ), projection["tables"]
+
+
+def test_form_row_unmerged_tail_is_not_an_empty_record_axis(table_parser):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.merge_cells("A1:I1")
+    sheet["A1"] = "Anonymous declaration"
+    sheet.merge_cells("A3:I4")
+    sheet["A3"] = "Organization details"
+    sheet.merge_cells("A5:E5")
+    sheet["A5"] = "Address"
+    sheet.merge_cells("F5:G5")
+    sheet["F5"] = "Contact"
+    sheet["H5"] = "Reviewer"
+    sheet["I5"] = "Project"
+    sheet.merge_cells("A8:G8")
+    sheet["A8"] = "Declaration"
+    sheet.merge_cells("A9:G10")
+    sheet["A9"] = "The submitted item satisfies the agreed requirements."
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(workbook), parser=table_parser,
+    )
+    assert not any(
+        table["enumeration_reason"] == "empty_record_axis_proven"
+        for table in projection["tables"]
+    )
 
 
 def test_empty_record_axis_ignores_a_disjoint_sidecar_outside_the_table_columns(table_parser):
@@ -2449,7 +2504,7 @@ def test_missing_unknown_projection_emits_d4_tombstone(table_parser, monkeypatch
 
     assert projection["tables"] == []
     assert projection["rows"] == []
-    assert set(projection) == tabular_structure.PROJECTION_FIELDS
+    assert set(projection) == tabular_structure.PROJECTION_FIELDS | {"source_layouts"}
     assert audit["version"] == "tabular-structure-producer-audit/v1"
     assert audit["producer_generation_ref"] == projection["producer_generation_ref"]
     assert audit["enumeration_rule_version"] == projection["enumeration_rule_version"]
@@ -2490,7 +2545,7 @@ def test_producer_audit_exports_content_free_closed_object_evidence(table_parser
         parser=table_parser,
     )
 
-    assert set(projection) == tabular_structure.PROJECTION_FIELDS
+    assert set(projection) == tabular_structure.PROJECTION_FIELDS | {"source_layouts"}
     assert audit["defects"] == []
     assert len(audit["source_regions"]) == 1
     assert len(audit["output_objects"]) == 1
@@ -8499,7 +8554,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v6"
+    assert projection["version"] == "tabular-structure-projection/v7"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 
@@ -9248,7 +9303,12 @@ def test_global_indices_and_totals_survive_projection_part_boundaries(table_pars
     target = [row for row in projection["rows"] if row["table_label_kwd"] == "Inspection"]
     data_rows = [row for row in target if row["row_role_kwd"] == "data"]
 
-    assert len(parts) == 2
+    assert len([part for part in parts if part["rows"]]) == 2
+    assert [row for part in parts for row in part["rows"]] == projection["rows"]
+    assert [entry for part in parts for entry in part["layout_cells"]] == [
+        {"object_ref": layout["object_ref"], "cell": cell}
+        for layout in projection["source_layouts"] for cell in layout["cells"]
+    ]
     assert [row["data_row_index_int"] for row in data_rows] == list(range(1, 3003))
     assert {row["source_total_count_int"] for row in target} == {3002}
     assert len({row["row_ref_kwd"] for row in target}) == len(target)

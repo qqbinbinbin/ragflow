@@ -39,6 +39,7 @@ from rag.app.tabular_structure import (
     StructureSnapshotMissing,
     tabular_structure_projection_prefix,
     load_tabular_structure_projection,
+    load_tabular_structure_projection_for_serving,
     load_tabular_structure_projection_for_backfill,
     delete_tabular_structure_projection_manifest,
     delete_tabular_structure_projection_parts,
@@ -101,6 +102,25 @@ def _managed_generation_result(record: dict[str, Any], projection: dict[str, Any
         "enumeration_rule_version": projection["enumeration_rule_version"],
         "row_count": record["row_count"],
     }
+
+
+def _public_structure_manifest(record: dict[str, Any], projection: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "producer_generation_ref": projection["producer_generation_ref"],
+        "projection_version": projection["version"],
+        "producer_schema_version": projection["producer_schema_version"],
+        "structure_algorithm_version": projection["structure_algorithm_version"],
+        "enumeration_rule_version": projection["enumeration_rule_version"],
+        "row_count": record["row_count"],
+        "tables": deepcopy(projection["tables"]),
+    }
+    if "source_layouts" in projection:
+        result["source_layouts"] = [
+            {**{key: deepcopy(value) for key, value in layout.items() if key != "cells"},
+             "cell_count": len(layout["cells"])}
+            for layout in projection["source_layouts"]
+        ]
+    return result
 
 
 def _validate_record(record: dict[str, Any]) -> None:
@@ -2105,7 +2125,7 @@ class TabularStructureService:
                 "active generation changed",
                 active_generation_ref=record["producer_generation_ref"],
             )
-        projection = load_tabular_structure_projection(
+        projection = load_tabular_structure_projection_for_serving(
             storage,
             bucket=dataset_id,
             document_id=document_id,
@@ -2139,7 +2159,7 @@ class TabularStructureService:
         cls._authorize(repository, tenant_id, dataset_id, document_id)
         if record["status"] not in {"shadow", "active", "retained"}:
             raise StructureSnapshotMissing("structure generation is unavailable")
-        projection = load_tabular_structure_projection(
+        projection = load_tabular_structure_projection_for_serving(
             storage,
             bucket=dataset_id,
             document_id=document_id,
@@ -2154,15 +2174,7 @@ class TabularStructureService:
     @classmethod
     def read_generation_manifest(cls, storage, **kwargs) -> dict[str, Any]:
         record, projection = cls._read_generation_projection(storage, **kwargs)
-        return {
-            "producer_generation_ref": projection["producer_generation_ref"],
-            "projection_version": projection["version"],
-            "producer_schema_version": projection["producer_schema_version"],
-            "structure_algorithm_version": projection["structure_algorithm_version"],
-            "enumeration_rule_version": projection["enumeration_rule_version"],
-            "row_count": record["row_count"],
-            "tables": deepcopy(projection["tables"]),
-        }
+        return _public_structure_manifest(record, projection)
 
     @classmethod
     def read_generation(cls, storage, **kwargs) -> dict[str, Any]:
@@ -2234,18 +2246,34 @@ class TabularStructureService:
         )
 
     @classmethod
+    def read_generation_layout(
+        cls, storage, *, object_ref: str, cursor: int = 0,
+        page_size: int = 30, **kwargs,
+    ) -> dict[str, Any]:
+        if type(cursor) is not int or cursor < 0 or type(page_size) is not int or not 1 <= page_size <= 3000:
+            raise ValueError("invalid layout page bounds")
+        _record, projection = cls._read_generation_projection(storage, **kwargs)
+        layout = next((item for item in projection.get("source_layouts", [])
+                       if item["object_ref"] == object_ref), None)
+        if layout is None:
+            raise StructureSnapshotMissing("source layout is missing")
+        total = len(layout["cells"])
+        if cursor > total:
+            raise ValueError("layout cursor exceeds source")
+        end = min(cursor + page_size, total)
+        return {
+            "version": "source-layout-page/v1",
+            "layout": {**{key: deepcopy(value) for key, value in layout.items() if key != "cells"},
+                       "cell_count": total},
+            "cell_offset": cursor,
+            "cells": deepcopy(layout["cells"][cursor:end]),
+            "next_cursor": end if end < total else None,
+        }
+
+    @classmethod
     def read_active_manifest(cls, storage, **kwargs) -> dict[str, Any]:
         record, projection = cls._read_projection(storage, **kwargs)
-        tables = deepcopy(projection["tables"])
-        return {
-            "producer_generation_ref": projection["producer_generation_ref"],
-            "projection_version": projection["version"],
-            "producer_schema_version": projection["producer_schema_version"],
-            "structure_algorithm_version": projection["structure_algorithm_version"],
-            "enumeration_rule_version": projection["enumeration_rule_version"],
-            "row_count": record["row_count"],
-            "tables": tables,
-        }
+        return _public_structure_manifest(record, projection)
 
     @classmethod
     def read_active_table(
