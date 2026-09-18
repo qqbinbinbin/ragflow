@@ -5321,6 +5321,82 @@ def test_candidate_generation_manifest_exposes_layout_inventory(
         )
 
 
+def test_stored_layout_previews_preserve_pages_and_revalidate_every_read(
+    service_module, generation_repository, table_parser,
+):
+    storage, projection, receipt = _stored_generation(table_parser)
+    service = service_module.TabularStructureService
+    scope = dict(tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
+                 repository=generation_repository)
+    service.register_shadow_generation(storage, receipt=receipt, **scope)
+    generation_ref = projection["producer_generation_ref"]
+    request = dict(**scope, producer_generation_ref=generation_ref)
+    assert projection["source_layouts"]
+    expected = [service.read_generation_layout(storage, object_ref=layout["object_ref"],
+                                               page_size=3, **request)
+                for layout in projection["source_layouts"]]
+    for status in ("shadow", "active", "retained"):
+        record = generation_repository.get(generation_ref)
+        generation_repository.inject({**record, "status": status})
+        storage.get_calls.clear()
+        result = service.read_generation_layout_previews(storage, page_size=3, **request)
+        assert result["pages"] == expected
+        assert len(storage.get_calls) == receipt["part_count"] + 1
+        assert len(set(storage.get_calls)) == len(storage.get_calls)
+    for field in ("tenant_id", "dataset_id", "document_id", "producer_generation_ref"):
+        storage.get_calls.clear()
+        with pytest.raises(service_module.StructureSnapshotMissing):
+            service.read_generation_layout_previews(storage, **{**request, field: "other"})
+        assert storage.get_calls == []
+    for status in ("failed", "deleting"):
+        record = generation_repository.get(generation_ref)
+        generation_repository.inject({**record, "status": status})
+        storage.get_calls.clear()
+        with pytest.raises(service_module.StructureSnapshotMissing):
+            service.read_generation_layout_previews(storage, **request)
+        assert storage.get_calls == []
+    generation_repository.inject({**record, "status": "retained"})
+    # Even after a successful read, no cache can hide newly corrupted objects.
+    for key, original in list(storage.objects.items()):
+        storage.objects[key] = original + b" "
+        with pytest.raises(service_module.StructureSnapshotChanged):
+            service.read_generation_layout_previews(storage, **request)
+        storage.objects[key] = original
+
+
+def test_layout_previews_share_one_verified_projection_read(service_module, monkeypatch):
+    service = service_module.TabularStructureService
+    layouts = [{"object_ref": f"layout-{i}", "cells": [{"value": j} for j in range(35)]}
+               for i in range(9)]
+    projection = {"producer_generation_ref": "generation-a", "source_layouts": layouts}
+    read = MagicMock(return_value=({}, projection))
+    monkeypatch.setattr(service, "_read_generation_projection", read)
+    result = service.read_generation_layout_previews(
+        "storage", page_size=32, tenant_id="owner", dataset_id="dataset",
+        document_id="document", producer_generation_ref="generation-a",
+    )
+    read.assert_called_once_with("storage", tenant_id="owner", dataset_id="dataset",
+                                 document_id="document", producer_generation_ref="generation-a")
+    assert result["version"] == "source-layout-previews/v1"
+    assert result["producer_generation_ref"] == "generation-a"
+    assert len(result["pages"]) == 9
+    for layout, page in zip(layouts, result["pages"]):
+        assert page["layout"] == {"object_ref": layout["object_ref"], "cell_count": 35}
+        assert page["cells"] == layout["cells"][:32]
+        assert page["cell_offset"] == 0
+        assert page["next_cursor"] == 32
+    result["pages"][0]["cells"][0]["value"] = "changed"
+    assert layouts[0]["cells"][0]["value"] == 0
+    read.reset_mock()
+    for size in (0, True, 33):
+        with pytest.raises(ValueError):
+            service.read_generation_layout_previews("storage", page_size=size)
+    read.assert_not_called()
+    read.side_effect = service_module.StructureSnapshotMissing("missing")
+    with pytest.raises(service_module.StructureSnapshotMissing):
+        service.read_generation_layout_previews("storage", page_size=32)
+
+
 def test_exact_generation_reads_support_shadow_active_and_retained_with_scope_binding(
     service_module,
     generation_repository,
@@ -5611,10 +5687,11 @@ def test_source_bound_generation_lookup_derives_the_ref_inside_ragflow_and_reads
 
 
 @pytest.mark.asyncio
-async def test_layout_route_binds_authorization_generation_and_bounds():
+@pytest.mark.parametrize("batch", [False, True])
+async def test_layout_route_binds_authorization_generation_and_bounds(batch):
     module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
     route = next((node for node in module.body if isinstance(node, ast.AsyncFunctionDef)
-                  and node.name == "list_tabular_structure_layout_cells"), None)
+                  and node.name == ("list_tabular_structure_layout_previews" if batch else "list_tabular_structure_layout_cells")), None)
     assert route is not None, "layout HTTP route missing"
     assert {"login_required", "add_tenant_id_to_kwargs"} <= {
         node.id for node in route.decorator_list if isinstance(node, ast.Name)
@@ -5622,9 +5699,10 @@ async def test_layout_route_binds_authorization_generation_and_bounds():
     paths = [node.args[0].value for node in route.decorator_list
              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
              and node.func.attr == "route"]
-    assert paths == ["/datasets/<dataset_id>/documents/<document_id>/tabular-structure/layouts/<object_ref>/cells"]
+    assert paths == ["/datasets/<dataset_id>/documents/<document_id>/tabular-structure/layouts/" + ("previews" if batch else "<object_ref>/cells")]
     route.decorator_list = []
     service = SimpleNamespace(read_generation_layout=MagicMock(return_value={"version": "source-layout-page/v1"}))
+    service.read_generation_layout_previews = service.read_generation_layout
     request = SimpleNamespace(args={"generation_ref": "generation", "cursor": "3", "page_size": "5"})
     namespace = {
         "_authorized_structure_owner": lambda *args: ("owner", None),
@@ -5636,20 +5714,26 @@ async def test_layout_route_binds_authorization_generation_and_bounds():
     }
     exec(compile(ast.Module(body=[route], type_ignores=[]), str(CHUNK_API_PATH), "exec"), namespace)
     handler = namespace[route.name]
-    assert await handler("caller", "dataset", "document", "object") == {"data": {"version": "source-layout-page/v1"}}
+    arguments = ("caller", "dataset", "document") + (() if batch else ("object",))
+    assert await handler(*arguments) == {"data": {"version": "source-layout-page/v1"}}
     service.read_generation_layout.assert_called_once_with(
         "storage", tenant_id="owner", dataset_id="dataset", document_id="document",
-        producer_generation_ref="generation", object_ref="object", cursor=3, page_size=5,
+        producer_generation_ref="generation", page_size=5,
+        **({} if batch else {"object_ref": "object", "cursor": 3}),
     )
     service.read_generation_layout.reset_mock()
-    for args in ({}, {"generation_ref": "g", "cursor": "oops"},
-                 {"generation_ref": "g", "cursor": "-1"},
-                 {"generation_ref": "g", "page_size": "3001"}):
+    invalid = ({}, {"generation_ref": "g", "page_size": "0"},
+               {"generation_ref": "g", "page_size": "oops"},
+               {"generation_ref": "g", "page_size": "33" if batch else "3001"})
+    if not batch:
+        invalid += ({"generation_ref": "g", "cursor": "-1"},
+                    {"generation_ref": "g", "cursor": "oops"})
+    for args in invalid:
         request.args = args
-        await handler("caller", "dataset", "document", "object")
+        await handler(*arguments)
     service.read_generation_layout.assert_not_called()
     namespace["_authorized_structure_owner"] = lambda *args: (None, {"error": "denied"})
-    assert await handler("caller", "dataset", "document", "object") == {"error": "denied"}
+    assert await handler(*arguments) == {"error": "denied"}
     service.read_generation_layout.assert_not_called()
 
 

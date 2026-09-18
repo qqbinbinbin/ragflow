@@ -2246,6 +2246,33 @@ class TabularStructureService:
         )
 
     @classmethod
+    def read_generation_layout_previews(
+        cls, storage, *, page_size: int = 32, **kwargs,
+    ) -> dict[str, Any]:
+        """Read all bounded previews from one authorized, verified snapshot.
+
+        No persistent cache: every invocation rechecks generation ownership,
+        lifecycle state, manifest/part hashes and complete projection validity.
+        """
+        if type(page_size) is not int or not 1 <= page_size <= 32:
+            raise ValueError("invalid layout preview bounds")
+        _record, projection = cls._read_generation_projection(storage, **kwargs)
+        pages = []
+        for layout in projection.get("source_layouts", []):
+            total = len(layout["cells"])
+            end = min(page_size, total)
+            pages.append({
+                "version": "source-layout-page/v1",
+                "layout": {**{key: deepcopy(value) for key, value in layout.items() if key != "cells"},
+                           "cell_count": total},
+                "cell_offset": 0,
+                "cells": deepcopy(layout["cells"][:end]),
+                "next_cursor": end if end < total else None,
+            })
+        return {"version": "source-layout-previews/v1",
+                "producer_generation_ref": projection["producer_generation_ref"], "pages": pages}
+
+    @classmethod
     def read_generation_layout(
         cls, storage, *, object_ref: str, cursor: int = 0,
         page_size: int = 30, **kwargs,

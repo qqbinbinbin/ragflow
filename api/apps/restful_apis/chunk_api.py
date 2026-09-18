@@ -726,6 +726,30 @@ async def list_tabular_structure_rows(tenant_id, dataset_id, document_id, table_
         return _tabular_structure_error_response(error)
 
 
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/layouts/previews", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+async def list_tabular_structure_layout_previews(tenant_id, dataset_id, document_id):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    generation_ref = str(request.args.get("generation_ref") or "").strip()
+    if not generation_ref:
+        return get_error_data_result(message="`generation_ref` is required")
+    try:
+        page_size = int(request.args.get("page_size", 32))
+        if not 1 <= page_size <= 32:
+            raise ValueError("invalid layout preview bounds")
+        data = _get_tabular_structure_service().read_generation_layout_previews(
+            settings.STORAGE_IMPL, tenant_id=owner_tenant_id,
+            dataset_id=dataset_id, document_id=document_id,
+            producer_generation_ref=generation_ref, page_size=page_size,
+        )
+        return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
 @manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/layouts/<object_ref>/cells", methods=["GET"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs
