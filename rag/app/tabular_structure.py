@@ -32,14 +32,14 @@ from datetime import date, datetime, time
 from io import BytesIO
 from typing import Any
 
-from rag.app.source_layout import SOURCE_LAYOUT_PROJECTION_CONTRACT, validate_source_layout, validate_layout_membership
+from rag.app.source_layout import source_layout_version_for_contract, validate_source_layout, validate_layout_membership
 
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v3"
-PRODUCER_SCHEMA_VERSION = "table-producer/v7"
-PROJECTION_VERSION = "tabular-structure-projection/v7"
+PRODUCER_SCHEMA_VERSION = "table-producer/v8"
+PROJECTION_VERSION = "tabular-structure-projection/v8"
 PROJECTION_PART_VERSION = "tabular-structure-part/v4"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v29"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v30"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v2"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -49,8 +49,8 @@ _CURRENT_PROJECTION_CONTRACT = (
     ENUMERATION_RULE_VERSION,
 )
 _RETAINED_SERVING_PROJECTION_CONTRACT = (
-    "table-producer/v6", "tabular-structure-projection/v6",
-    "region-producer/v28", "enumeration-rules/v9",
+    "table-producer/v7", "tabular-structure-projection/v7",
+    "region-producer/v29", "enumeration-rules/v9",
 )
 _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
     {
@@ -73,6 +73,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v26", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v27", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v28", "enumeration-rules/v9"),
+        _RETAINED_SERVING_PROJECTION_CONTRACT,
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -1229,7 +1230,7 @@ def _logical_occupied_cells(
     for merged in worksheet.merged_cells.ranges:
         anchor = worksheet.cell(merged.min_row, merged.min_col).value
         formula_merge = (
-            _CURRENT_PROJECTION_CONTRACT == SOURCE_LAYOUT_PROJECTION_CONTRACT
+            source_layout_version_for_contract(_CURRENT_PROJECTION_CONTRACT) is not None
             and (merged.min_row, merged.min_col) in (
                 (formula_coordinates or set()) | (unresolved_formula_coordinates or set())
             )
@@ -7670,7 +7671,8 @@ def _build_tabular_structure_projection_with_audit(
             for region_index, (region, _g1_disagreement) in enumerate(candidates, start=1)
         }
 
-        if _CURRENT_PROJECTION_CONTRACT == SOURCE_LAYOUT_PROJECTION_CONTRACT:
+        layout_version = source_layout_version_for_contract(_CURRENT_PROJECTION_CONTRACT)
+        if layout_version:
             # Preserve source-region geometry independently of record-axis
             # interpretation. This does not classify an unknown region as a form.
             for members in _source_layout_memberships(worksheet, regions):
@@ -7679,7 +7681,7 @@ def _build_tabular_structure_projection_with_audit(
                     _region_membership_sha256(sheet_ordinal, members),
                 )
                 layout = {
-                    "version": "source-layout/v1", "source_sha256": source_sha256,
+                    "version": layout_version, "source_sha256": source_sha256,
                     "producer_generation_ref": producer_generation_ref,
                     "sheet_ordinal": sheet_ordinal, "object_ref": object_ref,
                     "cells": _source_layout_cells(
@@ -7688,10 +7690,13 @@ def _build_tabular_structure_projection_with_audit(
                         formula_values=sheet_formula_values,
                     ),
                 }
+                if layout_version == "source-layout/v2":
+                    layout["sheet_name"] = sheet_name
                 validate_source_layout(
                     layout, source_sha256=source_sha256,
                     producer_generation_ref=producer_generation_ref,
                     sheet_ordinal=sheet_ordinal, object_ref=object_ref,
+                    layout_version=layout_version,
                 )
                 validate_layout_membership(layout, members)
                 source_layouts.append(layout)
@@ -8111,7 +8116,7 @@ def _build_tabular_structure_projection_with_audit(
         "tables": tables,
         "rows": records,
     }
-    if _CURRENT_PROJECTION_CONTRACT == SOURCE_LAYOUT_PROJECTION_CONTRACT:
+    if source_layout_version_for_contract(_CURRENT_PROJECTION_CONTRACT):
         projection["source_layouts"] = source_layouts
     validate_tabular_structure_projection(projection)
     audit = {
@@ -8165,7 +8170,8 @@ def _validate_tabular_structure_projection_for_contract(
         structure_algorithm_version,
         enumeration_rule_version,
     ) = contract
-    layout_contract = contract == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    layout_version = source_layout_version_for_contract(contract)
+    layout_contract = layout_version is not None
     expected_fields = PROJECTION_FIELDS | {"source_layouts"} if layout_contract else PROJECTION_FIELDS
     if not isinstance(projection, dict) or set(projection) != expected_fields:
         raise ValueError("structure projection does not match the fixed top-level schema")
@@ -8187,6 +8193,7 @@ def _validate_tabular_structure_projection_for_contract(
         if not isinstance(layouts, list):
             raise ValueError("invalid source layouts")
         seen_layouts = set()
+        sheet_titles = {}
         previous_sheet = 0
         for layout in layouts:
             if not isinstance(layout, dict):
@@ -8194,7 +8201,12 @@ def _validate_tabular_structure_projection_for_contract(
             validate_source_layout(
                 layout, source_sha256=source_sha256, producer_generation_ref=generation_ref,
                 sheet_ordinal=layout.get("sheet_ordinal"), object_ref=layout.get("object_ref"),
+                layout_version=layout_version,
             )
+            if layout_version == "source-layout/v2":
+                prior = sheet_titles.setdefault(layout["sheet_ordinal"], layout["sheet_name"])
+                if prior != layout["sheet_name"]:
+                    raise ValueError("source layout worksheet title drift")
             expected_layout_ref = "layout_" + _versioned_digest(
                 "source-layout-object/v1", source_sha256, layout["sheet_ordinal"],
                 _source_layout_membership_sha256(layout),
@@ -8553,13 +8565,13 @@ def partition_tabular_structure_projection(
     contract = tuple(projection.get(key) for key in (
         "producer_schema_version", "version", "structure_algorithm_version", "enumeration_rule_version",
     ))
-    if contract not in (_CURRENT_PROJECTION_CONTRACT, SOURCE_LAYOUT_PROJECTION_CONTRACT):
+    if contract != _CURRENT_PROJECTION_CONTRACT and not source_layout_version_for_contract(contract):
         raise ValueError("unsupported projection write contract")
     _validate_tabular_structure_projection_for_contract(projection, contract)
     if rows_per_part < 1:
         raise ValueError("rows_per_part must be positive")
     rows = projection["rows"]
-    has_layouts = contract == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    has_layouts = source_layout_version_for_contract(contract) is not None
     layout_cells = [
         {"object_ref": layout["object_ref"], "cell": cell}
         for layout in projection.get("source_layouts", []) for cell in layout["cells"]
@@ -8725,10 +8737,11 @@ def list_tabular_structure_projection_objects(
     if hashlib.sha256(manifest_payload).hexdigest() != manifest_sha256:
         raise StructureSnapshotChanged("manifest digest changed")
     manifest = _decode_snapshot_json(manifest_payload, "manifest")
-    layout_contract = (
+    layout_version = source_layout_version_for_contract((
         manifest.get("producer_schema_version"), manifest.get("version"),
         manifest.get("structure_algorithm_version"), manifest.get("enumeration_rule_version"),
-    ) == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    ))
+    layout_contract = layout_version is not None
     allowed_manifest_fields = {
         _DELETE_MANIFEST_BASE_FIELDS,
         _CURRENT_DELETE_MANIFEST_FIELDS,
@@ -8755,11 +8768,12 @@ def list_tabular_structure_projection_objects(
         if not isinstance(descriptors, list):
             raise StructureSnapshotChanged("layout manifest changed")
         seen_refs = set()
+        sheet_titles = {}
         previous_sheet = 0
         for descriptor in descriptors:
             if not isinstance(descriptor, dict) or set(descriptor) != {
                 "version", "source_sha256", "producer_generation_ref", "sheet_ordinal", "object_ref", "cell_count",
-            } or type(descriptor["cell_count"]) is not int or descriptor["cell_count"] < 0:
+            } | ({"sheet_name"} if layout_version == "source-layout/v2" else set()) or type(descriptor["cell_count"]) is not int or descriptor["cell_count"] < 0:
                 raise StructureSnapshotChanged("layout descriptor changed")
             layout = {key: value for key, value in descriptor.items() if key != "cell_count"}
             layout["cells"] = []
@@ -8768,9 +8782,14 @@ def list_tabular_structure_projection_objects(
                     layout, source_sha256=manifest["source_sha256"],
                     producer_generation_ref=producer_generation_ref,
                     sheet_ordinal=descriptor["sheet_ordinal"], object_ref=descriptor["object_ref"],
+                    layout_version=layout_version,
                 )
             except ValueError as exc:
                 raise StructureSnapshotChanged("layout descriptor changed") from exc
+            if layout_version == "source-layout/v2":
+                prior = sheet_titles.setdefault(descriptor["sheet_ordinal"], descriptor["sheet_name"])
+                if prior != descriptor["sheet_name"]:
+                    raise StructureSnapshotChanged("layout worksheet title drift")
             if descriptor["object_ref"] in seen_refs or descriptor["sheet_ordinal"] < previous_sheet:
                 raise StructureSnapshotChanged("layout descriptor order changed")
             seen_refs.add(descriptor["object_ref"])
@@ -8994,10 +9013,11 @@ def _load_tabular_structure_projection_for_contracts(
         "tables",
         "parts",
     }
-    layout_contract = (
+    layout_version = source_layout_version_for_contract((
         manifest.get("producer_schema_version"), manifest.get("version"),
         manifest.get("structure_algorithm_version"), manifest.get("enumeration_rule_version"),
-    ) == SOURCE_LAYOUT_PROJECTION_CONTRACT
+    ))
+    layout_contract = layout_version is not None
     if layout_contract:
         expected_manifest_fields.add("source_layouts")
     if set(manifest) != expected_manifest_fields:
@@ -9031,7 +9051,7 @@ def _load_tabular_structure_projection_for_contracts(
         for descriptor in manifest["source_layouts"]:
             if not isinstance(descriptor, dict) or set(descriptor) != {
                 "version", "source_sha256", "producer_generation_ref", "sheet_ordinal", "object_ref", "cell_count",
-            }:
+            } | ({"sheet_name"} if layout_version == "source-layout/v2" else set()):
                 raise StructureSnapshotChanged("layout descriptor changed")
             ref = descriptor["object_ref"]
             if not isinstance(ref, str) or ref in layouts_by_ref or type(descriptor["cell_count"]) is not int or descriptor["cell_count"] < 0:

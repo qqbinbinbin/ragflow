@@ -39,6 +39,15 @@ def _enable_reviewed_predecessor(monkeypatch):
     monkeypatch.setattr(producer, "_CURRENT_PROJECTION_CONTRACT", contract)
 
 
+def _enable_named_candidate(monkeypatch):
+    from rag.app.source_layout import SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT
+    for key, value in zip(("PRODUCER_SCHEMA_VERSION", "PROJECTION_VERSION",
+                           "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "ENUMERATION_RULE_VERSION"),
+                          SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT):
+        monkeypatch.setattr(producer, key, value)
+    monkeypatch.setattr(producer, "_CURRENT_PROJECTION_CONTRACT", SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT)
+
+
 def test_merge_membership_is_checked_once_per_span():
     sheet = Workbook().active
     sheet["A1"] = "source declaration"
@@ -68,7 +77,12 @@ def test_released_default_emits_source_layout_and_keeps_predecessor_readable(mon
         "anonymous.xlsx", stream.getvalue(), parser=_load_table_module(monkeypatch).Excel(),
     )
     assert projection.get("source_layouts"), "released default must emit original form context"
-    assert projection["structure_algorithm_version"] == "region-producer/v29"
+    assert projection["structure_algorithm_version"] == "region-producer/v30"
+    assert {layout["version"] for layout in projection["source_layouts"]} == {"source-layout/v2"}
+    assert {layout["sheet_name"] for layout in projection["source_layouts"]} == {book.active.title}
+    assert producer._RETAINED_SERVING_PROJECTION_CONTRACT == (
+        "table-producer/v7", "tabular-structure-projection/v7", "region-producer/v29", "enumeration-rules/v9",
+    )
     assert producer.PROJECTION_PART_VERSION == "tabular-structure-part/v4"
     for version in ("region-producer/v27", "region-producer/v28"):
         assert ("table-producer/v6", "tabular-structure-projection/v6", version,
@@ -144,6 +158,84 @@ def test_checkpoint_merge_preserves_every_sheet_layout():
     first, second = _layout_checkpoint(1), _layout_checkpoint(2)
     merged = _merge_sheet_projections([first, second], generation_ref=first["producer_generation_ref"])
     assert merged["source_layouts"] == first["source_layouts"] + second["source_layouts"]
+
+
+def test_named_layout_lifecycle_preserves_titles_and_retained_v29():
+    from rag.app.source_layout import SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT
+    first, second = _layout_checkpoint(1), _layout_checkpoint(2)
+    for projection, title in ((first, "Declaration"), (second, "Declaration (variant)")):
+        for key, value in zip(("producer_schema_version", "version",
+                               "structure_algorithm_version", "enumeration_rule_version"),
+                              SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT):
+            projection[key] = value
+        projection["source_layouts"][0].update(version="source-layout/v2", sheet_name=title)
+    projection = _merge_sheet_projections([first, second], generation_ref=first["producer_generation_ref"])
+    storage = _VerifiedStorage()
+    receipt = producer.store_tabular_structure_projection(
+        storage, bucket="bucket", document_id="document", projection=projection, rows_per_part=1,
+    )
+    restored = producer._load_tabular_structure_projection_for_contracts(
+        storage, bucket="bucket", document_id="document",
+        producer_generation_ref=first["producer_generation_ref"],
+        manifest_object_name=receipt["manifest_object_name"],
+        manifest_sha256=receipt["manifest_sha256"],
+        accepted_contracts=frozenset({SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT}),
+    )
+    assert restored == projection
+    inventory = producer.list_tabular_structure_projection_objects(
+        storage, bucket="bucket", document_id="document",
+        producer_generation_ref=first["producer_generation_ref"],
+        manifest_object_name=receipt["manifest_object_name"],
+        manifest_sha256=receipt["manifest_sha256"], expected_part_count=2,
+    )
+    assert len(inventory["object_names"]) == 3
+
+
+@pytest.mark.parametrize("boundary", ["projection", "checkpoint"])
+def test_named_layout_rejects_conflicting_titles_on_one_sheet(boundary):
+    from rag.app.source_layout import SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT
+    first = _layout_checkpoint(1)
+    for key, value in zip(("producer_schema_version", "version",
+                           "structure_algorithm_version", "enumeration_rule_version"),
+                          SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT):
+        first[key] = value
+    first["source_layouts"][0].update(version="source-layout/v2", sheet_name="Declaration")
+    second = deepcopy(first)
+    layout = second["source_layouts"][0]
+    layout["sheet_name"] = "Different title"
+    layout["cells"][0].update(anchor=[3, 1], span=[3, 1, 3, 1])
+    layout["object_ref"] = "layout_" + producer._versioned_digest(
+        "source-layout-object/v1", "a" * 64, 1,
+        producer._region_membership_sha256(1, {(3, 1)}),
+    )
+    with pytest.raises((ValueError, RuntimeError), match="title"):
+        if boundary == "checkpoint":
+            _merge_sheet_projections([first, second], generation_ref=first["producer_generation_ref"])
+        else:
+            first["source_layouts"].extend(second["source_layouts"])
+            producer._validate_tabular_structure_projection_for_contract(first, SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT)
+
+
+@pytest.mark.parametrize("title", ["Declaration", "申报表（修订版）", "Independent source"])
+def test_successor_builder_preserves_original_sheet_title(monkeypatch, title):
+    from rag.app.source_layout import SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT
+    for key, value in zip(("PRODUCER_SCHEMA_VERSION", "PROJECTION_VERSION",
+                           "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "ENUMERATION_RULE_VERSION"),
+                          SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT):
+        monkeypatch.setattr(producer, key, value)
+    monkeypatch.setattr(producer, "_CURRENT_PROJECTION_CONTRACT", SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT)
+    book = Workbook()
+    book.active.title = title
+    book.active["A1"] = "Applicant"
+    book.active["B1"] = "Alpha"
+    stream = BytesIO()
+    book.save(stream)
+    projection = producer.build_tabular_structure_projection(
+        "anonymous.xlsx", stream.getvalue(), parser=_load_table_module(monkeypatch).Excel(),
+    )
+    assert projection.get("source_layouts")
+    assert {layout["sheet_name"] for layout in projection["source_layouts"]} == {title}
+    assert {layout["version"] for layout in projection["source_layouts"]} == {"source-layout/v2"}
 
 
 @pytest.mark.parametrize("damage", ["identity", "moved", "missing"])
@@ -419,9 +511,10 @@ def test_current_pn01_layout_build_storage_preserves_native_values(monkeypatch, 
                        and str(cell["value"]) == str(value) for cell in cells), (ordinal, r, c)
 
 
+@pytest.mark.parametrize("named", [False, True])
 @pytest.mark.parametrize("merged", [False, True])
-def test_builder_preserves_uncached_formula_as_unresolved(monkeypatch, merged):
-    _enable_candidate(monkeypatch)
+def test_builder_preserves_uncached_formula_as_unresolved(monkeypatch, merged, named):
+    (_enable_named_candidate if named else _enable_candidate)(monkeypatch)
     book = Workbook()
     book.active["A1"] = "Calculated value"
     book.active["B1"] = "=1+1"
@@ -499,16 +592,16 @@ def test_successor_preserves_every_existing_list_field_on_reviewed_sources(monke
     assert hashlib.sha256(binary).hexdigest() == expected_sha
     parser = _load_table_module(monkeypatch).Excel()
     generation = "11111111-1111-5111-8111-111111111111"
-    _enable_reviewed_predecessor(monkeypatch)
+    _enable_candidate(monkeypatch)
     print(f"source-replay {expected_sha} legacy-start", flush=True)
     previous = producer.build_tabular_structure_projection("anonymous.xls", binary, parser=parser, producer_generation_ref=generation)
-    assert previous["structure_algorithm_version"] == "region-producer/v28"
-    assert "source_layouts" not in previous
+    assert previous["structure_algorithm_version"] == "region-producer/v29"
+    assert previous["source_layouts"]
     print(f"source-replay {expected_sha} legacy-complete tables={len(previous['tables'])} rows={len(previous['rows'])}", flush=True)
-    _enable_candidate(monkeypatch)
+    _enable_named_candidate(monkeypatch)
     print(f"source-replay {expected_sha} successor-start", flush=True)
     successor = producer.build_tabular_structure_projection("anonymous.xls", binary, parser=parser, producer_generation_ref=generation)
-    assert successor["structure_algorithm_version"] == "region-producer/v29"
+    assert successor["structure_algorithm_version"] == "region-producer/v30"
     print(f"source-replay {expected_sha} successor-complete tables={len(successor['tables'])} rows={len(successor['rows'])}", flush=True)
 
     def list_projection(projection):

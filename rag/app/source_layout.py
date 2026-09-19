@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from copy import deepcopy
 from datetime import date, datetime, time
 
@@ -16,6 +17,19 @@ SOURCE_LAYOUT_PROJECTION_CONTRACT = (
     "table-producer/v7", "tabular-structure-projection/v7",
     "region-producer/v29", "enumeration-rules/v9",
 )
+
+SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT = (
+    "table-producer/v8", "tabular-structure-projection/v8",
+    "region-producer/v30", "enumeration-rules/v9",
+)
+
+
+def source_layout_version_for_contract(contract):
+    """Resolve only released exact tuples, never a payload's claimed version."""
+    return {
+        SOURCE_LAYOUT_PROJECTION_CONTRACT: "source-layout/v1",
+        SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT: "source-layout/v2",
+    }.get(contract)
 
 
 def _coordinates(value, length):
@@ -29,10 +43,13 @@ def _coordinates(value, length):
 
 def validate_source_layout(
     value, *, source_sha256, producer_generation_ref, sheet_ordinal, object_ref,
+    layout_version="source-layout/v1",
 ):
     """Return an owned copy after exact schema, scope and geometry validation."""
+    if layout_version not in ("source-layout/v1", "source-layout/v2"):
+        raise ValueError("unsupported layout version")
     expected = {
-        "version": "source-layout/v1", "source_sha256": source_sha256,
+        "version": layout_version, "source_sha256": source_sha256,
         "producer_generation_ref": producer_generation_ref,
         "sheet_ordinal": sheet_ordinal, "object_ref": object_ref,
     }
@@ -45,8 +62,18 @@ def validate_source_layout(
             for character in identity
         ):
             raise ValueError("invalid layout identity")
-    if not isinstance(value, dict) or set(value) != {*expected, "cells"}:
+    fields = {*expected, "cells"}
+    if layout_version == "source-layout/v2":
+        fields.add("sheet_name")
+    if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("invalid layout envelope")
+    if layout_version == "source-layout/v2":
+        title = value["sheet_name"]
+        if not isinstance(title, str) or not title.strip() or any(
+            unicodedata.category(character) in ("Cc", "Cf", "Cs")
+            for character in title
+        ) or len(title.encode("utf-8")) > 1024:
+            raise ValueError("invalid layout sheet title")
     if any(type(value[key]) is not type(wanted) or value[key] != wanted for key, wanted in expected.items()):
         raise ValueError("layout scope or version drift")
     if not isinstance(value["cells"], list):

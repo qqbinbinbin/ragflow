@@ -302,17 +302,19 @@ def _merge_sheet_projections(
         "tables": [table for projection in projections for table in projection.get("tables", [])],
         "rows": [row for projection in projections for row in projection.get("rows", [])],
     }
-    from rag.app.source_layout import SOURCE_LAYOUT_PROJECTION_CONTRACT, validate_source_layout
+    from rag.app.source_layout import source_layout_version_for_contract, validate_source_layout
 
     contract = tuple(first[key] for key in (
         "producer_schema_version", "version", "structure_algorithm_version", "enumeration_rule_version",
     ))
-    if contract != SOURCE_LAYOUT_PROJECTION_CONTRACT:
+    layout_version = source_layout_version_for_contract(contract)
+    if not layout_version:
         if any("source_layouts" in projection for projection in projections):
             raise RuntimeError("layout checkpoint uses an unsupported projection contract")
         return result
     layouts = []
     seen = set()
+    sheet_titles = {}
     last_sheet = 0
     for projection in projections:
         if not isinstance(projection.get("source_layouts"), list):
@@ -324,7 +326,12 @@ def _merge_sheet_projections(
                 layout, source_sha256=first["source_sha256"],
                 producer_generation_ref=generation_ref,
                 sheet_ordinal=layout.get("sheet_ordinal"), object_ref=layout.get("object_ref"),
+                layout_version=layout_version,
             )
+            if layout_version == "source-layout/v2":
+                prior = sheet_titles.setdefault(validated["sheet_ordinal"], validated["sheet_name"])
+                if prior != validated["sheet_name"]:
+                    raise RuntimeError("layout checkpoint worksheet title drift")
             if validated["object_ref"] in seen or validated["sheet_ordinal"] < last_sheet:
                 raise RuntimeError("duplicate or unordered layout checkpoint")
             seen.add(validated["object_ref"])

@@ -1132,10 +1132,10 @@ def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
 
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v3"
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v7"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v7"
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v8"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v8"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v4"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v29"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v30"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -8554,7 +8554,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v7"
+    assert projection["version"] == "tabular-structure-projection/v8"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 

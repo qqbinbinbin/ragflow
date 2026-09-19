@@ -39,6 +39,65 @@ def test_layout_survives_json_without_inventing_field_roles():
     assert "enumeration_status" not in value
 
 
+def named_layout(title="2、Declaration（variant）"):
+    return {**example(), "version": "source-layout/v2", "sheet_name": title}
+
+
+def test_layout_version_is_bound_to_exact_producer_tuple():
+    resolve = contract().source_layout_version_for_contract
+    old = ("table-producer/v7", "tabular-structure-projection/v7",
+           "region-producer/v29", "enumeration-rules/v9")
+    new = ("table-producer/v8", "tabular-structure-projection/v8",
+           "region-producer/v30", "enumeration-rules/v9")
+    assert resolve(old) == "source-layout/v1"
+    assert resolve(new) == "source-layout/v2"
+    for index in range(3):
+        mixed = list(new)
+        mixed[index] = old[index]
+        assert resolve(tuple(mixed)) is None
+    assert resolve((*new[:3], "enumeration-rules/v10")) is None
+
+
+def read_named(value):
+    original = example()
+    return contract().validate_source_layout(
+        value, source_sha256=original["source_sha256"],
+        producer_generation_ref=original["producer_generation_ref"],
+        sheet_ordinal=original["sheet_ordinal"], object_ref=original["object_ref"],
+        layout_version="source-layout/v2",
+    )
+
+
+@pytest.mark.parametrize("title", ["Declaration", "申报表（修订版）", "  原始名称  ", "e\u0301"])
+def test_named_layout_preserves_exact_source_title(title):
+    value = named_layout(title)
+    assert read_named(json.loads(json.dumps(value))) == value
+
+
+@pytest.mark.parametrize("title", [None, "", "   ", 12, "a\x00b", "a\u200bb", "中" * 342])
+def test_named_layout_rejects_invalid_title(title):
+    with pytest.raises(ValueError, match="title"):
+        read_named(named_layout(title))
+
+
+def test_layout_title_version_cannot_be_mixed_with_retained_layout():
+    with pytest.raises(ValueError):
+        read(named_layout())
+    with pytest.raises(ValueError):
+        read_named(example())
+    with pytest.raises(ValueError):
+        read({**example(), "sheet_name": "unexpected"})
+
+
+def test_named_layout_requires_title_and_exact_schema():
+    value = named_layout()
+    del value["sheet_name"]
+    with pytest.raises(ValueError):
+        read_named(value)
+    with pytest.raises(ValueError):
+        read_named({**named_layout(), "inferred_form_type": "declaration"})
+
+
 @pytest.mark.parametrize("state,content", [
     ("date", "2026-09-18"), ("datetime", "2026-09-18T12:34:56"),
     ("time", "12:34:56.123000"),
