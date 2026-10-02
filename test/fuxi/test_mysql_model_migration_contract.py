@@ -351,7 +351,8 @@ def isolated_model_mysql():
         admin.close()
 
 
-def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(isolated_model_mysql):
+@pytest.mark.parametrize("partial_additive", [False, True])
+def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(isolated_model_mysql, partial_additive):
     db = isolated_model_mysql
     db.execute_sql("CREATE TABLE tenant_llm (id INT PRIMARY KEY, tenant_id VARCHAR(32), "
                    "llm_factory VARCHAR(128), llm_name VARCHAR(128), model_type VARCHAR(16), "
@@ -393,17 +394,47 @@ def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(i
     # Synthetic fixture decision only; this does not authorize a customer binding change.
     db.execute_sql("UPDATE knowledgebase SET embd_id=%s WHERE id='kb-disabled'",
                    ("bge-large-zh-v1.5@OpenAI-API-Compatible",))
-    stages = ["tenant_model_contract_preflight", "tenant_model_provider", "tenant_model_instance",
+    source = (ROOT / "api/db/db_models.py").read_text(encoding="utf-8")
+    table_names = ["chat_channel", "compilation_template", "compilation_template_group", "file_commit",
+                   "file_commit_item", "tenant_model_group", "tenant_model_group_mapping"]
+    table_models = migration_module.load_declarative_orm_models(source, db.db, table_names)
+    columns = {"knowledgebase": [f"{kind}_task_{suffix}" for kind in
+               ("artifact", "skill", "structure_graph", "structure_mindmap", "timeline",
+                "session_graph", "session_essence", "structure") for suffix in ("id", "finish_at")],
+               "tenant": ["ocr_id", "tenant_ocr_id"], "sync_logs": ["task_type"], "user_canvas": ["tags"]}
+    timestamps = ("create_time", "create_date", "update_time", "update_date")
+    indexes = {name: [(field,) for field in timestamps] for name in
+               ("tabular_structure_dataset_index_state", "tabular_structure_table_index")}
+    selected = {**columns, **{table: list(timestamps) for table in indexes}}
+    field_models = migration_module.load_declarative_orm_models(source, db.db, list(selected), field_names=selected)
+    for table in ("sync_logs", "user_canvas"):
+        db.execute_sql(f"CREATE TABLE `{table}` (id VARCHAR(32) PRIMARY KEY)")
+        db.execute_sql(f"INSERT INTO `{table}` VALUES ('preserved')")
+    if partial_additive:
+        table_models["chat_channel"].create_table()
+        from playhouse.migrate import MySQLMigrator, migrate
+        migrate(MySQLMigrator(db.db).add_column("tenant", "ocr_id", field_models["tenant"]._meta.fields["ocr_id"]))
+    stages = ["tenant_model_contract_preflight", "tabular_structure_foundation", "tabular_structure_discovery_index",
+              "tenant_model_provider", "tenant_model_instance",
               "tenant_model", "tenant_model_id_migration"]
     snapshots = []
+    schemas = []
     for _ in range(2):
         for name in stages:
             stage = MIGRATION_STAGES[name](db, dry_run=False)
             if stage.check():
                 stage.execute()
+        migration_module.apply_reviewed_missing_tables(db.db, table_models)
+        migration_module.apply_reviewed_additive_delta(db.db, field_models, columns, indexes)
         snapshots.append({table: db.execute_sql(f"SELECT * FROM `{table}` ORDER BY id").fetchall()
                           for table in ("tenant_model_provider", "tenant_model_instance", "tenant_model", "tenant", "knowledgebase", "dialog")})
+        schemas.append(db.execute_sql("SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE "
+                                     "FROM information_schema.columns WHERE table_schema=DATABASE() "
+                                     "ORDER BY TABLE_NAME,ORDINAL_POSITION").fetchall())
     assert snapshots[0] == snapshots[1]
+    assert schemas[0] == schemas[1]
+    assert db.execute_sql("SELECT id,task_type FROM sync_logs").fetchone() == ("preserved", "sync")
+    assert db.execute_sql("SELECT id,tags FROM user_canvas").fetchone() == ("preserved", "")
     assert identities() == baseline
     assert db.execute_sql("SELECT * FROM tenant_llm ORDER BY id").fetchall() == legacy_rows
     assert db.execute_sql("SELECT COUNT(*) FROM tenant_model").fetchone()[0] == 5
@@ -416,7 +447,8 @@ def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(i
     assert "https://customer.example.invalid/v1" in binding[3]
 
 
-def test_all_reviewed_missing_tables_preserve_primary_and_unique_indexes_in_mysql(isolated_model_mysql):
+@pytest.mark.parametrize("drift", ["width", "unique_index"])
+def test_all_reviewed_missing_tables_preserve_primary_and_unique_indexes_in_mysql(isolated_model_mysql, drift):
     db = isolated_model_mysql
     names = ["chat_channel", "compilation_template", "compilation_template_group",
              "file_commit", "file_commit_item", "tabular_structure_generation", "tenant_model",
@@ -426,8 +458,7 @@ def test_all_reviewed_missing_tables_preserve_primary_and_unique_indexes_in_mysq
     db.execute_sql("CREATE TABLE protected_business (id VARCHAR(32) PRIMARY KEY)")
     db.execute_sql("INSERT INTO protected_business VALUES ('preserve-me')")
     for _ in range(2):
-        for name in names:
-            models[name].create_table(safe=True)
+        migration_module.apply_reviewed_missing_tables(db.db, models)
     for name, model in models.items():
         assert {column.name for column in db.db.get_columns(name)} == set(model._meta.fields)
         primary = model._meta.primary_key
@@ -442,6 +473,15 @@ def test_all_reviewed_missing_tables_preserve_primary_and_unique_indexes_in_mysq
     db.execute_sql("INSERT INTO file_commit_item (id,commit_id,file_id,operation) VALUES ('a','commit','file','add')")
     with pytest.raises(peewee.IntegrityError):
         db.execute_sql("INSERT INTO file_commit_item (id,commit_id,file_id,operation) VALUES ('b','commit','file','modify')")
+    db.execute_sql("DROP TABLE chat_channel")
+    if drift == "width":
+        db.execute_sql("ALTER TABLE file_commit MODIFY title VARCHAR(128) NULL")
+    else:
+        db.execute_sql("CREATE UNIQUE INDEX unreviewed_title ON file_commit(title)")
+    with pytest.raises(RuntimeError, match="reviewed_table_(schema|index)_mismatch"):
+        migration_module.apply_reviewed_missing_tables(db.db, models)
+    assert not db.db.table_exists("chat_channel")
+    assert db.execute_sql("SELECT id FROM protected_business").fetchone() == ("preserve-me",)
 
 
 def test_reviewed_additive_fields_defaults_indexes_and_drift_in_mysql(isolated_model_mysql):

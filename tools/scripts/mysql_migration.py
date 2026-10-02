@@ -29,6 +29,7 @@ import json
 import logging
 import ast
 import os
+import re
 import sys
 import time
 import uuid
@@ -138,6 +139,46 @@ def load_declarative_orm_models(source: str, database, table_names: list, field_
     if set(result) != set(table_names):
         raise RuntimeError("orm_requested_tables_unproven")
     return result
+
+
+def apply_reviewed_missing_tables(database, models, dry_run=False):
+    """Create explicit missing tables only after all existing contracts pass."""
+    pending = []
+    for table, model in sorted(models.items()):
+        if not database.table_exists(table):
+            pending.append(model)
+            continue
+        actual = {row[0]: row[1:] for row in database.execute_sql(
+            "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name=%s", (table,)).fetchall()}
+        expected = {}
+        for name, field in model._meta.fields.items():
+            types = {"AUTO": "int", "INT": "int", "BIGINT": "bigint", "BOOL": "tinyint(1)",
+                     "DATETIME": "datetime", "FLOAT": "float", "TEXT": "text", "LONGTEXT": "longtext"}
+            column_type = f"varchar({field.max_length})" if isinstance(field, CharField) else types.get(field.field_type)
+            if column_type is None:
+                raise RuntimeError("unreviewed_table_field_type:" + table + "." + name)
+            expected[name] = (column_type, "YES" if field.null else "NO")
+        actual = {name: (re.sub(r"^(int|bigint)\(\d+\)$", r"\1", value[0].lower()), value[1])
+                  for name, value in actual.items()}
+        primary = model._meta.primary_key
+        primary_columns = list(primary.field_names) if isinstance(primary, CompositeKey) else [primary.name]
+        if actual != expected or database.get_primary_keys(table) != primary_columns:
+            raise RuntimeError("reviewed_table_schema_mismatch:" + table)
+        wanted = {(field.name,): bool(field.unique) for field in model._meta.fields.values()
+                  if not field.primary_key and (field.index or field.unique)}
+        wanted.update({tuple(names): bool(unique) for names, unique in model._meta.indexes})
+        present = {tuple(index.columns): bool(index.unique) for index in database.get_indexes(table)
+                   if index.name != "PRIMARY"}
+        if any(present.get(names) != unique for names, unique in wanted.items()) or any(
+                unique and wanted.get(names) is not True for names, unique in present.items()):
+            raise RuntimeError("reviewed_table_index_mismatch:" + table)
+    if not dry_run:
+        for model in pending:
+            model.create_table(safe=False)
+        if apply_reviewed_missing_tables(database, models, dry_run=True):
+            raise RuntimeError("reviewed_table_postcheck_failed")
+    return len(pending)
 
 
 def apply_reviewed_additive_delta(database, models, columns, indexes, dry_run=False):
