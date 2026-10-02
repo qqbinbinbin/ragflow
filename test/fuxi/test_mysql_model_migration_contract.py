@@ -60,6 +60,23 @@ from tools.scripts.mysql_migration import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_ocr_add_column_width_matches_current_model_contract():
+    source = (ROOT / "api/db/db_models.py").read_text(encoding="utf-8")
+    models = migration_module.load_declarative_orm_models(
+        source, MigrationDatabase(MigrationConfig()).db, ["tenant"])
+    tree = ast.parse(source)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "migrate_db")
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == "alter_db_add_column"
+             and len(node.args) == 4 and isinstance(node.args[1], ast.Constant)
+             and isinstance(node.args[2], ast.Constant)
+             and (node.args[1].value, node.args[2].value) == ("tenant", "ocr_id")]
+    assert len(calls) == 1
+    width = next(ast.literal_eval(keyword.value) for keyword in calls[0].args[3].keywords
+                 if keyword.arg == "max_length")
+    assert width == models["tenant"]._meta.fields["ocr_id"].max_length
+
+
 def test_declarative_models_compile_defaults_and_composite_keys_without_execution():
     source = '''
 raise RuntimeError("model source must not execute")
