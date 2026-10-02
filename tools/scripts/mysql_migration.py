@@ -47,7 +47,7 @@ from peewee import (
     CompositeKey,
     FloatField,
 )
-from playhouse.migrate import MySQLMigrator
+from playhouse.migrate import MySQLMigrator, migrate
 
 # Add project root to path for imports
 PROJECT_BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 MIGRATION_DB_VERSION_MARKER = "mysql_migration.database.version"
 
 
-def load_declarative_orm_models(source: str, database, table_names: list) -> dict:
+def load_declarative_orm_models(source: str, database, table_names: list, field_names=None) -> dict:
     """Compile reviewed schema declarations only, never model/runtime behavior."""
     class LongText(TextField):
         field_type = "LONGTEXT"
@@ -80,10 +80,12 @@ def load_declarative_orm_models(source: str, database, table_names: list) -> dic
         except (ValueError, TypeError) as error:
             raise RuntimeError("unreviewed_orm_expression") from error
 
-    def fields(node):
+    def fields(node, selected=None):
         result = {}
         for statement in node.body:
             if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
+                continue
+            if selected is not None and statement.targets[0].id not in selected:
                 continue
             call = statement.value
             if not isinstance(call.func, ast.Name) or not call.func.id.endswith("Field"):
@@ -126,12 +128,65 @@ def load_declarative_orm_models(source: str, database, table_names: list) -> dic
                 if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name) or value.func.id != "CompositeKey":
                     raise RuntimeError("unreviewed_orm_primary_key")
                 options["primary_key"] = CompositeKey(*[literal(arg) for arg in value.args])
-        attrs = {**fields(base), **fields(node), "Meta": type("Meta", (), options)}
+        selected = None if field_names is None else set(field_names[table])
+        attrs = {**fields(base, selected), **fields(node, selected), "Meta": type("Meta", (), options)}
+        if selected is not None and not selected <= set(attrs):
+            raise RuntimeError("orm_requested_fields_unproven")
         if table in result:
             raise RuntimeError("orm_duplicate_table:" + table)
         result[table] = type(node.name, (Model,), attrs)
     if set(result) != set(table_names):
         raise RuntimeError("orm_requested_tables_unproven")
+    return result
+
+
+def apply_reviewed_additive_delta(database, models, columns, indexes, dry_run=False):
+    """Preflight every explicit field/index before additive DDL; never ALTER existing fields."""
+    pending_columns, pending_indexes = [], []
+    for table in sorted(set(columns) | set(indexes)):
+        if table not in models or not database.table_exists(table):
+            raise RuntimeError("reviewed_table_contract_missing:" + table)
+        model = models[table]
+        live = {row[0]: row[1:] for row in database.execute_sql(
+            "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name=%s", (table,)).fetchall()}
+        for name in columns.get(table, []):
+            field = model._meta.fields[name]
+            if isinstance(field, CharField):
+                expected = f"varchar({field.max_length})"
+            elif isinstance(field, DateTimeField):
+                expected = "datetime"
+            elif isinstance(field, BigIntegerField):
+                expected = "bigint"
+            else:
+                raise RuntimeError("unreviewed_additive_field:" + table + "." + name)
+            if name in live:
+                actual_type, nullable = live[name]
+                if actual_type.lower().replace("bigint(20)", "bigint") != expected or (nullable == "YES") != field.null:
+                    raise RuntimeError("reviewed_column_contract_mismatch:" + table + "." + name)
+            else:
+                if not field.null and (field.default is None or callable(field.default)):
+                    raise RuntimeError("reviewed_nonnull_default_missing:" + table + "." + name)
+                pending_columns.append((table, name, field))
+        existing = database.get_indexes(table)
+        for names in indexes.get(table, []):
+            names = tuple(names)
+            if not names or any(name not in model._meta.fields or name not in live for name in names):
+                raise RuntimeError("reviewed_index_columns_missing:" + table)
+            matching = [index for index in existing if tuple(index.columns) == names]
+            if any(index.unique for index in matching):
+                raise RuntimeError("reviewed_index_contract_mismatch:" + table)
+            if not matching:
+                pending_indexes.append((table, names))
+    result = {"columns_added": len(pending_columns), "indexes_added": len(pending_indexes)}
+    if not dry_run:
+        migrator = MySQLMigrator(database)
+        for table, name, field in pending_columns:
+            migrate(migrator.add_column(table, name, field))
+        for table, names in pending_indexes:
+            migrate(migrator.add_index(table, names, unique=False))
+        if apply_reviewed_additive_delta(database, models, columns, indexes, dry_run=True) != {"columns_added": 0, "indexes_added": 0}:
+            raise RuntimeError("reviewed_additive_postcheck_failed")
     return result
 
 

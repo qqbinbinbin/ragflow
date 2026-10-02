@@ -444,6 +444,48 @@ def test_all_reviewed_missing_tables_preserve_primary_and_unique_indexes_in_mysq
         db.execute_sql("INSERT INTO file_commit_item (id,commit_id,file_id,operation) VALUES ('b','commit','file','modify')")
 
 
+def test_reviewed_additive_fields_defaults_indexes_and_drift_in_mysql(isolated_model_mysql):
+    db = isolated_model_mysql
+    source = (ROOT / "api/db/db_models.py").read_text(encoding="utf-8")
+    columns = {"knowledgebase": [f"{kind}_task_{suffix}" for kind in
+               ("artifact", "skill", "structure_graph", "structure_mindmap", "timeline",
+                "session_graph", "session_essence", "structure") for suffix in ("id", "finish_at")],
+               "tenant": ["ocr_id", "tenant_ocr_id"], "sync_logs": ["task_type"], "user_canvas": ["tags"]}
+    timestamps = ("create_time", "create_date", "update_time", "update_date")
+    indexes = {name: [(field,) for field in timestamps] for name in
+               ("tabular_structure_dataset_index_state", "tabular_structure_table_index")}
+    selected = {**columns, **{table: list(timestamps) for table in indexes}}
+    models = migration_module.load_declarative_orm_models(source, db.db, list(selected), field_names=selected)
+    for table in columns:
+        db.execute_sql(f"CREATE TABLE `{table}` (id VARCHAR(32) PRIMARY KEY)")
+        db.execute_sql(f"INSERT INTO `{table}` VALUES ('preserved')")
+    for table in indexes:
+        db.execute_sql(f"CREATE TABLE `{table}` (id VARCHAR(32) PRIMARY KEY, create_time BIGINT NULL, "
+                       "create_date DATETIME NULL, update_time BIGINT NULL, update_date DATETIME NULL)")
+    execute = migration_module.apply_reviewed_additive_delta
+    dry = execute(db.db, models, columns, indexes, dry_run=True)
+    assert dry == {"columns_added": 20, "indexes_added": 8}
+    assert len(db.db.get_columns("tenant")) == 1
+    assert execute(db.db, models, columns, indexes) == dry
+    assert execute(db.db, models, columns, indexes) == {"columns_added": 0, "indexes_added": 0}
+    for table, fields in columns.items():
+        assert set(fields) <= {column.name for column in db.db.get_columns(table)}
+        assert db.execute_sql(f"SELECT id FROM `{table}`").fetchone() == ("preserved",)
+    assert db.execute_sql("SELECT task_type FROM sync_logs").fetchone() == ("sync",)
+    assert db.execute_sql("SELECT tags FROM user_canvas").fetchone() == ("",)
+    assert db.execute_sql("SELECT ocr_id, tenant_ocr_id FROM tenant").fetchone() == (None, None)
+    for table, fields in indexes.items():
+        actual = {tuple(index.columns) for index in db.db.get_indexes(table) if not index.unique}
+        assert set(fields) <= actual
+    # Queue an earlier missing field, then reject a later drift before any DDL.
+    db.execute_sql("ALTER TABLE knowledgebase DROP COLUMN artifact_task_finish_at")
+    db.execute_sql("ALTER TABLE tenant MODIFY ocr_id VARCHAR(128) NULL")
+    with pytest.raises(RuntimeError, match="reviewed_column_contract_mismatch"):
+        execute(db.db, models, columns, indexes)
+    assert "artifact_task_finish_at" not in {column.name for column in db.db.get_columns("knowledgebase")}
+    assert db.execute_sql("SELECT id FROM tenant").fetchone() == ("preserved",)
+
+
 @pytest.mark.parametrize("drift", [False, True])
 def test_foundation_existing_schema_is_noop_or_rejected_without_ddl(drift):
     stage_class = MIGRATION_STAGES["tabular_structure_foundation"]
