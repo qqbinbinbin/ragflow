@@ -541,12 +541,13 @@ def test_discovery_migration_reprojects_when_index_table_is_missing_but_state_ex
 
 
 @pytest.mark.skipif(
-    not os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_PASSWORD"),
+    not (os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_PASSWORD") or os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_SOCKET")),
     reason="explicit isolated MySQL integration target is not configured",
 )
 def test_discovery_identity_migration_round_trips_opaque_refs_in_mysql():
     database_name = f"adr039_table_ref_{uuid.uuid4().hex}"
-    password = os.environ["FUXI_ADR039_MYSQL_INTEGRATION_PASSWORD"]
+    password = os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_PASSWORD", "")
+    socket = os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_SOCKET")
     host = os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_HOST", "mysql")
     port = int(os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_PORT", "3306"))
     user = os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_USER", "root")
@@ -554,6 +555,8 @@ def test_discovery_identity_migration_round_trips_opaque_refs_in_mysql():
         MigrationConfig(host=host, port=port, user=user, password=password, database="mysql")
     )
     target = None
+    if socket:
+        admin.db.connect_params["unix_socket"] = socket
     admin.connect()
     try:
         admin.execute_sql(f"CREATE DATABASE `{database_name}` CHARACTER SET utf8mb4")
@@ -566,6 +569,8 @@ def test_discovery_identity_migration_round_trips_opaque_refs_in_mysql():
                 database=database_name,
             )
         )
+        if socket:
+            target.db.connect_params["unix_socket"] = socket
         target.connect()
         for table in ("document", "knowledgebase"):
             target.execute_sql(f"CREATE TABLE `{table}` (id VARCHAR(32) PRIMARY KEY) ENGINE=InnoDB")
