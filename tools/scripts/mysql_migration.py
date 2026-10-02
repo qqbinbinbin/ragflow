@@ -141,6 +141,61 @@ def load_declarative_orm_models(source: str, database, table_names: list, field_
     return result
 
 
+def apply_reviewed_schema_model_delta(database, source, contract, dry_run=False):
+    """Execute source-bound reviewed deltas; caller owns backup, isolation and locks."""
+    if contract.get("schema") != "ragflow.reviewed-schema-model-delta/v1" or contract.get("review_status") != "reviewed":
+        raise RuntimeError("reviewed_schema_contract_required")
+    if contract.get("source_sha256") != hashlib.sha256(source.encode("utf-8")).hexdigest():
+        raise RuntimeError("reviewed_schema_source_mismatch")
+    columns, indexes = contract["missing_columns"], contract["missing_indexes"]
+    selected = {table: list(fields) for table, fields in columns.items()}
+    for table, groups in indexes.items():
+        selected.setdefault(table, []).extend(name for group in groups for name in group)
+    models = load_declarative_orm_models(source, database.db, contract["missing_tables"])
+    field_models = load_declarative_orm_models(source, database.db, list(selected), field_names=selected)
+    def protected():
+        result = {}
+        for table in ("tenant", "knowledgebase", "document", "file", "tenant_llm"):
+            if not database.table_exists(table):
+                raise RuntimeError("reviewed_protected_table_missing:" + table)
+            ids = database.execute_sql(f"SELECT id FROM `{table}` ORDER BY id").fetchall()
+            result[table] = (len(ids), hashlib.sha256(json.dumps(ids, default=str).encode()).hexdigest())
+        return result
+    baseline = protected()
+    # Resolve every model reference and every additive target before the first DDL.
+    TenantModelContractPreflightStage(database, dry_run=True).execute()
+    apply_reviewed_missing_tables(database.db, models, dry_run=True)
+    stages = ("tabular_structure_foundation", "tabular_structure_discovery_index",
+              "tenant_model_provider", "tenant_model_instance", "tenant_model", "tenant_model_id_migration")
+    created_tables = set(models)
+    for name in stages[:-1]:
+        created_tables.update(MIGRATION_STAGES[name].target_tables)
+    table_count = sum(not database.table_exists(table) for table in created_tables)
+    delta = apply_reviewed_additive_delta(database.db, field_models, columns, {}, dry_run=True)
+    foundation = TabularStructureFoundationStage(database, dry_run=True)
+    foundation.check()
+    discovery = TabularStructureDiscoveryIndexStage(database, dry_run=True)
+    discovery._require_supported_backend()
+    present = [database.table_exists(table) for table in discovery.target_tables]
+    if any(present) and (not all(present) or discovery._table_ref_column_contract() != discovery.TABLE_REF_COLUMN_CONTRACT
+                        or discovery._has_stale_index_schema_state()):
+        raise RuntimeError("reviewed_discovery_reprojection_not_authorized")
+    current_indexes = {table: groups for table, groups in indexes.items() if database.table_exists(table)}
+    planned_indexes = apply_reviewed_additive_delta(database.db, field_models, {}, current_indexes, dry_run=True)
+    delta["indexes_added"] = planned_indexes["indexes_added"] + sum(len(groups) for table, groups in indexes.items()
+                                                                       if table not in current_indexes)
+    if not dry_run:
+        for name in stages:
+            stage = MIGRATION_STAGES[name](database, dry_run=False)
+            if stage.check():
+                stage.execute()
+        apply_reviewed_missing_tables(database.db, models)
+        delta = apply_reviewed_additive_delta(database.db, field_models, columns, indexes)
+        if protected() != baseline:
+            raise RuntimeError("reviewed_protected_identity_mismatch")
+    return {"tables_added": table_count, **delta, "protected_identity_match": True, "dry_run": dry_run}
+
+
 def apply_reviewed_missing_tables(database, models, dry_run=False):
     """Create explicit missing tables only after all existing contracts pass."""
     pending = []

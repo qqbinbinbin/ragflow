@@ -1,5 +1,6 @@
 from pathlib import Path
 import ast
+import hashlib
 from contextlib import nullcontext
 import inspect
 import os
@@ -75,6 +76,13 @@ def test_ocr_add_column_width_matches_current_model_contract():
     width = next(ast.literal_eval(keyword.value) for keyword in calls[0].args[3].keywords
                  if keyword.arg == "max_length")
     assert width == models["tenant"]._meta.fields["ocr_id"].max_length
+
+
+def test_reviewed_chain_rejects_stale_source_before_database_access():
+    with pytest.raises(RuntimeError, match="reviewed_schema_source_mismatch"):
+        migration_module.apply_reviewed_schema_model_delta(None, "source", {
+            "schema": "ragflow.reviewed-schema-model-delta/v1", "review_status": "reviewed",
+            "source_sha256": "0" * 64})
 
 
 def test_declarative_models_compile_defaults_and_composite_keys_without_execution():
@@ -414,24 +422,28 @@ def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(i
         table_models["chat_channel"].create_table()
         from playhouse.migrate import MySQLMigrator, migrate
         migrate(MySQLMigrator(db.db).add_column("tenant", "ocr_id", field_models["tenant"]._meta.fields["ocr_id"]))
-    stages = ["tenant_model_contract_preflight", "tabular_structure_foundation", "tabular_structure_discovery_index",
-              "tenant_model_provider", "tenant_model_instance",
-              "tenant_model", "tenant_model_id_migration"]
+    contract = {"schema": "ragflow.reviewed-schema-model-delta/v1", "review_status": "reviewed",
+                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "missing_tables": table_names, "missing_columns": columns, "missing_indexes": indexes}
     snapshots = []
     schemas = []
+    preview_tables = db.execute_sql("SHOW TABLES").fetchall()
+    preview = migration_module.apply_reviewed_schema_model_delta(db, source, contract, dry_run=True)
+    assert preview["tables_added"] == (12 if partial_additive else 13)
+    assert preview["columns_added"] == (19 if partial_additive else 20)
+    assert preview["indexes_added"] == 8
+    assert db.execute_sql("SHOW TABLES").fetchall() == preview_tables
+    assert identities() == baseline
     for _ in range(2):
-        for name in stages:
-            stage = MIGRATION_STAGES[name](db, dry_run=False)
-            if stage.check():
-                stage.execute()
-        migration_module.apply_reviewed_missing_tables(db.db, table_models)
-        migration_module.apply_reviewed_additive_delta(db.db, field_models, columns, indexes)
+        result = migration_module.apply_reviewed_schema_model_delta(db, source, contract)
+        assert result["protected_identity_match"] is True
         snapshots.append({table: db.execute_sql(f"SELECT * FROM `{table}` ORDER BY id").fetchall()
                           for table in ("tenant_model_provider", "tenant_model_instance", "tenant_model", "tenant", "knowledgebase", "dialog")})
         schemas.append(db.execute_sql("SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE "
                                      "FROM information_schema.columns WHERE table_schema=DATABASE() "
                                      "ORDER BY TABLE_NAME,ORDINAL_POSITION").fetchall())
     assert snapshots[0] == snapshots[1]
+    assert result["tables_added"] == result["columns_added"] == result["indexes_added"] == 0
     assert schemas[0] == schemas[1]
     assert db.execute_sql("SELECT id,task_type FROM sync_logs").fetchone() == ("preserved", "sync")
     assert db.execute_sql("SELECT id,tags FROM user_canvas").fetchone() == ("preserved", "")
