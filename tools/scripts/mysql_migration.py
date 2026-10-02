@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import logging
+import ast
 import os
 import sys
 import time
@@ -34,6 +35,7 @@ import uuid
 
 from packaging.version import InvalidVersion, Version
 from peewee import (
+    BooleanField,
     CharField,
     IntegerField,
     BigIntegerField,
@@ -42,6 +44,8 @@ from peewee import (
     Model,
     PrimaryKeyField,
     TextField,
+    CompositeKey,
+    FloatField,
 )
 from playhouse.migrate import MySQLMigrator
 
@@ -55,6 +59,80 @@ logger = logging.getLogger(__name__)
 
 
 MIGRATION_DB_VERSION_MARKER = "mysql_migration.database.version"
+
+
+def load_declarative_orm_models(source: str, database, table_names: list) -> dict:
+    """Compile reviewed schema declarations only, never model/runtime behavior."""
+    class LongText(TextField):
+        field_type = "LONGTEXT"
+
+    constructors = {"CharField": CharField, "IntegerField": IntegerField,
+                    "BigIntegerField": BigIntegerField, "DateTimeField": DateTimeField,
+                    "BooleanField": BooleanField, "FloatField": FloatField,
+                    "PrimaryKeyField": PrimaryKeyField, "TextField": TextField,
+                    "LongTextField": LongText, "JSONField": LongText, "ListField": LongText,
+                    "SerializedField": LongText}
+    def literal(node):
+        if isinstance(node, ast.Name) and node.id in ("dict", "list"):
+            return {"dict": dict, "list": list}[node.id]
+        try:
+            return ast.literal_eval(node)
+        except (ValueError, TypeError) as error:
+            raise RuntimeError("unreviewed_orm_expression") from error
+
+    def fields(node):
+        result = {}
+        for statement in node.body:
+            if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
+                continue
+            call = statement.value
+            if not isinstance(call.func, ast.Name) or not call.func.id.endswith("Field"):
+                continue
+            constructor = constructors.get(call.func.id)
+            if constructor is None:
+                raise RuntimeError("unreviewed_orm_field:" + call.func.id)
+            kwargs = {}
+            for keyword in call.keywords:
+                if keyword.arg == "help_text":
+                    continue
+                if keyword.arg not in ("max_length", "null", "primary_key", "index", "unique", "default"):
+                    raise RuntimeError("unreviewed_orm_field_option:" + str(keyword.arg))
+                kwargs[keyword.arg] = literal(keyword.value)
+            result[statement.targets[0].id] = constructor(*[literal(arg) for arg in call.args], **kwargs)
+        return result
+
+    classes = [node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)]
+    base = next((node for node in classes if node.name == "BaseModel"), None)
+    if base is None:
+        raise RuntimeError("orm_base_fields_unproven")
+    result = {}
+    for node in classes:
+        if not any(isinstance(parent, ast.Name) and parent.id == "DataBaseModel" for parent in node.bases):
+            continue
+        meta_nodes = [statement for child in node.body if isinstance(child, ast.ClassDef) and child.name == "Meta"
+                      for statement in child.body if isinstance(statement, ast.Assign)]
+        table = node.name.lower()
+        for statement in meta_nodes:
+            if statement.targets[0].id in ("db_table", "table_name"):
+                table = literal(statement.value)
+        if table not in table_names:
+            continue
+        options = {"database": database, "table_name": table}
+        for statement in meta_nodes:
+            if statement.targets[0].id == "indexes":
+                options["indexes"] = literal(statement.value)
+            elif statement.targets[0].id == "primary_key":
+                value = statement.value
+                if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name) or value.func.id != "CompositeKey":
+                    raise RuntimeError("unreviewed_orm_primary_key")
+                options["primary_key"] = CompositeKey(*[literal(arg) for arg in value.args])
+        attrs = {**fields(base), **fields(node), "Meta": type("Meta", (), options)}
+        if table in result:
+            raise RuntimeError("orm_duplicate_table:" + table)
+        result[table] = type(node.name, (Model,), attrs)
+    if set(result) != set(table_names):
+        raise RuntimeError("orm_requested_tables_unproven")
+    return result
 
 
 class MigrationConfig:

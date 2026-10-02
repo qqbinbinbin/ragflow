@@ -9,6 +9,7 @@ import types
 import uuid
 
 import pytest
+import tools.scripts.mysql_migration as migration_module
 
 
 class _Field:
@@ -57,6 +58,44 @@ from tools.scripts.mysql_migration import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_declarative_models_compile_defaults_and_composite_keys_without_execution():
+    source = '''
+raise RuntimeError("model source must not execute")
+class BaseModel(Model):
+    create_time = BigIntegerField(null=True, index=True)
+class Example(DataBaseModel):
+    owner = CharField(max_length=32)
+    name = CharField(max_length=128, default="")
+    config = JSONField(null=False, default=dict)
+    class Meta:
+        db_table = "example"
+        primary_key = CompositeKey("owner", "name")
+        indexes = ((("name",), True),)
+'''
+    database = MigrationDatabase(MigrationConfig()).db
+    models = migration_module.load_declarative_orm_models(source, database, ["example"])
+    model = models["example"]
+    assert model._meta.primary_key.field_names == ("owner", "name")
+    assert model._meta.indexes == [(('name',), True)]
+    assert model._meta.fields["name"].default == ""
+    assert model._meta.fields["config"].default is dict
+    sql, params = model._schema._create_table().query()
+    assert "LONGTEXT NOT NULL" in sql
+    assert "PRIMARY KEY (`owner`, `name`)" in sql
+    assert not params
+
+
+def test_declarative_models_reject_dynamic_schema_expression():
+    source = '''
+class BaseModel(Model):
+    create_time = BigIntegerField(null=True)
+class Example(DataBaseModel):
+    id = CharField(max_length=fetch_secret(), primary_key=True)
+'''
+    with pytest.raises(RuntimeError, match="unreviewed_orm_expression"):
+        migration_module.load_declarative_orm_models(source, MigrationDatabase(MigrationConfig()).db, ["example"])
 
 
 @pytest.mark.parametrize(
@@ -358,6 +397,34 @@ def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(i
                             "WHERE k.id='kb-disabled'").fetchone()
     assert binding[:3] == ("0", "tenant-a", "bge-large-zh-v1.5")
     assert "https://customer.example.invalid/v1" in binding[3]
+
+
+def test_all_reviewed_missing_tables_preserve_primary_and_unique_indexes_in_mysql(isolated_model_mysql):
+    db = isolated_model_mysql
+    names = ["chat_channel", "compilation_template", "compilation_template_group",
+             "file_commit", "file_commit_item", "tabular_structure_generation", "tenant_model",
+             "tenant_model_group", "tenant_model_group_mapping", "tenant_model_instance", "tenant_model_provider"]
+    source = (ROOT / "api/db/db_models.py").read_text(encoding="utf-8")
+    models = migration_module.load_declarative_orm_models(source, db.db, names)
+    db.execute_sql("CREATE TABLE protected_business (id VARCHAR(32) PRIMARY KEY)")
+    db.execute_sql("INSERT INTO protected_business VALUES ('preserve-me')")
+    for _ in range(2):
+        for name in names:
+            models[name].create_table(safe=True)
+    for name, model in models.items():
+        assert {column.name for column in db.db.get_columns(name)} == set(model._meta.fields)
+        primary = model._meta.primary_key
+        expected_primary = list(primary.field_names) if hasattr(primary, "field_names") else [primary.name]
+        assert db.db.get_primary_keys(name) == expected_primary
+        actual_unique = {tuple(index.columns) for index in db.db.get_indexes(name) if index.unique}
+        for columns, unique in model._meta.indexes:
+            if unique:
+                assert tuple(columns) in actual_unique
+        assert db.execute_sql(f"SELECT COUNT(*) FROM `{name}`").fetchone()[0] == 0
+    assert list(db.execute_sql("SELECT id FROM protected_business").fetchall()) == [("preserve-me",)]
+    db.execute_sql("INSERT INTO file_commit_item (id,commit_id,file_id,operation) VALUES ('a','commit','file','add')")
+    with pytest.raises(peewee.IntegrityError):
+        db.execute_sql("INSERT INTO file_commit_item (id,commit_id,file_id,operation) VALUES ('b','commit','file','modify')")
 
 
 @pytest.mark.parametrize("drift", [False, True])
