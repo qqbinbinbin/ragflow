@@ -3029,6 +3029,10 @@ Examples:
 
     # Configuration options
     parser.add_argument("--config", "-c", type=str, help="Path to YAML config file")
+    parser.add_argument("--reviewed-schema-delta", help="Explicit reviewed additive schema/model contract JSON")
+    parser.add_argument("--reviewed-contract-sha256", help="Pinned SHA256 of reviewed contract")
+    parser.add_argument("--model-source", help="Source-bound ORM declarations for reviewed delta")
+    parser.add_argument("--unix-socket", help="Explicit MySQL Unix socket for isolated replay")
 
     # Migration options
     parser.add_argument("--stages", "-s", type=str, help="Comma-separated list of stages to run")
@@ -3046,6 +3050,49 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.reviewed_schema_delta:
+        if any((args.stages, args.create_table_only, args.backfill_tabular_structure_index,
+                args.check_database_version, args.mark_database_version, args.database_version,
+                args.mark_database_version_on_success, args.list_stages)):
+            raise RuntimeError("reviewed_delta_mode_conflict")
+        if not args.model_source or not args.reviewed_contract_sha256:
+            raise RuntimeError("reviewed_delta_source_and_digest_required")
+        with open(args.reviewed_schema_delta, "rb") as handle:
+            content = handle.read()
+        if hashlib.sha256(content).hexdigest() != args.reviewed_contract_sha256:
+            raise RuntimeError("reviewed_contract_digest_mismatch")
+        contract = json.loads(content)
+        with open(args.model_source, encoding="utf-8") as handle:
+            source = handle.read()
+        if contract.get("review_status") != "reviewed" or contract.get("schema") != "ragflow.reviewed-schema-model-delta/v1":
+            raise RuntimeError("reviewed_schema_contract_required")
+        if contract.get("source_sha256") != hashlib.sha256(source.encode()).hexdigest():
+            raise RuntimeError("reviewed_schema_source_mismatch")
+        if args.config:
+            # Do not use the historical config loader's silent fallback here.
+            from ruamel.yaml import YAML
+            with open(args.config, encoding="utf-8") as handle:
+                loaded = YAML(typ="safe").load(handle)
+            db_config = loaded.get("database", loaded.get("mysql", {}))
+            if not isinstance(db_config, dict) or not all(key in db_config for key in ("host", "user", "password")):
+                raise RuntimeError("reviewed_database_config_invalid")
+            config = MigrationConfig(host=db_config["host"], port=db_config.get("port", 3306),
+                                     user=db_config["user"], password=db_config["password"],
+                                     database=db_config.get("name", db_config.get("database", "rag_flow")))
+        else:
+            config = MigrationConfig(args.host, args.port, args.user, args.password, args.database)
+        database = MigrationDatabase(config)
+        if args.unix_socket:
+            database.db.connect_params["unix_socket"] = args.unix_socket
+        try:
+            database.connect()
+            result = apply_reviewed_schema_model_delta(database, source, contract, dry_run=not args.execute)
+            print(json.dumps(result, sort_keys=True))
+        finally:
+            database.close()
+        return
+    if any((args.reviewed_contract_sha256, args.model_source, args.unix_socket)):
+        raise RuntimeError("reviewed_delta_mode_required")
 
     # List stages and exit
     if args.list_stages:

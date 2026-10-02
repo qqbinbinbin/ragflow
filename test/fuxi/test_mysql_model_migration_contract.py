@@ -85,6 +85,17 @@ def test_reviewed_chain_rejects_stale_source_before_database_access():
             "source_sha256": "0" * 64})
 
 
+def test_reviewed_delta_cli_requires_pinned_contract_before_connection(tmp_path, monkeypatch):
+    import json
+    contract = tmp_path / "contract.json"
+    contract.write_text(json.dumps({"schema": "ragflow.reviewed-schema-model-delta/v1"}))
+    monkeypatch.setattr(sys, "argv", ["mysql_migration.py", "--reviewed-schema-delta", str(contract),
+                                    "--reviewed-contract-sha256", "0" * 64,
+                                    "--model-source", str(contract)])
+    with pytest.raises(RuntimeError, match="reviewed_contract_digest_mismatch"):
+        migration_module.main()
+
+
 def test_declarative_models_compile_defaults_and_composite_keys_without_execution():
     source = '''
 raise RuntimeError("model source must not execute")
@@ -360,7 +371,7 @@ def isolated_model_mysql():
 
 
 @pytest.mark.parametrize("partial_additive", [False, True])
-def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(isolated_model_mysql, partial_additive):
+def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(isolated_model_mysql, partial_additive, tmp_path, monkeypatch):
     db = isolated_model_mysql
     db.execute_sql("CREATE TABLE tenant_llm (id INT PRIMARY KEY, tenant_id VARCHAR(32), "
                    "llm_factory VARCHAR(128), llm_name VARCHAR(128), model_type VARCHAR(16), "
@@ -432,6 +443,15 @@ def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(i
     assert preview["tables_added"] == (12 if partial_additive else 13)
     assert preview["columns_added"] == (19 if partial_additive else 20)
     assert preview["indexes_added"] == 8
+    import json
+    contract_path = tmp_path / "reviewed.json"
+    contract_path.write_text(json.dumps(contract))
+    monkeypatch.setattr(sys, "argv", ["mysql_migration.py", "--reviewed-schema-delta", str(contract_path),
+                                    "--reviewed-contract-sha256", hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+                                    "--model-source", str(ROOT / "api/db/db_models.py"),
+                                    "--database", db.config.database, "--unix-socket",
+                                    os.environ["FUXI_ADR039_MYSQL_INTEGRATION_SOCKET"]])
+    migration_module.main()
     assert db.execute_sql("SHOW TABLES").fetchall() == preview_tables
     assert identities() == baseline
     for _ in range(2):
