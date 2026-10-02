@@ -28,6 +28,11 @@ echo "Running model provider table migrations..."
 # Structure discovery is a MySQL 8-only capability. The stage performs the
 # backend/ngram preflight before creating any discovery state.
 "$PY" tools/scripts/mysql_migration.py \
+    --stages tabular_structure_foundation \
+    --config "$CONFIG" \
+    --execute
+
+"$PY" tools/scripts/mysql_migration.py \
     --stages tabular_structure_discovery_index \
     --config "$CONFIG" \
     --execute

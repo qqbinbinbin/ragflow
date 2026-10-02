@@ -1,4 +1,5 @@
 from pathlib import Path
+import ast
 from contextlib import nullcontext
 import inspect
 import os
@@ -210,6 +211,98 @@ def test_model_preflight_precedes_discovery_writes():
     assert source.index("--stages tenant_model_contract_preflight ") < source.index(
         "--stages tabular_structure_discovery_index"
     )
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_foundation_stage_creates_only_missing_table(dry_run):
+    stage_class = MIGRATION_STAGES.get("tabular_structure_foundation")
+    assert stage_class is not None
+
+    class Database:
+        def __init__(self):
+            self.statements = []
+
+        def table_exists(self, table):
+            return False
+
+        def execute_sql(self, sql, params=None):
+            self.statements.append(sql)
+            class Cursor:
+                def fetchone(self):
+                    return ("8.0.40",) if sql == "SELECT VERSION()" else ("ACTIVE",)
+            return Cursor()
+
+    database = Database()
+    stage = stage_class(database, dry_run=dry_run)
+    assert stage.check() is True
+    assert stage.execute()[0] == 0
+    writes = [sql for sql in database.statements if not sql.startswith("SELECT ")]
+    assert len(writes) == (0 if dry_run else 1)
+    if not dry_run:
+        assert writes[0].lstrip().startswith("CREATE TABLE IF NOT EXISTS tabular_structure_generation")
+
+
+def test_foundation_stage_precedes_discovery_and_follows_model_preflight():
+    source = (ROOT / "tools/scripts/run_migrations.sh").read_text(encoding="utf-8")
+    assert source.index("--stages tenant_model_contract_preflight ") < source.index(
+        "--stages tabular_structure_foundation"
+    ) < source.index("--stages tabular_structure_discovery_index")
+
+
+def test_foundation_contract_matches_authoritative_orm_fields():
+    tree = ast.parse((ROOT / "api/db/db_models.py").read_text(encoding="utf-8"))
+    expected = {}
+    field_types = {"CharField": "varchar", "BigIntegerField": "bigint",
+                   "IntegerField": "int", "DateTimeField": "datetime"}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name in ("BaseModel", "TabularStructureGeneration"):
+            for statement in node.body:
+                if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
+                    continue
+                call = statement.value
+                if not isinstance(call.func, ast.Name) or call.func.id not in field_types:
+                    continue
+                options = {key.arg: ast.literal_eval(key.value) for key in call.keywords}
+                expected[statement.targets[0].id] = (
+                    field_types[call.func.id], options.get("max_length"),
+                    "YES" if options.get("null", False) else "NO",
+                    "PRI" if options.get("primary_key", False) else "",
+                )
+    assert len(expected) == 19
+    assert MIGRATION_STAGES["tabular_structure_foundation"].COLUMN_CONTRACT == expected
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_foundation_existing_schema_is_noop_or_rejected_without_ddl(drift):
+    stage_class = MIGRATION_STAGES["tabular_structure_foundation"]
+
+    class Cursor:
+        def fetchall(self):
+            rows = [(name, *contract) for name, contract in stage_class.COLUMN_CONTRACT.items()]
+            return rows[:-1] if drift else rows
+
+    class Database:
+        config = type("Config", (), {"database": "anonymous"})()
+
+        def table_exists(self, table):
+            return True
+
+        def execute_sql(self, sql, params=None):
+            assert sql.startswith("SELECT ")
+            if sql == "SELECT VERSION()" or "INFORMATION_SCHEMA.PLUGINS" in sql:
+                class BackendCursor:
+                    def fetchone(self):
+                        return ("8.0.40",) if sql == "SELECT VERSION()" else ("ACTIVE",)
+                return BackendCursor()
+            return Cursor()
+
+    stage = stage_class(Database(), dry_run=False)
+    if drift:
+        with pytest.raises(RuntimeError, match="foundation_schema_mismatch"):
+            stage.execute()
+    else:
+        assert stage.check() is False
+        assert stage.execute()[0] == 0
 
 
 @pytest.mark.parametrize("method", ["check", "execute"])
@@ -474,12 +567,13 @@ def test_discovery_identity_migration_round_trips_opaque_refs_in_mysql():
             )
         )
         target.connect()
-        target.execute_sql(
-            "CREATE TABLE tabular_structure_generation ("
-            "producer_generation_ref VARCHAR(36) PRIMARY KEY, tenant_id VARCHAR(32) NOT NULL, "
-            "kb_id VARCHAR(256) NOT NULL, document_id VARCHAR(32) NOT NULL, "
-            "status VARCHAR(16) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-        )
+        for table in ("document", "knowledgebase"):
+            target.execute_sql(f"CREATE TABLE `{table}` (id VARCHAR(32) PRIMARY KEY) ENGINE=InnoDB")
+        foundation = MIGRATION_STAGES["tabular_structure_foundation"](target, dry_run=False)
+        assert foundation.check() is True
+        foundation.execute()
+        assert foundation.check() is False
+        foundation.execute()
         target.execute_sql(
             "CREATE TABLE tabular_structure_dataset_index_state ("
             "tenant_id VARCHAR(32) NOT NULL, kb_id VARCHAR(256) NOT NULL, "
@@ -509,8 +603,12 @@ def test_discovery_identity_migration_round_trips_opaque_refs_in_mysql():
             "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
         )
         target.execute_sql(
-            "INSERT INTO tabular_structure_generation VALUES "
-            "('11111111-1111-1111-1111-111111111111','tenant','dataset','document','active')"
+            "INSERT INTO tabular_structure_generation "
+            "(producer_generation_ref,tenant_id,kb_id,document_id,projection_version,"
+            "producer_schema_version,manifest_object_name,manifest_sha256,source_sha256,"
+            "row_count,part_count,status) VALUES "
+            "('11111111-1111-1111-1111-111111111111','tenant','dataset','document',"
+            "'v1','v1','anonymous.json',REPEAT('a',64),REPEAT('b',64),1,1,'active')"
         )
         target.execute_sql(
             "INSERT INTO tabular_structure_dataset_index_state VALUES "

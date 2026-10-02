@@ -2313,6 +2313,89 @@ class TenantModelIdMigrationStage(MigrationStage):
         return None
 
 
+class TabularStructureFoundationStage(MigrationStage):
+    """Create the generation foundation without running broad ORM migration."""
+
+    name = "tabular_structure_foundation"
+    description = "Create the additive tabular structure generation foundation"
+    target_tables = ["tabular_structure_generation"]
+    COLUMN_CONTRACT = {
+        "producer_generation_ref": ("varchar", 36, "NO", "PRI"),
+        "tenant_id": ("varchar", 32, "NO", ""),
+        "kb_id": ("varchar", 256, "NO", ""),
+        "document_id": ("varchar", 32, "NO", ""),
+        "projection_version": ("varchar", 64, "NO", ""),
+        "producer_schema_version": ("varchar", 64, "NO", ""),
+        "manifest_object_name": ("varchar", 512, "NO", ""),
+        "manifest_sha256": ("varchar", 64, "NO", ""),
+        "source_sha256": ("varchar", 64, "NO", ""),
+        "row_count": ("bigint", None, "NO", ""),
+        "part_count": ("int", None, "NO", ""),
+        "status": ("varchar", 16, "NO", ""),
+        "safe_error_code": ("varchar", 64, "YES", ""),
+        "activated_at": ("datetime", None, "YES", ""),
+        "retained_at": ("datetime", None, "YES", ""),
+        "create_time": ("bigint", None, "YES", ""),
+        "create_date": ("datetime", None, "YES", ""),
+        "update_time": ("bigint", None, "YES", ""),
+        "update_date": ("datetime", None, "YES", ""),
+    }
+
+    def check(self) -> bool:
+        TabularStructureDiscoveryIndexStage(self.db, dry_run=True)._require_supported_backend()
+        if not self.db.table_exists(self.target_tables[0]):
+            return True
+        rows = self.db.execute_sql(
+            "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_KEY "
+            "FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
+            (self.db.config.database, self.target_tables[0]),
+        ).fetchall()
+        actual = {name: (kind.lower(), length, nullable, "PRI" if key == "PRI" else "")
+                  for name, kind, length, nullable, key in rows}
+        if actual != self.COLUMN_CONTRACT:
+            raise RuntimeError("tabular_structure_foundation_schema_mismatch")
+        return False
+
+    def execute(self) -> tuple[int, list]:
+        if self.check() and not self.dry_run:
+            self.create_target_table()
+        return 0, self.target_tables
+
+    def create_target_table(self):
+        self.db.execute_sql("""
+            CREATE TABLE IF NOT EXISTS tabular_structure_generation (
+                producer_generation_ref VARCHAR(36) NOT NULL PRIMARY KEY,
+                tenant_id VARCHAR(32) NOT NULL,
+                kb_id VARCHAR(256) NOT NULL,
+                document_id VARCHAR(32) NOT NULL,
+                projection_version VARCHAR(64) NOT NULL,
+                producer_schema_version VARCHAR(64) NOT NULL,
+                manifest_object_name VARCHAR(512) NOT NULL,
+                manifest_sha256 VARCHAR(64) NOT NULL,
+                source_sha256 VARCHAR(64) NOT NULL,
+                row_count BIGINT NOT NULL,
+                part_count INT NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                safe_error_code VARCHAR(64) NULL,
+                activated_at DATETIME NULL,
+                retained_at DATETIME NULL,
+                create_time BIGINT NULL,
+                create_date DATETIME NULL,
+                update_time BIGINT NULL,
+                update_date DATETIME NULL,
+                INDEX idx_generation_tenant (tenant_id),
+                INDEX idx_generation_kb (kb_id),
+                INDEX idx_generation_document (document_id),
+                INDEX idx_generation_status (status),
+                INDEX idx_generation_create_time (create_time),
+                INDEX idx_generation_create_date (create_date),
+                INDEX idx_generation_update_time (update_time),
+                INDEX idx_generation_update_date (update_date),
+                INDEX idx_generation_scope_status (tenant_id,kb_id,document_id,status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+
 class TabularStructureDiscoveryIndexStage(MigrationStage):
     """Create the MySQL 8 ngram index used only for bounded table recall."""
 
@@ -2519,6 +2602,7 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
 
 # Registry of available migration stages
 MIGRATION_STAGES = {
+    "tabular_structure_foundation": TabularStructureFoundationStage,
     "tabular_structure_discovery_index": TabularStructureDiscoveryIndexStage,
     "tenant_model_contract_preflight": TenantModelContractPreflightStage,
     "tenant_model_provider": TenantModelProviderStage,
