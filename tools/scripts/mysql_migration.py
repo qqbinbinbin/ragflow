@@ -2326,6 +2326,11 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
         "tabular_structure_table_index",
     ]
 
+    def _require_source_tables(self):
+        for table in self.source_tables:
+            if not self.db.table_exists(table):
+                raise RuntimeError("discovery_missing_source_table:" + table)
+
     def _require_supported_backend(self):
         version_row = self.db.execute_sql("SELECT VERSION()").fetchone()
         version = str(version_row[0] if version_row else "")
@@ -2401,6 +2406,7 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
         )
 
     def check(self) -> bool:
+        self._require_source_tables()
         self._require_supported_backend()
         missing_schema = (
             any(not self.db.table_exists(table) for table in self.target_tables)
@@ -2415,6 +2421,7 @@ class TabularStructureDiscoveryIndexStage(MigrationStage):
         return self._active_generation_lacks_index_state()
 
     def execute(self) -> tuple[int, list]:
+        self._require_source_tables()
         self._require_supported_backend()
         if self.dry_run:
             return 0, self.target_tables

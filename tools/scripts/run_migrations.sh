@@ -19,6 +19,12 @@ CONFIG="${1:-conf/service_conf.yaml}"
 
 echo "Running model provider table migrations..."
 
+# Reject unresolved model references before any discovery or model write.
+"$PY" tools/scripts/mysql_migration.py \
+    --stages tenant_model_contract_preflight \
+    --config "$CONFIG" \
+    --execute
+
 # Structure discovery is a MySQL 8-only capability. The stage performs the
 # backend/ngram preflight before creating any discovery state.
 "$PY" tools/scripts/mysql_migration.py \

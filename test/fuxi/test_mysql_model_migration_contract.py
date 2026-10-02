@@ -205,6 +205,28 @@ def test_service_migration_does_not_skip_contract_repair_from_version_marker():
         assert "--database-version" not in call
 
 
+def test_model_preflight_precedes_discovery_writes():
+    source = (ROOT / "tools/scripts/run_migrations.sh").read_text(encoding="utf-8")
+    assert source.index("--stages tenant_model_contract_preflight ") < source.index(
+        "--stages tabular_structure_discovery_index"
+    )
+
+
+@pytest.mark.parametrize("method", ["check", "execute"])
+@pytest.mark.parametrize("missing", TabularStructureDiscoveryIndexStage.source_tables)
+def test_discovery_missing_dependency_rejects_before_any_sql(method, missing):
+    class Database:
+        def table_exists(self, table):
+            return table != missing
+
+        def execute_sql(self, sql, params=None):
+            raise AssertionError("SQL reached before missing dependency rejection: " + sql)
+
+    stage = TabularStructureDiscoveryIndexStage(Database(), dry_run=False)
+    with pytest.raises(RuntimeError, match="discovery_missing_source_table:" + missing):
+        getattr(stage, method)()
+
+
 def test_contract_preflight_rejects_cross_tenant_legacy_reference():
     source_by_id, source_by_name = TenantModelContractPreflightStage.build_source_maps(
         [
@@ -242,7 +264,7 @@ def test_service_migration_preflights_references_before_any_write_stage():
     stages = next(
         value.split(",")
         for value in stage_lists
-        if "tenant_model_contract_preflight" in value
+        if "tenant_model_provider" in value
     )
     assert stages == [
         "tenant_model_contract_preflight",
@@ -596,9 +618,10 @@ def test_tabular_structure_discovery_migration_runs_before_backend_start():
     assert "--backfill-tabular-structure-index" in source
     ddl = source.index("--stages tabular_structure_discovery_index")
     backfill = source.index("--backfill-tabular-structure-index")
-    model_contract = source.index("--stages tenant_model_contract_preflight")
+    model_preflight = source.index("--stages tenant_model_contract_preflight ")
+    model_contract = source.index("--stages tenant_model_contract_preflight,")
     version_marker = source.index("--mark-database-version")
-    assert ddl < backfill < model_contract < version_marker
+    assert model_preflight < ddl < backfill < model_contract < version_marker
     assert source.count('--config "$CONFIG"') >= 3
 
 
