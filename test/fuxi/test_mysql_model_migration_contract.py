@@ -272,6 +272,94 @@ def test_foundation_contract_matches_authoritative_orm_fields():
     assert MIGRATION_STAGES["tabular_structure_foundation"].COLUMN_CONTRACT == expected
 
 
+@pytest.fixture
+def isolated_model_mysql():
+    socket = os.getenv("FUXI_ADR039_MYSQL_INTEGRATION_SOCKET")
+    if not socket:
+        pytest.skip("explicit isolated MySQL socket is not configured")
+    name = "fuxi_model_fixture_" + uuid.uuid4().hex
+    admin = MigrationDatabase(MigrationConfig(database="mysql"))
+    admin.db.connect_params["unix_socket"] = socket
+    admin.connect()
+    database = None
+    try:
+        admin.execute_sql(f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4")
+        database = MigrationDatabase(MigrationConfig(database=name))
+        database.db.connect_params["unix_socket"] = socket
+        database.connect()
+        yield database
+    finally:
+        if database is not None:
+            database.close()
+        admin.execute_sql(f"DROP DATABASE IF EXISTS `{name}`")
+        admin.close()
+
+
+def test_complete_legacy_model_chain_preserves_owners_endpoints_and_identities(isolated_model_mysql):
+    db = isolated_model_mysql
+    db.execute_sql("CREATE TABLE tenant_llm (id INT PRIMARY KEY, tenant_id VARCHAR(32), "
+                   "llm_factory VARCHAR(128), llm_name VARCHAR(128), model_type VARCHAR(16), "
+                   "api_key TEXT, api_base TEXT, max_tokens INT, status CHAR(1))")
+    db.execute_sql("CREATE TABLE tenant (id VARCHAR(32) PRIMARY KEY, tenant_llm_id INT, "
+                   "tenant_embd_id INT, tenant_rerank_id INT)")
+    db.execute_sql("CREATE TABLE knowledgebase (id VARCHAR(32) PRIMARY KEY, tenant_id VARCHAR(32), "
+                   "status CHAR(1), embd_id VARCHAR(256), tenant_embd_id INT)")
+    db.execute_sql("CREATE TABLE dialog (id VARCHAR(32) PRIMARY KEY, tenant_id VARCHAR(32), tenant_llm_id INT)")
+    db.execute_sql("CREATE TABLE document (id VARCHAR(32) PRIMARY KEY, kb_id VARCHAR(32))")
+    db.execute_sql("CREATE TABLE file (id VARCHAR(32) PRIMARY KEY)")
+    models = [
+        (1, "tenant-a", "OpenAI-API-Compatible", "bge-large-zh-v1.5", "embedding", "customer", "https://customer.example.invalid/v1", 8192, "1"),
+        (2, "tenant-a", "OpenAI-API-Compatible", "BAAI/bge-reranker-v2-m3", "rerank", "rerank", "https://rerank.example.invalid/v1", 8192, "1"),
+        (3, "tenant-a", "OpenAI-API-Compatible", "qwen3.6-plus", "chat", "chat", "https://chat.example.invalid/v1", 8192, "1"),
+        (4, "tenant-a", "OpenAI-API-Compatible", "text-embedding-v3", "embedding", "chat", "https://chat.example.invalid/v1", 8192, "1"),
+        (5, "tenant-a", "Tongyi-Qianwen", "qwen-turbo", "chat", "chat", "https://chat.example.invalid/v1", 8192, "1"),
+        (6, "tenant-b", "OpenAI-API-Compatible", "bge-large-zh-v1.5", "embedding", "disabled", "https://customer.example.invalid/v1", 8192, "0"),
+    ]
+    for row in models:
+        db.execute_sql("INSERT INTO tenant_llm VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", row)
+    db.execute_sql("INSERT INTO tenant VALUES ('tenant-a',3,1,2),('tenant-b',NULL,NULL,NULL)")
+    db.execute_sql("INSERT INTO knowledgebase VALUES "
+                   "('kb-active','tenant-a','1','bge-large-zh-v1.5@OpenAI-API-Compatible',1),"
+                   "('kb-disabled','tenant-a','0','BAAI/bge-large-zh-v1.5@OpenAI-API-Compatible',NULL)")
+    db.execute_sql("INSERT INTO dialog VALUES ('dialog-a','tenant-a',3)")
+    db.execute_sql("INSERT INTO document VALUES ('doc-a','kb-active'),('doc-b','kb-active')")
+    db.execute_sql("INSERT INTO file VALUES ('file-a'),('file-b')")
+    def identities():
+        return {table: db.execute_sql(f"SELECT id FROM `{table}` ORDER BY id").fetchall()
+                for table in ("tenant", "knowledgebase", "document", "file", "tenant_llm")}
+    baseline = identities()
+    legacy_rows = db.execute_sql("SELECT * FROM tenant_llm ORDER BY id").fetchall()
+    before_tables = db.execute_sql("SHOW TABLES").fetchall()
+    with pytest.raises(RuntimeError, match="legacy tenant model name is unresolved"):
+        TenantModelContractPreflightStage(db, dry_run=False).execute()
+    assert db.execute_sql("SHOW TABLES").fetchall() == before_tables
+    assert identities() == baseline
+    # Synthetic fixture decision only; this does not authorize a customer binding change.
+    db.execute_sql("UPDATE knowledgebase SET embd_id=%s WHERE id='kb-disabled'",
+                   ("bge-large-zh-v1.5@OpenAI-API-Compatible",))
+    stages = ["tenant_model_contract_preflight", "tenant_model_provider", "tenant_model_instance",
+              "tenant_model", "tenant_model_id_migration"]
+    snapshots = []
+    for _ in range(2):
+        for name in stages:
+            stage = MIGRATION_STAGES[name](db, dry_run=False)
+            if stage.check():
+                stage.execute()
+        snapshots.append({table: db.execute_sql(f"SELECT * FROM `{table}` ORDER BY id").fetchall()
+                          for table in ("tenant_model_provider", "tenant_model_instance", "tenant_model", "tenant", "knowledgebase", "dialog")})
+    assert snapshots[0] == snapshots[1]
+    assert identities() == baseline
+    assert db.execute_sql("SELECT * FROM tenant_llm ORDER BY id").fetchall() == legacy_rows
+    assert db.execute_sql("SELECT COUNT(*) FROM tenant_model").fetchone()[0] == 5
+    binding = db.execute_sql("SELECT k.status,p.tenant_id,m.model_name,i.extra "
+                            "FROM knowledgebase k JOIN tenant_model m ON m.id=k.tenant_embd_id "
+                            "JOIN tenant_model_provider p ON p.id=m.provider_id "
+                            "JOIN tenant_model_instance i ON i.id=m.instance_id "
+                            "WHERE k.id='kb-disabled'").fetchone()
+    assert binding[:3] == ("0", "tenant-a", "bge-large-zh-v1.5")
+    assert "https://customer.example.invalid/v1" in binding[3]
+
+
 @pytest.mark.parametrize("drift", [False, True])
 def test_foundation_existing_schema_is_noop_or_rejected_without_ddl(drift):
     stage_class = MIGRATION_STAGES["tabular_structure_foundation"]
