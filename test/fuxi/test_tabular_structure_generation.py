@@ -3697,6 +3697,65 @@ def test_projection_object_inventory_rejects_unknown_historical_manifest_schema(
         )
 
 
+@pytest.mark.parametrize(
+    ("active_generation", "active_index", "expected"),
+    [(False, False, "complete"), (True, False, "pending"),
+     (False, True, "pending"), (True, True, "pending")],
+)
+def test_missing_discovery_state_requires_proven_empty_active_scope(
+    service_module, monkeypatch, active_generation, active_index, expected,
+):
+    import peewee
+
+    test_database = peewee.SqliteDatabase(":memory:")
+
+    class Base(peewee.Model):
+        class Meta:
+            database = test_database
+
+    class Generation(Base):
+        tenant_id = peewee.CharField()
+        kb_id = peewee.CharField()
+        status = peewee.CharField()
+
+    class TableIndex(Base):
+        tenant_id = peewee.CharField()
+        kb_id = peewee.CharField()
+        active = peewee.BooleanField()
+
+    class State(Base):
+        tenant_id = peewee.CharField()
+        kb_id = peewee.CharField()
+
+    test_database.create_tables([Generation, TableIndex, State])
+    Generation.create(tenant_id="other-tenant", kb_id="dataset-a", status="active")
+    Generation.create(tenant_id="tenant-a", kb_id="other-dataset", status="active")
+    Generation.create(tenant_id="tenant-a", kb_id="dataset-a", status="retired")
+    TableIndex.create(tenant_id="tenant-a", kb_id="dataset-a", active=False)
+    if active_generation:
+        Generation.create(tenant_id="tenant-a", kb_id="dataset-a", status="active")
+    if active_index:
+        TableIndex.create(tenant_id="tenant-a", kb_id="dataset-a", active=True)
+    repository = service_module.PeeweeTabularStructureRepository()
+    monkeypatch.setattr(repository, "_models", lambda: (test_database, object, object, Generation, State, TableIndex))
+    try:
+        result = repository.discover_active_tables("tenant-a", "dataset-a", "anonymous", None, 20)
+        assert result == {"index_revision": 0, "backfill_status": expected, "unsafe": False, "records": []}
+        assert State.select().count() == 0, "readonly discovery must not fabricate a completed state"
+    finally:
+        test_database.close()
+
+
+def test_in_memory_missing_state_matches_empty_and_pending_scope(service_module):
+    repository = service_module.InMemoryTabularStructureRepository()
+    result = repository.discover_active_tables("tenant-a", "dataset-a", "anonymous", None, 20)
+    assert result["backfill_status"] == "complete"
+    repository._records["generation-a"] = {"tenant_id": "tenant-a", "kb_id": "dataset-a", "status": "active"}
+    assert repository.discover_active_tables("tenant-a", "dataset-a", "anonymous", None, 20)["backfill_status"] == "pending"
+    repository.mark_backfill_pending("tenant-a", "empty-dataset")
+    assert repository.discover_active_tables("tenant-a", "empty-dataset", "anonymous", None, 20)["backfill_status"] == "pending"
+
+
 def test_peewee_discovery_sql_binds_every_placeholder_in_statement_order(
     service_module,
     monkeypatch,

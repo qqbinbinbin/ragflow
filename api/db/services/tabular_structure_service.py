@@ -511,9 +511,19 @@ class InMemoryTabularStructureRepository:
                     and record["identity_hash"] > last_identity
                 )
             ]
+        backfill_status = self._backfill_status.get(key)
+        if backfill_status is None:
+            active_scope_exists = any(
+                    record["tenant_id"] == tenant_id and record["kb_id"] == dataset_id
+                    and record["status"] == "active" for record in self._records.values()
+                ) or any(
+                    record["tenant_id"] == tenant_id and record["kb_id"] == dataset_id
+                    and record["active"] for record in self._table_index.values()
+                )
+            backfill_status = "pending" if active_scope_exists else "complete"
         return {
             "index_revision": self._dataset_revisions.get(key, 0),
-            "backfill_status": self._backfill_status.get(key, "pending"),
+            "backfill_status": backfill_status,
             "unsafe": unsafe,
             "records": records[:limit],
         }
@@ -1116,9 +1126,21 @@ class PeeweeTabularStructureRepository:
                 DatasetIndexState.kb_id == dataset_id,
             )
             if state is None:
+                # A dataset without Active structure is an empty scope, not a
+                # backfill job. Existing generations or index rows still block.
+                has_active_generation = Generation.select().where(
+                    Generation.tenant_id == tenant_id,
+                    Generation.kb_id == dataset_id,
+                    Generation.status == "active",
+                ).exists()
+                has_active_index = TableIndex.select().where(
+                    TableIndex.tenant_id == tenant_id,
+                    TableIndex.kb_id == dataset_id,
+                    TableIndex.active == True,  # noqa: E712
+                ).exists()
                 return {
                     "index_revision": 0,
-                    "backfill_status": "pending",
+                    "backfill_status": "pending" if has_active_generation or has_active_index else "complete",
                     "unsafe": False,
                     "records": [],
                 }
