@@ -323,21 +323,21 @@ def _active_generation_record(projection, receipt, *, document_id: str):
 def test_successor_runtime_serves_predecessor_active_manifest_and_rows(
     service_module, table_parser, generation_repository, monkeypatch,
 ):
-    predecessor = ("table-producer/v6", "tabular-structure-projection/v6",
-                   "region-producer/v28", "enumeration-rules/v9")
+    predecessor = ("table-producer/v7", "tabular-structure-projection/v7",
+                   "region-producer/v29", "enumeration-rules/v9")
     with monkeypatch.context() as previous:
         for key, value in zip(("PRODUCER_SCHEMA_VERSION", "PROJECTION_VERSION",
                                "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "ENUMERATION_RULE_VERSION"), predecessor):
             previous.setattr(tabular_structure, key, value)
-        previous.setattr(tabular_structure, "PROJECTION_PART_VERSION", "tabular-structure-part/v3")
+        previous.setattr(tabular_structure, "PROJECTION_PART_VERSION", "tabular-structure-part/v4")
         previous.setattr(tabular_structure, "_CURRENT_PROJECTION_CONTRACT", predecessor)
         storage, projection, receipt = _stored_generation(table_parser)
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v29"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v30"
     generation_repository.inject(_active_generation_record(projection, receipt, document_id="document-1"))
     scope = dict(tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
                  producer_generation_ref=projection["producer_generation_ref"], repository=generation_repository)
     manifest = service_module.TabularStructureService.read_active_manifest(storage, **scope)
-    assert manifest["structure_algorithm_version"] == "region-producer/v28"
+    assert manifest["structure_algorithm_version"] == "region-producer/v29"
     assert manifest["tables"] == projection["tables"]
     page = service_module.TabularStructureService.read_generation_rows(
         storage, table_ref=projection["tables"][0]["table_ref"], page_size=100, **scope)
@@ -5423,6 +5423,38 @@ def test_stored_layout_previews_preserve_pages_and_revalidate_every_read(
         storage.objects[key] = original
 
 
+def test_compact_layout_previews_are_lossless_and_reject_unknown_version_before_read(service_module, monkeypatch):
+    service = service_module.TabularStructureService
+    cells = [
+        {"anchor": [1, 1], "span": [1, 1, 1, 2], "value": '{"$ref":0}', "state": "literal"},
+        {"anchor": [2, 1], "span": [2, 1, 2, 1], "value": None, "state": "blank"},
+        {"anchor": [3, 1], "span": [3, 1, 3, 1], "value": "=A1", "state": "formula_unresolved"},
+        {"anchor": [4, 1], "span": [4, 1, 4, 1], "value": False, "state": "literal"},
+    ]
+    projection = {"producer_generation_ref": "generation-a", "source_layouts": [
+        {"object_ref": "layout-a", "sheet_name": "Original title", "cells": cells},
+        {"object_ref": "layout-b", "sheet_name": "Blank geometry", "cells": []},
+    ]}
+    read = MagicMock(return_value=({}, projection))
+    monkeypatch.setattr(service, "_read_generation_projection", read)
+    result = service.read_generation_layout_previews(
+        "storage", page_size=3, preview_transport_version="source-layout-previews-compact/v1",
+        tenant_id="owner", producer_generation_ref="generation-a",
+    )
+    read.assert_called_once_with("storage", tenant_id="owner", producer_generation_ref="generation-a")
+    assert result == {
+        "version": "source-layout-previews-compact/v1", "producer_generation_ref": "generation-a",
+        "pages": [["layout-a", 0, [[c["anchor"], c["span"], c["value"], c["state"]] for c in cells[:3]], 3],
+                  ["layout-b", 0, [], None]],
+    }
+    result["pages"][0][2][0][0][0] = 999
+    assert cells[0]["anchor"] == [1, 1]
+    read.reset_mock()
+    with pytest.raises(ValueError, match="transport"):
+        service.read_generation_layout_previews("storage", preview_transport_version="unknown")
+    read.assert_not_called()
+
+
 def test_layout_previews_share_one_verified_projection_read(service_module, monkeypatch):
     service = service_module.TabularStructureService
     layouts = [{"object_ref": f"layout-{i}", "cells": [{"value": j} for j in range(35)]}
@@ -5794,6 +5826,34 @@ async def test_layout_route_binds_authorization_generation_and_bounds(batch):
     namespace["_authorized_structure_owner"] = lambda *args: (None, {"error": "denied"})
     assert await handler(*arguments) == {"error": "denied"}
     service.read_generation_layout.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_layout_preview_route_forwards_only_the_explicit_supported_compact_version():
+    module = ast.parse(CHUNK_API_PATH.read_text(encoding="utf-8"))
+    route = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef)
+                 and node.name == "list_tabular_structure_layout_previews")
+    route.decorator_list = []
+    read = MagicMock(return_value={"version": "source-layout-previews-compact/v1"})
+    request = SimpleNamespace(args={"generation_ref": "generation", "page_size": "32",
+                                   "preview_transport_version": "source-layout-previews-compact/v1"})
+    namespace = {
+        "_authorized_structure_owner": lambda *args: ("owner", None),
+        "_get_tabular_structure_service": lambda: SimpleNamespace(read_generation_layout_previews=read),
+        "settings": SimpleNamespace(STORAGE_IMPL="storage"), "request": request,
+        "get_result": lambda **args: args, "get_error_data_result": lambda **args: args,
+        "_tabular_structure_error_response": lambda error: {"error": str(error)},
+    }
+    exec(compile(ast.Module(body=[route], type_ignores=[]), str(CHUNK_API_PATH), "exec"), namespace)
+    handler = namespace[route.name]
+    assert await handler("caller", "dataset", "document") == {"data": {"version": "source-layout-previews-compact/v1"}}
+    read.assert_called_once_with("storage", tenant_id="owner", dataset_id="dataset", document_id="document",
+                                 producer_generation_ref="generation", page_size=32,
+                                 preview_transport_version="source-layout-previews-compact/v1")
+    read.reset_mock()
+    request.args["preview_transport_version"] = "unknown"
+    assert "error" in await handler("caller", "dataset", "document")
+    read.assert_not_called()
 
 
 @pytest.mark.asyncio

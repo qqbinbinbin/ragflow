@@ -738,12 +738,16 @@ async def list_tabular_structure_layout_previews(tenant_id, dataset_id, document
         return get_error_data_result(message="`generation_ref` is required")
     try:
         page_size = int(request.args.get("page_size", 32))
+        transport = request.args.get("preview_transport_version")
         if not 1 <= page_size <= 32:
             raise ValueError("invalid layout preview bounds")
+        if transport not in (None, "source-layout-previews-compact/v1"):
+            raise ValueError("invalid layout preview transport")
         data = _get_tabular_structure_service().read_generation_layout_previews(
             settings.STORAGE_IMPL, tenant_id=owner_tenant_id,
             dataset_id=dataset_id, document_id=document_id,
             producer_generation_ref=generation_ref, page_size=page_size,
+            **({"preview_transport_version": transport} if transport else {}),
         )
         return get_result(data=data)
     except Exception as error:

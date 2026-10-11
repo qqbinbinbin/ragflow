@@ -2269,7 +2269,8 @@ class TabularStructureService:
 
     @classmethod
     def read_generation_layout_previews(
-        cls, storage, *, page_size: int = 32, **kwargs,
+        cls, storage, *, page_size: int = 32,
+        preview_transport_version: str | None = None, **kwargs,
     ) -> dict[str, Any]:
         """Read all bounded previews from one authorized, verified snapshot.
 
@@ -2278,11 +2279,21 @@ class TabularStructureService:
         """
         if type(page_size) is not int or not 1 <= page_size <= 32:
             raise ValueError("invalid layout preview bounds")
+        if preview_transport_version not in (None, "source-layout-previews-compact/v1"):
+            raise ValueError("invalid layout preview transport")
         _record, projection = cls._read_generation_projection(storage, **kwargs)
         pages = []
         for layout in projection.get("source_layouts", []):
             total = len(layout["cells"])
             end = min(page_size, total)
+            if preview_transport_version:
+                pages.append([
+                    layout["object_ref"], 0,
+                    [[deepcopy(cell["anchor"]), deepcopy(cell["span"]),
+                      cell["value"], cell["state"]] for cell in layout["cells"][:end]],
+                    end if end < total else None,
+                ])
+                continue
             pages.append({
                 "version": "source-layout-page/v1",
                 "layout": {**{key: deepcopy(value) for key, value in layout.items() if key != "cells"},
@@ -2291,7 +2302,7 @@ class TabularStructureService:
                 "cells": deepcopy(layout["cells"][:end]),
                 "next_cursor": end if end < total else None,
             })
-        return {"version": "source-layout-previews/v1",
+        return {"version": preview_transport_version or "source-layout-previews/v1",
                 "producer_generation_ref": projection["producer_generation_ref"], "pages": pages}
 
     @classmethod
