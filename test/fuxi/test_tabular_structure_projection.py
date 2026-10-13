@@ -87,10 +87,11 @@ def test_ooxml_drawing_does_not_change_cell_or_safety_projection(table_parser, u
         for cell in row:
             cell.border = Border(left=side, right=side, top=side, bottom=side)
     binary = _save_workbook(book)
+    drawing_binary = _workbook_with_unsupported_drawing(binary)
     generation = str(uuid.uuid4())
     expected = build_tabular_structure_projection('source.xlsx', binary, parser=table_parser,
                                                  producer_generation_ref=generation)
-    actual = build_tabular_structure_projection('source.xlsx', _workbook_with_unsupported_drawing(binary),
+    actual = build_tabular_structure_projection('source.xlsx', drawing_binary,
                                                parser=table_parser, producer_generation_ref=generation)
     # Drawing bytes change the source hash, but never the cell membership or verdict.
     summarize = lambda p: [(t['source_total_count'], t['enumeration_status'], t['enumeration_reason'])
@@ -103,7 +104,7 @@ def test_ooxml_drawing_does_not_change_cell_or_safety_projection(table_parser, u
         assert all(t['enumeration_status'] != 'supported_complete' for t in actual['tables'])
     else:
         assert any(t['enumeration_status'] == 'supported_complete' for t in actual['tables'])
-    assert actual['source_sha256'] == hashlib.sha256(_workbook_with_unsupported_drawing(binary)).hexdigest()
+    assert actual['source_sha256'] == hashlib.sha256(drawing_binary).hexdigest()
 
 
 def test_ooxml_cell_reader_preserves_metadata_and_generation_context(table_parser, monkeypatch):

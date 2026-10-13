@@ -2362,6 +2362,36 @@ class TabularStructureService:
         }
 
     @classmethod
+    def read_active_tables(
+        cls,
+        storage,
+        *,
+        table_refs: list[str],
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Return exact table snapshots from one verified active projection."""
+        if (not isinstance(table_refs, list) or not table_refs or
+                len(table_refs) > 40 or
+                any(not isinstance(value, str) or not value or
+                    len(value) > 1024 or any(char.isspace() or unicodedata.category(char) in {'Cc', 'Cf'}
+                                             for char in value) for value in table_refs) or
+                len(set(table_refs)) != len(table_refs)):
+            raise ValueError("invalid indexed table refs")
+        _record, projection = cls._read_projection(storage, **kwargs)
+        by_ref = {item["table_ref"]: item for item in projection["tables"]}
+        if any(table_ref not in by_ref for table_ref in table_refs):
+            raise StructureSnapshotMissing("active indexed table snapshot is missing")
+        return {
+            "transport_version": "indexed-table-snapshots/v1",
+            "producer_generation_ref": projection["producer_generation_ref"],
+            "producer_schema_version": projection["producer_schema_version"],
+            "projection_version": projection["version"],
+            "structure_algorithm_version": projection["structure_algorithm_version"],
+            "enumeration_rule_version": projection["enumeration_rule_version"],
+            "tables": [deepcopy(by_ref[table_ref]) for table_ref in table_refs],
+        }
+
+    @classmethod
     def read_active_rows(
         cls,
         storage,

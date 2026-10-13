@@ -5659,6 +5659,92 @@ def test_active_table_read_returns_only_the_generation_bound_table_metadata(
     }
 
 
+def test_active_table_batch_reads_one_verified_projection_and_exact_targets(
+    service_module, generation_repository, table_parser, monkeypatch,
+):
+    from io import BytesIO
+    from openpyxl import load_workbook
+
+    book = load_workbook(BytesIO(_workbook_bytes(include_note=False)))
+    book.copy_worksheet(book.active).title = 'Second'
+    source = BytesIO()
+    book.save(source)
+    storage, projection, receipt = _stored_generation(table_parser, source_bytes=source.getvalue())
+    cls = service_module.TabularStructureService
+    cls.register_shadow_generation(storage, tenant_id='tenant-owner', dataset_id='dataset-1',
+                                   document_id='document-1', receipt=receipt, repository=generation_repository)
+    scope = dict(tenant_id='tenant-owner', dataset_id='dataset-1', document_id='document-1',
+                 producer_generation_ref=projection['producer_generation_ref'], repository=generation_repository)
+    cls.activate_generation(storage, **scope, expected_active_generation_ref=None)
+    targets = [t['table_ref'] for t in projection['tables'][:2]][::-1]
+    assert len(targets) == 2 and len(projection['tables']) == 3
+    read = MagicMock(wraps=cls._read_projection)
+    monkeypatch.setattr(cls, '_read_projection', read)
+    result = cls.read_active_tables(storage, table_refs=targets, **scope)
+    assert read.call_count == 1
+    assert result['transport_version'] == 'indexed-table-snapshots/v1'
+    assert result['producer_generation_ref'] == projection['producer_generation_ref']
+    assert [t['table_ref'] for t in result['tables']] == targets
+    assert result['tables'] == projection['tables'][:2][::-1]
+    with pytest.raises(service_module.StructureSnapshotMissing):
+        cls.read_active_tables(storage, table_refs=[targets[0], 'missing-table'], **scope)
+    wrong_scope = {**scope, 'tenant_id': 'another-tenant'}
+    with pytest.raises(PermissionError):
+        cls.read_active_tables(storage, table_refs=targets, **wrong_scope)
+    with pytest.raises(service_module.StructureSnapshotChanged):
+        cls.read_active_tables(storage, table_refs=targets,
+                               **{**scope, 'producer_generation_ref': str(uuid.uuid4())})
+    key = ('dataset-1', receipt['manifest_object_name'])
+    storage.objects[key] += b' '
+    with pytest.raises(service_module.StructureSnapshotChanged, match='manifest digest'):
+        cls.read_active_tables(storage, table_refs=targets, **scope)
+
+
+@pytest.mark.parametrize('refs', [[], ['same', 'same'], ['a'] * 41, ['bad\x00ref'], [None], [{}], ['x' * 1025]])
+def test_active_table_batch_invalid_targets_do_not_read_storage(service_module, refs, monkeypatch):
+    read = MagicMock(side_effect=AssertionError('invalid request read storage'))
+    monkeypatch.setattr(service_module.TabularStructureService, '_read_projection', read)
+    with pytest.raises(ValueError):
+        service_module.TabularStructureService.read_active_tables(None, table_refs=refs)
+    read.assert_not_called()
+
+
+@pytest.mark.parametrize('mode', ['valid', 'forged_scope', 'version', 'unauthorized'])
+async def test_active_table_batch_route_keeps_owner_and_exact_request_fields(mode):
+    module = ast.parse(CHUNK_API_PATH.read_text(encoding='utf-8'))
+    route = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef)
+                 and node.name == 'get_active_tabular_structure_tables')
+    route.decorator_list = []
+    service = MagicMock()
+    service.read_active_tables.return_value = {'tables': [{'table_ref': 'table-a'}]}
+    req = {'transport_version': 'indexed-table-snapshots/v1',
+           'generation_ref': 'generation-1', 'table_refs': ['table-a']}
+    if mode == 'forged_scope':
+        req['tenant_id'] = 'other-tenant'
+    if mode == 'version':
+        req['transport_version'] = 'unknown/v2'
+    async def read_json():
+        return req
+    namespace = {
+        '_authorized_structure_owner': lambda *args: ('tenant-owner', {'denied': True} if mode == 'unauthorized' else None),
+        '_get_tabular_structure_service': lambda: service, 'get_request_json': read_json,
+        'settings': SimpleNamespace(STORAGE_IMPL='storage'),
+        'get_error_data_result': lambda **kwargs: {'error': True},
+        '_authorized_document_source_name': lambda *args: 'authorized.xlsx',
+        'get_result': lambda **kwargs: kwargs,
+        '_tabular_structure_error_response': lambda error: {'error': str(error)},
+    }
+    exec(compile(ast.Module(body=[route], type_ignores=[]), str(CHUNK_API_PATH), 'exec'), namespace)
+    result = await namespace[route.name]('caller-tenant', 'dataset-1', 'document-1')
+    if mode == 'valid':
+        service.read_active_tables.assert_called_once_with('storage', tenant_id='tenant-owner',
+            dataset_id='dataset-1', document_id='document-1', producer_generation_ref='generation-1', table_refs=['table-a'])
+        assert result['data']['document_name'] == 'authorized.xlsx'
+    else:
+        service.read_active_tables.assert_not_called()
+        assert result.get('error') or result.get('denied')
+
+
 def test_managed_generation_receipts_preserve_validated_source_identity(
     service_module,
     generation_repository,

@@ -694,6 +694,30 @@ async def get_active_tabular_structure_table(tenant_id, dataset_id, document_id,
         return _tabular_structure_error_response(error)
 
 
+@manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/tables/snapshots", methods=["POST"])  # noqa: E501
+@login_required
+@add_tenant_id_to_kwargs
+async def get_active_tabular_structure_tables(tenant_id, dataset_id, document_id):
+    owner_tenant_id, error = _authorized_structure_owner(tenant_id, dataset_id, document_id)
+    if error:
+        return error
+    req = await get_request_json()
+    if (not isinstance(req, dict) or set(req) != {"transport_version", "generation_ref", "table_refs"} or
+            req.get("transport_version") != "indexed-table-snapshots/v1" or
+            not isinstance(req.get("generation_ref"), str) or not isinstance(req.get("table_refs"), list)):
+        return get_error_data_result(message="invalid indexed table snapshot request")
+    try:
+        data = _get_tabular_structure_service().read_active_tables(
+            settings.STORAGE_IMPL, tenant_id=owner_tenant_id, dataset_id=dataset_id,
+            document_id=document_id, producer_generation_ref=req["generation_ref"],
+            table_refs=req["table_refs"],
+        )
+        data["document_name"] = _authorized_document_source_name(dataset_id, document_id)
+        return get_result(data=data)
+    except Exception as error:
+        return _tabular_structure_error_response(error)
+
+
 @manager.route("/datasets/<dataset_id>/documents/<document_id>/tabular-structure/<table_ref>/rows", methods=["GET"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs
