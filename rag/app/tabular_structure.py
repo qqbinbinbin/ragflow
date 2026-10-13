@@ -30,7 +30,10 @@ from copy import copy
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, time
 from io import BytesIO
+from posixpath import basename, dirname
 from typing import Any
+from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from rag.app.source_layout import source_layout_version_for_contract, validate_source_layout, validate_layout_membership
 
@@ -1531,6 +1534,45 @@ def _formula_cached_result_kinds_from_biff_stream(
     return result
 
 
+def _cell_only_ooxml_binary(binary: bytes) -> bytes:
+    """Decouple cell evidence from DrawingML without changing source identity."""
+    if not binary.startswith(b"PK\x03\x04"):
+        return binary
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    worksheet_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+    replacements = {}
+    with ZipFile(BytesIO(binary)) as source:
+        types = ElementTree.fromstring(source.read("[Content_Types].xml"))
+        for part in types:
+            if part.get("ContentType") != worksheet_type:
+                continue
+            name = part.attrib["PartName"].lstrip("/")
+            sheet = ElementTree.fromstring(source.read(name))
+            drawings = sheet.findall("{" + namespace + "}drawing")
+            for drawing in drawings:
+                sheet.remove(drawing)
+            if drawings:
+                replacements[name] = ElementTree.tostring(sheet, encoding="utf-8")
+            relationships_name = dirname(name) + "/_rels/" + basename(name) + ".rels"
+            if relationships_name not in source.namelist():
+                continue
+            relationships = ElementTree.fromstring(source.read(relationships_name))
+            drawing_relationships = [relation for relation in relationships
+                if relation.get("Type") ==
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"]
+            for relation in drawing_relationships:
+                relationships.remove(relation)
+            if drawing_relationships:
+                replacements[relationships_name] = ElementTree.tostring(relationships, encoding="utf-8")
+        if not replacements:
+            return binary
+        output = BytesIO()
+        with ZipFile(output, "w", ZIP_DEFLATED) as target:
+            for member in source.infolist():
+                target.writestr(member, replacements.get(member.filename, source.read(member)))
+    return output.getvalue()
+
+
 def _formula_coordinates_by_sheet(binary: bytes) -> tuple[list[set[tuple[int, int]]], bool]:
     """Recover formula locations without exposing formula text to projections."""
 
@@ -1553,7 +1595,7 @@ def _formula_coordinates_by_sheet(binary: bytes) -> tuple[list[set[tuple[int, in
     try:
         from openpyxl import load_workbook
 
-        workbook = load_workbook(BytesIO(binary), data_only=False, read_only=False)
+        workbook = load_workbook(BytesIO(_cell_only_ooxml_binary(binary)), data_only=False, read_only=False)
     except Exception:
         return [], False
     result = []
@@ -1595,7 +1637,7 @@ def _formula_values_by_sheet(binary: bytes) -> list[dict[tuple[int, int], str]]:
     try:
         from openpyxl import load_workbook
 
-        workbook = load_workbook(BytesIO(binary), data_only=False, read_only=False)
+        workbook = load_workbook(BytesIO(_cell_only_ooxml_binary(binary)), data_only=False, read_only=False)
     except Exception:
         return []
     result = []
@@ -7602,7 +7644,9 @@ def _build_tabular_structure_projection_with_audit(
         else converted_source_sha256
     )
     source_context = source_context or {}
-    workbook = workbook or source_context.get("workbook") or parser._load_excel_to_workbook(BytesIO(binary))
+    workbook = workbook or source_context.get("workbook") or parser._load_excel_to_workbook(
+        BytesIO(_cell_only_ooxml_binary(binary))
+    )
     selected_sheet_ordinals = None if sheet_ordinals is None else {
         int(sheet_ordinal) for sheet_ordinal in sheet_ordinals
     }

@@ -3,6 +3,8 @@ import json
 import struct
 import uuid
 import types
+from zipfile import ZipFile, ZIP_DEFLATED
+from xml.etree import ElementTree
 from io import BytesIO
 from pathlib import Path
 
@@ -25,6 +27,158 @@ from rag.app.tabular_structure import (
     store_tabular_structure_projection,
     validate_tabular_structure_projection,
 )
+
+
+def _workbook_with_unsupported_drawing(binary):
+    output = BytesIO()
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    drawing = b'''<wsDr xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+      <absoluteAnchor><pos x="0" y="0"/><ext cx="1" cy="1"/>
+      <sp><nvSpPr><cNvPr id="1" name="shape"/><cNvSpPr/></nvSpPr>
+      <spPr><a:custGeom><a:avLst/><a:gdLst/><a:ahLst/>
+      <a:cxnLst><a:cxn ang="16200000"><a:pos x="0" y="0"/></a:cxn></a:cxnLst>
+      <a:rect l="0" t="0" r="1" b="1"/><a:pathLst/></a:custGeom></spPr></sp>
+      <clientData/></absoluteAnchor></wsDr>'''
+    with ZipFile(BytesIO(binary)) as source, ZipFile(output, 'w', ZIP_DEFLATED) as target:
+        for name in source.namelist():
+            value = source.read(name)
+            if name == 'xl/worksheets/sheet1.xml':
+                root = ElementTree.fromstring(value)
+                ElementTree.SubElement(root, '{' + ns + '}drawing', {'{' + rel_ns + '}id': 'drawing'})
+                value = ElementTree.tostring(root)
+            target.writestr(name, value)
+        target.writestr('xl/worksheets/_rels/sheet1.xml.rels',
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="drawing" Type="' + rel_ns + '/drawing" '
+            'Target="/xl/drawings/drawing1.xml"/></Relationships>')
+        target.writestr('xl/drawings/drawing1.xml', drawing)
+    return output.getvalue()
+
+
+def test_ooxml_formula_inventory_is_independent_of_drawing_geometry():
+    book = Workbook()
+    book.active.append(['Code', 'Value', 'Calculated'])
+    book.active.append(['A', 1, '=B2*2'])
+    book.create_sheet('Second').append(['=1+2'])
+    binary = _workbook_with_unsupported_drawing(_save_workbook(book))
+    with pytest.raises(ValueError, match='Unable to read workbook'):
+        load_workbook(BytesIO(binary))
+    assert tabular_structure._formula_coordinates_by_sheet(binary) == ([{(2, 3)}, {(1, 1)}], True)
+    assert tabular_structure._formula_values_by_sheet(binary) == [{(2, 3): '=B2*2'}, {(1, 1): '=1+2'}]
+
+
+@pytest.mark.parametrize('unsafe', ['none', 'hidden_row', 'hidden_column', 'formula'])
+def test_ooxml_drawing_does_not_change_cell_or_safety_projection(table_parser, unsafe):
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['Code', 'Value'])
+    sheet.append(['A', 10])
+    sheet.append(['B', 20])
+    if unsafe == 'hidden_row':
+        sheet.row_dimensions[2].hidden = True
+    if unsafe == 'hidden_column':
+        sheet.column_dimensions['B'].hidden = True
+    if unsafe == 'formula':
+        sheet['B2'] = '=B3*2'
+    side = Side(style='thin')
+    for row in sheet:
+        for cell in row:
+            cell.border = Border(left=side, right=side, top=side, bottom=side)
+    binary = _save_workbook(book)
+    generation = str(uuid.uuid4())
+    expected = build_tabular_structure_projection('source.xlsx', binary, parser=table_parser,
+                                                 producer_generation_ref=generation)
+    actual = build_tabular_structure_projection('source.xlsx', _workbook_with_unsupported_drawing(binary),
+                                               parser=table_parser, producer_generation_ref=generation)
+    # Drawing bytes change the source hash, but never the cell membership or verdict.
+    summarize = lambda p: [(t['source_total_count'], t['enumeration_status'], t['enumeration_reason'])
+                           for t in p['tables']]
+    assert summarize(actual) == summarize(expected)
+    row_content = lambda p: [(r['row_ordinal_int'], r['row_role_kwd'],
+                              r['ordered_fields_list']) for r in p['rows']]
+    assert row_content(actual) == row_content(expected)
+    if unsafe != 'none':
+        assert all(t['enumeration_status'] != 'supported_complete' for t in actual['tables'])
+    else:
+        assert any(t['enumeration_status'] == 'supported_complete' for t in actual['tables'])
+    assert actual['source_sha256'] == hashlib.sha256(_workbook_with_unsupported_drawing(binary)).hexdigest()
+
+
+def test_ooxml_cell_reader_preserves_metadata_and_generation_context(table_parser, monkeypatch):
+    from rag.app.tabular_structure_runtime import _prepare_source_context
+    import sys
+
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['Merged title'])
+    sheet.merge_cells('A1:C1')
+    sheet.append(['Code', 'Value', 'Computed'])
+    sheet.append(['A', 2, '=B3*2'])
+    sheet.row_dimensions[3].hidden = True
+    sheet.column_dimensions['B'].hidden = True
+    sheet['B3'].border = Border(bottom=Side(style='double'))
+    original = _workbook_with_unsupported_drawing(_save_workbook(book))
+    filtered = tabular_structure._cell_only_ooxml_binary(original)
+    with ZipFile(BytesIO(original)) as source, ZipFile(BytesIO(filtered)) as result:
+        assert source.namelist() == result.namelist()
+        for name in source.namelist():
+            if name not in {'xl/worksheets/sheet1.xml', 'xl/worksheets/_rels/sheet1.xml.rels'}:
+                assert source.read(name) == result.read(name)
+    monkeypatch.setitem(sys.modules, 'rag.app.table', types.SimpleNamespace(Excel=lambda: table_parser))
+    context = _prepare_source_context(original)
+    loaded = context['workbook'].active
+    assert str(loaded.merged_cells) == 'A1:C1'
+    assert loaded.row_dimensions[3].hidden is True
+    assert loaded.column_dimensions['B'].hidden is True
+    assert loaded['B3'].border.bottom.style == 'double'
+    assert loaded['B3'].value == 2
+    assert context['formula_coordinates'] == ([{(3, 3)}], True)
+    assert context['formula_values'] == [{(3, 3): '=B3*2'}]
+
+
+def test_ooxml_broken_cell_xml_does_not_become_proven_formula_inventory():
+    book = Workbook()
+    output = BytesIO()
+    with ZipFile(BytesIO(_save_workbook(book))) as source, ZipFile(output, 'w') as target:
+        for name in source.namelist():
+            target.writestr(name, b'<broken' if name == 'xl/worksheets/sheet1.xml' else source.read(name))
+    assert tabular_structure._formula_coordinates_by_sheet(output.getvalue()) == ([], False)
+
+
+def test_uploaded_ooxml_characteristics_keep_all_original_cells(table_parser):
+    source = Path('/opt/fuxi/evidence/local-f515d-diagnosis-20261013t022650039860z-c8b0f326/source.xlsx')
+    if not source.exists():
+        pytest.skip('exact uploaded source unavailable; not acceptance evidence')
+    binary = source.read_bytes()
+    assert hashlib.sha256(binary).hexdigest() == '6d6261a5ff44286f3d945ebf18adfd5d231df929f1f1120dc22c486adab86ff5'
+    original = load_workbook(BytesIO(binary), data_only=True, read_only=True)
+    sheet = original.worksheets[4]
+    with ZipFile(BytesIO(binary)) as archive:
+        root = ElementTree.fromstring(archive.read('xl/worksheets/sheet5.xml'))
+    from openpyxl.utils.cell import range_boundaries
+    merges = [range_boundaries(e.attrib['ref']) for e in root.iter() if e.tag.endswith('}mergeCell')]
+    projection = build_tabular_structure_projection('source.xlsx', binary, parser=table_parser,
+                                                    sheet_ordinals={5})
+    tables = [t for t in projection['tables'] if t['enumeration_status'] == 'supported_complete']
+    assert len(tables) == 1
+    assert tables[0]['source_total_count'] == 9
+    rows = [r for r in projection['rows'] if r['row_role_kwd'] == 'data']
+    assert {r['row_ordinal_int'] for r in rows} == set(range(8, 17))
+    checked = 0
+    for row in rows:
+        for field in json.loads(row['ordered_fields_list']):
+            r, c = row['row_ordinal_int'], int(field['column_id'].rsplit(':', 1)[1])
+            anchor = next(((r1, c1) for c1, r1, c2, r2 in merges
+                           if r1 <= r <= r2 and c1 <= c <= c2), (r, c))
+            value = sheet.cell(*anchor).value
+            expected = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value).strip()
+            assert field['value'] == expected
+            checked += 1
+    assert checked == 54
+    assert projection['source_sha256'] == hashlib.sha256(binary).hexdigest()
+    original.close()
 
 
 @pytest.mark.parametrize("grid_change", ["none", "interior_shared_edges", "open_outer_edge", "missing_header", "body_merge", "row_gap"])

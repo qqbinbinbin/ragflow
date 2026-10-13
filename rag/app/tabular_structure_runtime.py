@@ -257,8 +257,9 @@ def _default_sheet_count(filename: str, binary: bytes) -> int:
 def _load_workbook(binary: bytes):
     from io import BytesIO
     from rag.app.table import Excel
+    from rag.app.tabular_structure import _cell_only_ooxml_binary
 
-    return Excel()._load_excel_to_workbook(BytesIO(binary))
+    return Excel()._load_excel_to_workbook(BytesIO(_cell_only_ooxml_binary(binary)))
 
 
 def _prepare_source_context(binary: bytes) -> dict[str, Any]:
