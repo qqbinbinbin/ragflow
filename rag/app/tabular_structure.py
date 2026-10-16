@@ -39,10 +39,10 @@ from rag.app.source_layout import source_layout_version_for_contract, validate_s
 
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v3"
-PRODUCER_SCHEMA_VERSION = "table-producer/v8"
-PROJECTION_VERSION = "tabular-structure-projection/v8"
+PRODUCER_SCHEMA_VERSION = "table-producer/v9"
+PROJECTION_VERSION = "tabular-structure-projection/v9"
 PROJECTION_PART_VERSION = "tabular-structure-part/v4"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v30"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v31"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v2"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -55,6 +55,15 @@ _RETAINED_SERVING_PROJECTION_CONTRACT = (
     "table-producer/v7", "tabular-structure-projection/v7",
     "region-producer/v29", "enumeration-rules/v9",
 )
+_RETAINED_TITLE_PROJECTION_CONTRACT = (
+    "table-producer/v8", "tabular-structure-projection/v8",
+    "region-producer/v30", "enumeration-rules/v9",
+)
+_SERVING_PROJECTION_CONTRACTS = frozenset({
+    _CURRENT_PROJECTION_CONTRACT,
+    _RETAINED_SERVING_PROJECTION_CONTRACT,
+    _RETAINED_TITLE_PROJECTION_CONTRACT,
+})
 _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
     {
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v10", "enumeration-rules/v3"),
@@ -77,6 +86,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v27", "enumeration-rules/v9"),
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v28", "enumeration-rules/v9"),
         _RETAINED_SERVING_PROJECTION_CONTRACT,
+        _RETAINED_TITLE_PROJECTION_CONTRACT,
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -819,12 +829,15 @@ def _shared_vertical_record_groups(
             ),
             None,
         )
-        if key_merge is None:
-            return None
-        group = (key_merge.min_row, key_merge.max_row)
+        group = (
+            (key_merge.min_row, key_merge.max_row)
+            if key_merge is not None else (row_ordinal, row_ordinal)
+        )
         if not groups or groups[-1] != group:
             groups.append(group)
-    if len(groups) < 2:
+    # A repeated merge pattern proves grouping; an isolated merged identity
+    # among singleton rows can still describe independent physical records.
+    if sum(start < end for start, end in groups) < 2:
         return None
     if any(
         not any(
@@ -851,7 +864,7 @@ def _shared_vertical_record_groups(
                 and merged.max_row > merged.min_row
                 for merged in merged_ranges
             )
-            for group in groups
+            for group in groups if group[0] < group[1]
         )
         for offset in supporting_offsets
     ):
@@ -3540,6 +3553,38 @@ def _record_axis_evidence(
             rows = grouped_candidate_rows
             note_rows = [*note_rows, *grouped_tail_notes]
             grouped_tail_notes = []
+
+        # Prove grouped identity before classifying a trailing legend/sign-off.
+        # Expanded merge keys repeat, so scalar uniqueness cannot prove this
+        # prefix. The whole prefix must close independently of the footer.
+        if unknown_rows and len(headers) > 1:
+            prefix_offsets = set.intersection(*(
+                set(_record_field_offsets(values, row_ordinal=ordinal, merged_ranges=merged_ranges))
+                for ordinal, values, _gap in grouped_candidate_rows
+            ))
+            prefix_groups = _shared_vertical_record_groups(
+                grouped_candidate_rows, prefix_offsets, merged_ranges,
+            )
+            suffix = sorted([*unknown_rows, *grouped_tail_notes], key=lambda row: row[0])
+            suffix_ordinals = [grouped_candidate_rows[-1][0], *(row[0] for row in suffix)]
+            if (
+                prefix_groups is not None
+                and grouped_candidate_rows[-1][0] < suffix[0][0]
+                and all(_is_full_width_merge(row[0], len(headers), merged_ranges) for row in unknown_rows)
+                and all(
+                    _record_key_numeric_value(values[key_offset] if key_offset < len(values) else None) is None
+                    for _ordinal, values, _gap in suffix
+                )
+                and all(
+                    _record_rows_are_semantically_adjacent(left, right, len(headers), merged_ranges)
+                    for left, right in zip(suffix_ordinals, suffix_ordinals[1:])
+                )
+            ):
+                rows = grouped_candidate_rows
+                note_rows = [*note_rows, *suffix]
+                unknown_rows = ()
+                grouped_tail_notes = []
+                grouping_allowed = True
 
         # Full-width rows removed from the candidate axis can separate its
         # numeric prefix from a final multi-field context row. Reconcile this
@@ -9242,7 +9287,7 @@ def load_tabular_structure_projection_for_serving(
         producer_generation_ref=producer_generation_ref,
         manifest_object_name=manifest_object_name, manifest_sha256=manifest_sha256,
         expected_part_count=expected_part_count, tenant_id=tenant_id,
-        accepted_contracts=frozenset({_CURRENT_PROJECTION_CONTRACT, _RETAINED_SERVING_PROJECTION_CONTRACT}),
+        accepted_contracts=_SERVING_PROJECTION_CONTRACTS,
     )
 
 
@@ -9285,7 +9330,7 @@ def page_tabular_structure_rows(
     contract = tuple(projection.get(key) for key in (
         "producer_schema_version", "version", "structure_algorithm_version", "enumeration_rule_version",
     ))
-    if contract not in {_CURRENT_PROJECTION_CONTRACT, _RETAINED_SERVING_PROJECTION_CONTRACT}:
+    if contract not in _SERVING_PROJECTION_CONTRACTS:
         raise ValueError("unsupported serving projection contract")
     _validate_tabular_structure_projection_for_contract(projection, contract)
     if not isinstance(table_ref, str) or not table_ref:

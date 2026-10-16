@@ -320,11 +320,15 @@ def _active_generation_record(projection, receipt, *, document_id: str):
     }
 
 
+@pytest.mark.parametrize("predecessor", [
+    ("table-producer/v7", "tabular-structure-projection/v7",
+     "region-producer/v29", "enumeration-rules/v9"),
+    ("table-producer/v8", "tabular-structure-projection/v8",
+     "region-producer/v30", "enumeration-rules/v9"),
+])
 def test_successor_runtime_serves_predecessor_active_manifest_and_rows(
-    service_module, table_parser, generation_repository, monkeypatch,
+    service_module, table_parser, generation_repository, monkeypatch, predecessor,
 ):
-    predecessor = ("table-producer/v7", "tabular-structure-projection/v7",
-                   "region-producer/v29", "enumeration-rules/v9")
     with monkeypatch.context() as previous:
         for key, value in zip(("PRODUCER_SCHEMA_VERSION", "PROJECTION_VERSION",
                                "STRUCTURE_PRODUCER_ALGORITHM_VERSION", "ENUMERATION_RULE_VERSION"), predecessor):
@@ -332,12 +336,12 @@ def test_successor_runtime_serves_predecessor_active_manifest_and_rows(
         previous.setattr(tabular_structure, "PROJECTION_PART_VERSION", "tabular-structure-part/v4")
         previous.setattr(tabular_structure, "_CURRENT_PROJECTION_CONTRACT", predecessor)
         storage, projection, receipt = _stored_generation(table_parser)
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v30"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v31"
     generation_repository.inject(_active_generation_record(projection, receipt, document_id="document-1"))
     scope = dict(tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
                  producer_generation_ref=projection["producer_generation_ref"], repository=generation_repository)
     manifest = service_module.TabularStructureService.read_active_manifest(storage, **scope)
-    assert manifest["structure_algorithm_version"] == "region-producer/v29"
+    assert manifest["structure_algorithm_version"] == predecessor[2]
     assert manifest["tables"] == projection["tables"]
     page = service_module.TabularStructureService.read_generation_rows(
         storage, table_ref=projection["tables"][0]["table_ref"], page_size=100, **scope)

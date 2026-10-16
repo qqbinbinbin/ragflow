@@ -22,6 +22,10 @@ SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT = (
     "table-producer/v8", "tabular-structure-projection/v8",
     "region-producer/v30", "enumeration-rules/v9",
 )
+SOURCE_LAYOUT_MIXED_RECORD_PROJECTION_CONTRACT = (
+    "table-producer/v9", "tabular-structure-projection/v9",
+    "region-producer/v31", "enumeration-rules/v9",
+)
 
 
 def source_layout_version_for_contract(contract):
@@ -29,6 +33,7 @@ def source_layout_version_for_contract(contract):
     return {
         SOURCE_LAYOUT_PROJECTION_CONTRACT: "source-layout/v1",
         SOURCE_LAYOUT_TITLE_PROJECTION_CONTRACT: "source-layout/v2",
+        SOURCE_LAYOUT_MIXED_RECORD_PROJECTION_CONTRACT: "source-layout/v2",
     }.get(contract)
 
 

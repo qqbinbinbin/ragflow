@@ -1287,10 +1287,10 @@ def test_utf8_bounded_context_cannot_end_with_truncated_whitespace():
 
 def test_current_producer_versions_invalidate_pre_enumeration_generations():
     assert tabular_structure.TABULAR_STRUCTURE_VERSION == "tabular-row/v3"
-    assert PRODUCER_SCHEMA_VERSION == "table-producer/v8"
-    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v8"
+    assert PRODUCER_SCHEMA_VERSION == "table-producer/v9"
+    assert tabular_structure.PROJECTION_VERSION == "tabular-structure-projection/v9"
     assert tabular_structure.PROJECTION_PART_VERSION == "tabular-structure-part/v4"
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v30"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v31"
     assert tabular_structure.ENUMERATION_RULE_VERSION == "enumeration-rules/v9"
 
 
@@ -8123,6 +8123,210 @@ def test_group_axis_cannot_prove_ownership_from_adjacency_alone(defect):
     assert tabular_structure._shared_vertical_record_groups(rows, {0, 1, 2}, merges) is None
 
 
+@pytest.mark.parametrize("lengths", [(2, 1, 3, 1), (1, 2, 1, 2), (2, 2, 2)])
+def test_mixed_vertical_and_singleton_groups_keep_source_ownership(lengths):
+    from openpyxl.worksheet.cell_range import CellRange
+
+    rows, merges, anchors, owners = [], [], [], {}
+    for sequence, length in enumerate(lengths, 1):
+        anchor = 4 + len(rows)
+        anchors.append(anchor)
+        if length > 1:
+            merges.extend(CellRange(min_col=c, max_col=c, min_row=anchor,
+                                    max_row=anchor + length - 1) for c in (1, 2))
+        for offset in range(length):
+            ordinal = anchor + offset
+            rows.append((ordinal, [sequence, f"Item {sequence}", f"Detail {ordinal}", "OK"], False))
+            if offset:
+                owners[ordinal] = anchor
+    proof = tabular_structure._record_axis_evidence(
+        ["Identifier", "Process", "Characteristic", "Limit"], rows, merges,
+    )
+    assert proof is not None
+    assert proof["record_key_axis_proven"] is True
+    assert proof["record_row_ordinals"] == tuple(anchors)
+    assert proof["group_parent_row_ordinals"] == owners
+
+
+@pytest.mark.parametrize("defect", ["unshared_dimension", "missing_detail", "duplicate_singleton",
+                                   "conflicting_child_key", "crossing_dimension", "one_group_only"])
+def test_mixed_group_proof_rejects_ambiguous_record_ownership(defect):
+    from openpyxl.worksheet.cell_range import CellRange
+
+    rows = [(2, [1, "A", "a"], False), (3, [1, "A", "b"], False),
+            (4, [2, "B", "c"], False), (5, [2, "B", "d"], False),
+            (6, [3, "C", "e"], False), (7, [4, "D", "f"], False)]
+    merges = [CellRange("A2:A3"), CellRange("B2:B3"), CellRange("A4:A5"), CellRange("B4:B5")]
+    if defect == "unshared_dimension":
+        merges.pop()
+    elif defect == "missing_detail":
+        rows.pop(1)
+    elif defect == "duplicate_singleton":
+        rows[-1][1][0] = 3
+    elif defect == "conflicting_child_key":
+        rows[1][1][0] = 9
+    elif defect == "crossing_dimension":
+        merges[-1] = CellRange("B4:B6")
+    elif defect == "one_group_only":
+        rows = [*rows[:2], *rows[4:]]
+        merges = merges[:2]
+    # A single merge amid independent rows does not establish a repeated
+    # grouping layout; retain the pre-existing physical-record interpretation.
+    assert tabular_structure._shared_vertical_record_groups(rows, {0, 1, 2}, merges) is None
+
+
+@pytest.mark.parametrize("defect", ["numeric_footer", "record_after_legend", "internal_legend", "missing_group_row"])
+def test_grouped_footer_cannot_discard_unresolved_source_records(defect):
+    from openpyxl.worksheet.cell_range import CellRange
+
+    rows = [(2, [1, "A", "a"], False), (3, [1, "A", "b"], False),
+            (4, [2, "B", "c"], False), (5, [2, "B", "d"], False),
+            (6, [3, "C", "e"], False), (7, ["Legend"] * 3, False),
+            (8, ["Definition"] * 3, False), (9, ["Prepared", None, "Reviewed"], False)]
+    merges = [CellRange(span) for span in ("A2:A3", "B2:B3", "A4:A5", "B4:B5", "A7:C7", "A8:C8")]
+    if defect == "numeric_footer":
+        rows[-1][1][0] = 4
+    elif defect == "record_after_legend":
+        rows.append((10, [4, "D", "f"], False))
+    elif defect == "internal_legend":
+        rows[2] = (4, ["Unresolved"] * 3, False)
+        merges = [m for m in merges if m.min_row != 4] + [CellRange("A4:C4")]
+    else:
+        rows.pop(1)
+    proof = tabular_structure._record_axis_evidence(["Identifier", "Process", "Limit"], rows, merges)
+    assert proof is None or proof["unknown_row_ordinals"] or not proof["record_key_axis_proven"]
+
+
+def _mixed_group_context_and_footer_workbook(footer, *, crossing_context=False):
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Anonymous register"
+    sheet["A2"] = "Register title"
+    sheet.merge_cells("A2:H3")
+    for coordinate, value in {"A4": "Supplier", "C4": "Company A", "E4": "Part", "H4": "Assembly",
+                              "A5": "Project", "C5": "Project Q", "E5": "Identifier", "H5": "Code-X"}.items():
+        sheet[coordinate] = value
+    for row in (4, 5):
+        if crossing_context:
+            sheet.cell(row, 7, sheet.cell(row, 8).value)
+            sheet.cell(row, 8).value = None
+        spans = ((1, 2), (3, 4), (5, 6), (7, 8)) if crossing_context else ((1, 2), (3, 4), (5, 7))
+        for first, last in spans:
+            sheet.merge_cells(start_row=row, end_row=row, start_column=first, end_column=last)
+    sheet["J4"] = "Navigation"
+    sheet["A6"] = "Category"
+    sheet.merge_cells("A6:H6")
+    for coordinate, value in {"A7": "Code-X", "B7": "Process", "C7": "Description",
+                              "C8": "Product", "D8": "Manufacturing", "E7": "Class",
+                              "F7": "Limit", "H7": "Notes"}.items():
+        sheet[coordinate] = value
+    for merge in ("A7:A8", "B7:B8", "C7:D7", "E7:E8", "F7:G8", "H7:H8"):
+        sheet.merge_cells(merge)
+    for key, (first, last) in enumerate(((9, 10), (11, 12), (13, 14), (15, 15),
+                                        (16, 16), (17, 17), (18, 18)), 1):
+        sheet.cell(first, 1, key)
+        sheet.cell(first, 2, f"Process {key}")
+        if first != last:
+            for column in (1, 2):
+                sheet.merge_cells(start_row=first, end_row=last, start_column=column, end_column=column)
+        for row in range(first, last + 1):
+            sheet.cell(row, 3, f"Detail {row}")
+            sheet.cell(row, 5, "C")
+            sheet.cell(row, 6, f"Limit {row}")
+            sheet.merge_cells(start_row=row, end_row=row, start_column=6, end_column=7)
+    if footer in ("legend", "legend_and_signoff"):
+        for row, value in ((19, "Legend"), (20, "Definitions")):
+            sheet.cell(row, 1, value)
+            sheet.merge_cells(start_row=row, end_row=row, start_column=1, end_column=8)
+    if footer in ("signoff", "legend_and_signoff"):
+        sheet["A21"], sheet["C21"], sheet["E21"] = "Prepared", "Reviewed", "Approved"
+    return book
+
+
+@pytest.mark.parametrize("footer", ["none", "legend", "signoff", "legend_and_signoff"])
+@pytest.mark.parametrize("crossing_context", [False, True])
+def test_mixed_group_projection_preserves_body_header_and_footer(table_parser, footer, crossing_context):
+    book = _mixed_group_context_and_footer_workbook(footer, crossing_context=crossing_context)
+    sheet = book.active
+    projection = build_tabular_structure_projection("anonymous.xlsx", _save_workbook(book), parser=table_parser)
+    complete = [t for t in projection["tables"] if t["enumeration_status"] == "supported_complete"]
+    assert len(complete) == 1
+    table = complete[0]
+    assert table["source_total_count"] == 7
+    rows = [r for r in projection["rows"] if r["table_ref_kwd"] == table["table_ref"]]
+    by_ordinal = {r["row_ordinal_int"]: r for r in rows}
+    anchors = [9, 11, 13, 15, 16, 17, 18]
+    assert [r["row_ordinal_int"] for r in rows if r["row_role_kwd"] == "data"] == anchors
+    for child, parent in ((10, 9), (12, 11), (14, 13)):
+        assert by_ordinal[child]["row_role_kwd"] == "note"
+        assert by_ordinal[child]["parent_record_row_ref_kwd"] == by_ordinal[parent]["row_ref_kwd"]
+    for ordinal in range(9, 19):
+        values = {int(f["column_id"].rsplit(":", 1)[1]): f["value"]
+                  for f in json.loads(by_ordinal[ordinal]["ordered_fields_list"])}
+        assert values[3] == sheet.cell(ordinal, 3).value
+        assert values[6] == sheet.cell(ordinal, 6).value
+    merges = list(sheet.merged_cells.ranges)
+    for column in table["ordered_columns"]:
+        ordinal = int(column["column_id"].rsplit(":", 1)[1])
+        # Aligned populated spans can be legitimate parent levels. Strip them
+        # only with the existing crossing-merge proof, never business labels.
+        first_header_row = 6 if crossing_context else 2
+        allowed = {str(tabular_structure._cell_value(table_parser, sheet, row, ordinal, merges)).strip()
+                   for row in range(first_header_row, 9)}
+        assert set(column["header_path"]) <= allowed
+        leaf_values = {str(tabular_structure._cell_value(table_parser, sheet, row, ordinal, merges)).strip()
+                       for row in (7, 8)}
+        assert column["header_path"][-1] in leaf_values
+    if not crossing_context:
+        assert table["ordered_columns"][0]["header_path"] == [
+            "Register title", "Supplier", "Project", "Category", "Code-X",
+        ]
+    else:
+        assert table["ordered_columns"][0]["header_path"] == ["Category", "Code-X"]
+    for ordinal in (19, 20, 21):
+        if ordinal in by_ordinal:
+            assert by_ordinal[ordinal]["row_role_kwd"] == "note"
+            assert by_ordinal[ordinal]["parent_record_row_ref_kwd"] is None
+    validate_tabular_structure_projection(projection)
+
+
+def test_uploaded_mixed_characteristics_preserve_each_source_cell_and_group(table_parser):
+    source = Path('/opt/fuxi/evidence/f515-ptc-producer-record-axis-20261016t013452235667z-26328870/source.private.xls')
+    if not source.exists():
+        pytest.skip('exact uploaded source unavailable; not acceptance evidence')
+    binary = source.read_bytes()
+    assert hashlib.sha256(binary).hexdigest() == '7b247b415ffde272f54ce49b5ddde85ed5dc6ab2317af2578fb144686e63fe85'
+    from python_calamine import CalamineWorkbook
+
+    original = CalamineWorkbook.from_path(str(source)).get_sheet_by_index(9).to_python(skip_empty_area=False)
+    projection = build_tabular_structure_projection('source.xls', binary, parser=table_parser,
+                                                     sheet_ordinals={10})
+    complete = [t for t in projection['tables'] if t['enumeration_status'] == 'supported_complete']
+    assert len(complete) == 1
+    table = complete[0]
+    assert table['source_total_count'] == 7
+    rows = {r['row_ordinal_int']: r for r in projection['rows'] if r['table_ref_kwd'] == table['table_ref']}
+    assert [ordinal for ordinal, row in rows.items() if row['row_role_kwd'] == 'data'] == [9, 11, 13, 15, 16, 17, 18]
+    for child, parent in ((10, 9), (12, 11), (14, 13)):
+        assert rows[child]['row_role_kwd'] == 'note'
+        assert rows[child]['parent_record_row_ref_kwd'] == rows[parent]['row_ref_kwd']
+    checked = 0
+    for ordinal in range(9, 19):
+        fields = {int(f['column_id'].rsplit(':', 1)[1]): f['value']
+                  for f in json.loads(rows[ordinal]['ordered_fields_list'])}
+        for column, value in enumerate(original[ordinal - 1][:8], 1):
+            if value is None or value == '':
+                continue
+            expected = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value).strip()
+            assert fields.get(column) == expected, (ordinal, column)
+            checked += 1
+    assert checked == 44
+    for ordinal in (19, 20, 21):
+        if ordinal in rows:
+            assert rows[ordinal]['row_role_kwd'] == 'note'
+            assert rows[ordinal]['parent_record_row_ref_kwd'] is None
+
+
 def test_shared_vertical_record_group_keeps_detail_rows_out_of_the_record_count(table_parser):
     workbook = Workbook()
     sheet = workbook.active
@@ -8709,7 +8913,7 @@ def test_table_parser_exposes_the_projection_producer_without_using_chunk_output
 
     projection = table.build_structure_projection("anonymous.xlsx", _workbook_bytes())
 
-    assert projection["version"] == "tabular-structure-projection/v8"
+    assert projection["version"] == "tabular-structure-projection/v9"
     assert projection["rows"]
     assert all("content_with_weight" not in row for row in projection["rows"])
 

@@ -68,6 +68,26 @@ def read_named(value):
     )
 
 
+def test_mixed_record_successor_retains_exact_released_layout_contracts():
+    from rag.app import tabular_structure
+
+    current = ("table-producer/v9", "tabular-structure-projection/v9",
+               "region-producer/v31", "enumeration-rules/v9")
+    assert tabular_structure._CURRENT_PROJECTION_CONTRACT == current
+    resolve = contract().source_layout_version_for_contract
+    assert resolve(current) == "source-layout/v2"
+    for algorithm in ("region-producer/v30", "region-producer/v29"):
+        schema = "8" if algorithm.endswith("30") else "7"
+        released = ("table-producer/v" + schema,
+                    "tabular-structure-projection/v" + schema, algorithm,
+                    "enumeration-rules/v9")
+        assert released in tabular_structure._KNOWN_BACKFILL_PROJECTION_CONTRACTS
+        assert released in tabular_structure._SERVING_PROJECTION_CONTRACTS
+        assert resolve(released) == ("source-layout/v2" if schema == "8" else "source-layout/v1")
+    assert resolve((*current[:2], "region-producer/v32", current[3])) is None
+    assert resolve(("table-producer/v7", *current[1:])) is None
+
+
 @pytest.mark.parametrize("title", ["Declaration", "申报表（修订版）", "  原始名称  ", "e\u0301"])
 def test_named_layout_preserves_exact_source_title(title):
     value = named_layout(title)

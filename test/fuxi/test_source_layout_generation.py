@@ -77,7 +77,7 @@ def test_released_default_emits_source_layout_and_keeps_predecessor_readable(mon
         "anonymous.xlsx", stream.getvalue(), parser=_load_table_module(monkeypatch).Excel(),
     )
     assert projection.get("source_layouts"), "released default must emit original form context"
-    assert projection["structure_algorithm_version"] == "region-producer/v30"
+    assert projection["structure_algorithm_version"] == "region-producer/v31"
     assert {layout["version"] for layout in projection["source_layouts"]} == {"source-layout/v2"}
     assert {layout["sheet_name"] for layout in projection["source_layouts"]} == {book.active.title}
     assert producer._RETAINED_SERVING_PROJECTION_CONTRACT == (
