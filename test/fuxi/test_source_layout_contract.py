@@ -68,23 +68,30 @@ def read_named(value):
     )
 
 
-def test_mixed_record_successor_retains_exact_released_layout_contracts():
+def test_header_role_successor_retains_exact_released_layout_contracts():
     from rag.app import tabular_structure
 
-    current = ("table-producer/v9", "tabular-structure-projection/v9",
-               "region-producer/v31", "enumeration-rules/v9")
+    current = ("table-producer/v10", "tabular-structure-projection/v10",
+               "region-producer/v32", "enumeration-rules/v9")
     assert tabular_structure._CURRENT_PROJECTION_CONTRACT == current
     resolve = contract().source_layout_version_for_contract
     assert resolve(current) == "source-layout/v2"
-    for algorithm in ("region-producer/v30", "region-producer/v29"):
-        schema = "8" if algorithm.endswith("30") else "7"
+    for algorithm, schema in (("region-producer/v31", "9"),
+                              ("region-producer/v30", "8"),
+                              ("region-producer/v29", "7")):
         released = ("table-producer/v" + schema,
                     "tabular-structure-projection/v" + schema, algorithm,
                     "enumeration-rules/v9")
         assert released in tabular_structure._KNOWN_BACKFILL_PROJECTION_CONTRACTS
         assert released in tabular_structure._SERVING_PROJECTION_CONTRACTS
-        assert resolve(released) == ("source-layout/v2" if schema == "8" else "source-layout/v1")
-    assert resolve((*current[:2], "region-producer/v32", current[3])) is None
+        assert resolve(released) == ("source-layout/v1" if schema == "7" else "source-layout/v2")
+        for index in range(4):
+            if current[index] == released[index]:
+                continue
+            mixed = list(current)
+            mixed[index] = released[index]
+            assert resolve(tuple(mixed)) is None
+    assert resolve((*current[:2], "region-producer/v31", current[3])) is None
     assert resolve(("table-producer/v7", *current[1:])) is None
 
 

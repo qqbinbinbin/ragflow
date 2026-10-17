@@ -325,6 +325,8 @@ def _active_generation_record(projection, receipt, *, document_id: str):
      "region-producer/v29", "enumeration-rules/v9"),
     ("table-producer/v8", "tabular-structure-projection/v8",
      "region-producer/v30", "enumeration-rules/v9"),
+    ("table-producer/v9", "tabular-structure-projection/v9",
+     "region-producer/v31", "enumeration-rules/v9"),
 ])
 def test_successor_runtime_serves_predecessor_active_manifest_and_rows(
     service_module, table_parser, generation_repository, monkeypatch, predecessor,
@@ -336,7 +338,7 @@ def test_successor_runtime_serves_predecessor_active_manifest_and_rows(
         previous.setattr(tabular_structure, "PROJECTION_PART_VERSION", "tabular-structure-part/v4")
         previous.setattr(tabular_structure, "_CURRENT_PROJECTION_CONTRACT", predecessor)
         storage, projection, receipt = _stored_generation(table_parser)
-    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v31"
+    assert tabular_structure.STRUCTURE_PRODUCER_ALGORITHM_VERSION == "region-producer/v32"
     generation_repository.inject(_active_generation_record(projection, receipt, document_id="document-1"))
     scope = dict(tenant_id="tenant-owner", dataset_id="dataset-1", document_id="document-1",
                  producer_generation_ref=projection["producer_generation_ref"], repository=generation_repository)

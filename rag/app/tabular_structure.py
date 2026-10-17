@@ -39,10 +39,10 @@ from rag.app.source_layout import source_layout_version_for_contract, validate_s
 
 
 TABULAR_STRUCTURE_VERSION = "tabular-row/v3"
-PRODUCER_SCHEMA_VERSION = "table-producer/v9"
-PROJECTION_VERSION = "tabular-structure-projection/v9"
+PRODUCER_SCHEMA_VERSION = "table-producer/v10"
+PROJECTION_VERSION = "tabular-structure-projection/v10"
 PROJECTION_PART_VERSION = "tabular-structure-part/v4"
-STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v31"
+STRUCTURE_PRODUCER_ALGORITHM_VERSION = "region-producer/v32"
 ENUMERATION_RULE_VERSION = "enumeration-rules/v9"
 ROW_PAGE_TRANSPORT_VERSION = "tabular-row-page-compact/v2"
 _CURRENT_PROJECTION_CONTRACT = (
@@ -59,10 +59,15 @@ _RETAINED_TITLE_PROJECTION_CONTRACT = (
     "table-producer/v8", "tabular-structure-projection/v8",
     "region-producer/v30", "enumeration-rules/v9",
 )
+_RETAINED_MIXED_RECORD_PROJECTION_CONTRACT = (
+    "table-producer/v9", "tabular-structure-projection/v9",
+    "region-producer/v31", "enumeration-rules/v9",
+)
 _SERVING_PROJECTION_CONTRACTS = frozenset({
     _CURRENT_PROJECTION_CONTRACT,
     _RETAINED_SERVING_PROJECTION_CONTRACT,
     _RETAINED_TITLE_PROJECTION_CONTRACT,
+    _RETAINED_MIXED_RECORD_PROJECTION_CONTRACT,
 })
 _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
     {
@@ -87,6 +92,7 @@ _KNOWN_BACKFILL_PROJECTION_CONTRACTS = frozenset(
         ("table-producer/v6", "tabular-structure-projection/v6", "region-producer/v28", "enumeration-rules/v9"),
         _RETAINED_SERVING_PROJECTION_CONTRACT,
         _RETAINED_TITLE_PROJECTION_CONTRACT,
+        _RETAINED_MIXED_RECORD_PROJECTION_CONTRACT,
         _CURRENT_PROJECTION_CONTRACT,
     }
 )
@@ -2123,6 +2129,11 @@ def _parse_region_structure(parser, worksheet, rows):
                 or len(candidate[9]) != len(witness[9])
             ):
                 return False
+            if _explicit_inline_form_prefix_proven(
+                worksheet, header_start=witness[10], width=witness[16],
+                merged_ranges=merged_ranges,
+            ):
+                return True
             prefix_spans = [
                 merged for merged in merged_ranges
                 if candidate[10] < merged.min_row <= merged.max_row <= witness[10]
@@ -2435,6 +2446,52 @@ def _inline_context_segments(
     ):
         return None
     return segments
+
+
+def _explicit_inline_form_prefix_proven(
+    worksheet,
+    *,
+    header_start: int,
+    width: int,
+    merged_ranges,
+) -> bool:
+    """Recognize a repeated, explicitly delimited form before a header.
+
+    Geometry or a colon alone cannot distinguish populated parent headers.
+    Require repeated aligned label/value pairs terminated by a scope-wide
+    empty labelled field. The caller independently proves the same record axis.
+    """
+    def is_label(value):
+        return bool(value and value.endswith((":", "\uff1a")) and value[:-1].strip())
+
+    separator = next((
+        merged for merged in merged_ranges
+        if merged.min_row == merged.max_row == header_start
+        and merged.min_col == 1 and merged.max_col == width
+    ), None)
+    if separator is None or not is_label(
+        _sanitize_untrusted_text(worksheet.cell(header_start, 1).value)
+    ):
+        return False
+    topology = None
+    pair_rows = 0
+    for row_ordinal in range(header_start - 1, 0, -1):
+        segments = _inline_context_segments(
+            worksheet, row_ordinal=row_ordinal, width=width,
+            merged_ranges=merged_ranges,
+        )
+        if not segments or not all(is_label(segment["value"]) for segment in segments[::2]):
+            break
+        if any(not segment["value"] or is_label(segment["value"]) for segment in segments[1::2]):
+            return False
+        current_topology = tuple(
+            (segment["min_column"], segment["max_column"]) for segment in segments
+        )
+        if topology is not None and current_topology != topology:
+            return False
+        topology = current_topology
+        pair_rows += 1
+    return pair_rows >= 2
 
 
 def _inline_context_row_proven(

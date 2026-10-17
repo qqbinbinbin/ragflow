@@ -8290,6 +8290,121 @@ def test_mixed_group_projection_preserves_body_header_and_footer(table_parser, f
     validate_tabular_structure_projection(projection)
 
 
+@pytest.mark.parametrize("delimiter", [":", "\uff1a"])
+@pytest.mark.parametrize("crossing_context", [False, True])
+def test_explicit_repeated_form_prefix_is_context_not_parent_headers(
+    table_parser, delimiter, crossing_context,
+):
+    book = _mixed_group_context_and_footer_workbook(
+        "legend_and_signoff", crossing_context=crossing_context,
+    )
+    sheet = book.active
+    for coordinate in ("A4", "E4", "A5", "E5", "A6"):
+        sheet[coordinate] = str(sheet[coordinate].value) + delimiter
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(book), parser=table_parser,
+    )
+    complete = [table for table in projection["tables"]
+                if table["enumeration_status"] == "supported_complete"]
+    assert len(complete) == 1
+    table = complete[0]
+    assert table["source_total_count"] == 7
+    paths = {column["column_ordinal"]: column["header_path"]
+             for column in table["ordered_columns"]}
+    assert paths[1] == ["Code-X"]
+    assert paths[3] == ["Description", "Product"]
+    assert paths[4] == ["Description", "Manufacturing"]
+    assert paths[6] == ["Limit"]
+    context = table["table_context"]
+    for name, value in (("Supplier", "Company A"), ("Part", "Assembly"),
+                        ("Project", "Project Q"), ("Identifier", "Code-X")):
+        assert {"name": name + delimiter, "value": value} in context
+    assert {"name": "context", "value": "Category" + delimiter} in context
+    assert {"name": "context", "value": "Register title"} in context
+    validate_tabular_structure_projection(projection)
+
+
+@pytest.mark.parametrize("defect", ["no_field_delimiters", "no_empty_field_delimiter",
+                                    "one_pair_row", "different_pair_geometry",
+                                    "value_is_another_label", "empty_value"])
+def test_ambiguous_form_prefix_preserves_the_original_parent_headers(table_parser, defect):
+    book = _mixed_group_context_and_footer_workbook("legend_and_signoff")
+    sheet = book.active
+    for coordinate in ("A4", "E4", "A5", "E5", "A6"):
+        sheet[coordinate] = str(sheet[coordinate].value) + ":"
+    if defect == "no_field_delimiters":
+        for coordinate in ("A4", "E4", "A5", "E5"):
+            sheet[coordinate] = str(sheet[coordinate].value)[:-1]
+    elif defect == "no_empty_field_delimiter":
+        sheet["A6"] = "Common parent"
+    elif defect == "one_pair_row":
+        sheet["A4"] = "Parent A"
+    elif defect == "different_pair_geometry":
+        sheet.unmerge_cells("A5:B5")
+        sheet.unmerge_cells("C5:D5")
+        sheet.merge_cells("B5:D5")
+        sheet["B5"] = "Project Q"
+    elif defect == "value_is_another_label":
+        sheet["C4"] = "Parent B:"
+    elif defect == "empty_value":
+        sheet["C4"] = None
+    rows, _, _ = tabular_structure._complete_worksheet_rows(sheet)
+    headers, start, end = tabular_structure._parse_region_structure(table_parser, sheet, rows)
+    expected_start = 4 if defect == "different_pair_geometry" else 1
+    assert (start, end) == (expected_start, 8)
+    assert str(sheet["A6"].value) in headers[0]
+
+
+def test_explicit_form_boundary_retains_a_genuine_extra_parent_level(table_parser):
+    from openpyxl.worksheet.cell_range import CellRange
+
+    book = _mixed_group_context_and_footer_workbook("legend_and_signoff")
+    sheet = book.active
+    for coordinate in ("A4", "E4", "A5", "E5", "A6"):
+        sheet[coordinate] = str(sheet[coordinate].value) + ":"
+    spans = [CellRange(str(merged)) for merged in sheet.merged_cells.ranges]
+    for span in spans:
+        sheet.unmerge_cells(str(span))
+    sheet.insert_rows(7)
+    for span in spans:
+        if span.min_row >= 7:
+            span.shift(row_shift=1)
+        sheet.merge_cells(str(span))
+    sheet["A7"] = "Measured characteristics"
+    sheet.merge_cells("A7:H7")
+    projection = build_tabular_structure_projection(
+        "anonymous.xlsx", _save_workbook(book), parser=table_parser,
+    )
+    table = next(t for t in projection["tables"] if t["source_total_count"] == 7)
+    paths = {c["column_ordinal"]: c["header_path"] for c in table["ordered_columns"]}
+    assert paths[1] == ["Measured characteristics", "Code-X"]
+    assert paths[3] == ["Measured characteristics", "Description", "Product"]
+    assert paths[4] == ["Measured characteristics", "Description", "Manufacturing"]
+    assert {"name": "Supplier:", "value": "Company A"} in table["table_context"]
+
+
+def test_uploaded_mixed_characteristics_has_independent_form_context_and_leaf_headers(table_parser):
+    source = Path('/opt/fuxi/evidence/f515-ptc-producer-record-axis-20261016t013452235667z-26328870/source.private.xls')
+    if not source.exists():
+        pytest.skip('exact uploaded source unavailable; not acceptance evidence')
+    binary = source.read_bytes()
+    assert hashlib.sha256(binary).hexdigest() == '7b247b415ffde272f54ce49b5ddde85ed5dc6ab2317af2578fb144686e63fe85'
+    book = table_parser._load_excel_to_workbook(BytesIO(binary))
+    sheet = book.worksheets[9]
+    rows, _, _ = tabular_structure._complete_worksheet_rows(sheet)
+    headers, start, end = tabular_structure._parse_region_structure(table_parser, sheet, rows)
+    assert (start, end) == (6, 8)
+    assert headers[0] == sheet['A7'].value
+    projection = build_tabular_structure_projection(
+        'source.xls', binary, parser=table_parser, sheet_ordinals={10},
+    )
+    table = next(t for t in projection['tables'] if t['source_total_count'] == 7)
+    context = table['table_context']
+    for label, value in (('A4', 'C4'), ('E4', 'H4'), ('A5', 'C5'), ('E5', 'H5')):
+        assert {'name': sheet[label].value.strip(), 'value': sheet[value].value.strip()} in context
+    assert {'name': 'context', 'value': sheet['A6'].value.strip()} in context
+
+
 def test_uploaded_mixed_characteristics_preserve_each_source_cell_and_group(table_parser):
     source = Path('/opt/fuxi/evidence/f515-ptc-producer-record-axis-20261016t013452235667z-26328870/source.private.xls')
     if not source.exists():
